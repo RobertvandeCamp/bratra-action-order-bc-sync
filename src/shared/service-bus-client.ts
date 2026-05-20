@@ -17,7 +17,7 @@ export function generateSasToken(
   const resourceUri = `https://${namespace}.servicebus.windows.net/${queue}`;
   const expiry = Math.floor(Date.now() / 1000) + 600; // 10 min TTL
   const stringToSign = encodeURIComponent(resourceUri) + "\n" + expiry;
-  const sig = createHmac("sha256", Buffer.from(keyValue, "base64"))
+  const sig = createHmac("sha256", keyValue)
     .update(stringToSign)
     .digest("base64");
   return `SharedAccessSignature sr=${encodeURIComponent(resourceUri)}&sig=${encodeURIComponent(sig)}&se=${expiry}&skn=${keyName}`;
