@@ -6,6 +6,9 @@ import { authenticateM2M } from "../shared/bc-auth";
 import { checkBufferStatuses } from "./bc-buffer-checker";
 import type { BCConfig } from "../shared/types";
 
+/** Non-food company (consistent with dispatcher) */
+const COMPANY_ID = 2;
+
 /**
  * Verifier Lambda handler.
  *
@@ -43,6 +46,7 @@ export const handler = async (
   const { data: sentOrders, error } = await supabase
     .from("bc_sync_orders")
     .select("*")
+    .eq("company_id", COMPANY_ID)
     .eq("status", "sent")
     .lt("sent_at", twoMinutesAgo);
 

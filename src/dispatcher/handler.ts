@@ -103,24 +103,33 @@ export const handler = async (
           }),
         );
 
-        const { error: insertError } = await supabase
-          .from("bc_sync_orders")
-          .insert(insertRecords);
+        // Insert per order so unique violations only skip the duplicate, not the whole batch
+        const claimedOrders: WarehouseOrder[] = [];
+        for (let i = 0; i < insertRecords.length; i++) {
+          const { error: insertError } = await supabase
+            .from("bc_sync_orders")
+            .insert(insertRecords[i]);
 
-        if (insertError) {
-          // Pitfall 4: Handle unique constraint violation (concurrent runs)
-          if (insertError.code === PG_UNIQUE_VIOLATION) {
-            console.warn("Skipping batch -- concurrent run already claimed these orders", {
-              batchId,
-              orderIds: batch.orders.map((o) => o.id),
-            });
-            continue;
+          if (insertError) {
+            if (insertError.code === PG_UNIQUE_VIOLATION) {
+              console.warn("Skipping order -- concurrent run already claimed", {
+                orderId: batch.orders[i].id,
+              });
+              continue;
+            }
+            throw new Error(`Failed to insert sync record: ${insertError.message}`);
           }
-          throw new Error(`Failed to insert sync records: ${insertError.message}`);
+          claimedOrders.push(batch.orders[i]);
         }
 
-        // b. Map orders to envelope
-        const envelope = mapOrdersToEnvelope(batch.orders, {
+        if (claimedOrders.length === 0) {
+          console.log("All orders in batch already claimed", { batchId });
+          summary.batchesProcessed++;
+          continue;
+        }
+
+        // b. Map only claimed orders to envelope
+        const envelope = mapOrdersToEnvelope(claimedOrders, {
           messageId,
           correlationId,
           legalEntity: batch.legalEntity,
@@ -156,7 +165,7 @@ export const handler = async (
           });
         }
 
-        summary.ordersSent += batch.orders.length;
+        summary.ordersSent += claimedOrders.length;
       } catch (err) {
         // f. Update tracking records -> failed (D-14)
         const errorMessage = (err as Error).message;
