@@ -210,6 +210,8 @@ export const handler = async (
 
         try {
           // a. UPDATE (not INSERT) existing bc_sync_orders records
+          // Track which orders were successfully reset -- only send those
+          const resetOrders: WarehouseOrder[] = [];
           for (const order of batch.orders) {
             const syncRecord = failedOrderMap.get(order.id);
             if (!syncRecord) continue;
@@ -233,11 +235,20 @@ export const handler = async (
                 orderId: order.id,
                 error: updateError.message,
               });
+              // Skip this order -- tracking row not reset, would cause duplicate SB messages
+              continue;
             }
+            resetOrders.push(order);
           }
 
-          // b. Map to envelope and send
-          const envelope = mapOrdersToEnvelope(batch.orders, {
+          if (resetOrders.length === 0) {
+            console.warn("No orders successfully reset for re-dispatch in batch", { batchId });
+            summary.batchesProcessed++;
+            continue;
+          }
+
+          // b. Map to envelope and send (only successfully reset orders)
+          const envelope = mapOrdersToEnvelope(resetOrders, {
             messageId,
             correlationId,
             legalEntity: batch.legalEntity,
@@ -248,13 +259,13 @@ export const handler = async (
               batchId,
             });
             await sendOrdersOneByOne(
-              batch.orders,
+              resetOrders,
               batchId,
               batch.legalEntity,
               supabase,
               summary,
             );
-            summary.retriedOrders += batch.orders.length;
+            summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
             continue;
           }
@@ -275,8 +286,8 @@ export const handler = async (
             });
           }
 
-          summary.ordersSent += batch.orders.length;
-          summary.retriedOrders += batch.orders.length;
+          summary.ordersSent += resetOrders.length;
+          summary.retriedOrders += resetOrders.length;
         } catch (err) {
           // d. Update status -> failed
           const errorMessage = (err as Error).message;
