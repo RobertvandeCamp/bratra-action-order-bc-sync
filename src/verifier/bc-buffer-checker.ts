@@ -63,12 +63,38 @@ export async function checkBufferStatuses(
 
       // D-10: Not found -- buffer not yet arrived at BC
       if (!result.value || result.value.length === 0) {
-        console.log("Buffer not found in BC", {
-          orderId: order.id,
-          externalId: order.external_id,
-          action: "not_found",
-        });
-        summary.notFound++;
+        const sentAge = Date.now() - new Date(order.sent_at!).getTime();
+        const oneHour = 60 * 60 * 1000;
+
+        if (sentAge > oneHour) {
+          // Aging threshold: dead-letter orders not found in BC after 1 hour
+          const { error: agingError } = await supabase
+            .from("bc_sync_orders")
+            .update({
+              status: "dead_letter",
+              bc_buffer_status: "NotFound",
+              bc_error_message: `Buffer not found in BC after ${Math.round(sentAge / 60000)} minutes`,
+              failed_at: new Date().toISOString(),
+            })
+            .eq("id", order.id);
+          if (agingError) {
+            console.error("Failed to dead-letter aged not-found order", {
+              orderId: order.id, error: agingError.message,
+            });
+            summary.errors++;
+          } else {
+            summary.deadLetter++;
+            console.warn("Order dead-lettered (not found in BC after 1h)", {
+              orderId: order.id, externalId: order.external_id,
+              sentAgeMin: Math.round(sentAge / 60000), action: "dead_letter",
+            });
+          }
+        } else {
+          console.log("Buffer not found in BC", {
+            orderId: order.id, externalId: order.external_id, action: "not_found",
+          });
+          summary.notFound++;
+        }
         continue;
       }
 

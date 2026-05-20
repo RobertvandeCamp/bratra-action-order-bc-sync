@@ -149,9 +149,11 @@ export const handler = async (
           .eq("batch_id", batchId);
 
         if (updateError) {
-          // Throw so catch block marks orders as failed -- prevents orphaned
-          // records where SB message was sent but status stays 'pending'
-          throw new Error(`Failed to update sync records to sent: ${updateError.message}`);
+          // SB message already sent -- do NOT throw (would cause re-dispatch duplicates).
+          // Log error; verifier can still find orders via externalId in BC buffer.
+          console.error("SB sent but DB status update failed (orders trackable via externalId)", {
+            batchId, error: updateError.message,
+          });
         }
 
         summary.ordersSent += batch.orders.length;
@@ -280,7 +282,9 @@ export const handler = async (
             .eq("batch_id", batchId);
 
           if (sentError) {
-            throw new Error(`Failed to update re-dispatched records to sent: ${sentError.message}`);
+            console.error("SB re-dispatch sent but DB update failed", {
+              batchId, error: sentError.message,
+            });
           }
 
           summary.ordersSent += resetOrders.length;
@@ -370,7 +374,7 @@ async function sendOrdersOneByOne(
       }
 
       // Update message_id and external_id for tracking before send
-      await supabase
+      const { error: metaError } = await supabase
         .from("bc_sync_orders")
         .update({
           message_id: singleMessageId,
@@ -380,13 +384,25 @@ async function sendOrdersOneByOne(
         .eq("batch_id", originalBatchId)
         .eq("order_id", order.id);
 
+      if (metaError) {
+        throw new Error(`Failed to update tracking metadata: ${metaError.message}`);
+      }
+
       await sendToServiceBus(envelope);
 
-      await supabase
+      const { error: sentError } = await supabase
         .from("bc_sync_orders")
         .update({ status: "sent", sent_at: new Date().toISOString() })
         .eq("batch_id", originalBatchId)
         .eq("order_id", order.id);
+
+      if (sentError) {
+        // SB message already sent -- log but mark as sent anyway to prevent
+        // re-dispatch duplicates. The verifier will pick this up via externalId.
+        console.error("SB sent but DB update failed (order still trackable via externalId)", {
+          orderId: order.id, error: sentError.message,
+        });
+      }
 
       summary.ordersSent++;
     } catch (err) {
