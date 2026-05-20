@@ -23,13 +23,14 @@ const ORDER_SELECT = `
 `;
 
 /**
- * Fetch orders that have not been synced to BC yet (no active bc_sync_orders record).
- * Also includes failed orders that are eligible for re-dispatch (retry_count < max_retries).
+ * Fetch orders that have not been synced to BC yet (no bc_sync_orders record in any status).
  *
  * Uses a two-step anti-join pattern because Supabase JS does not support NOT EXISTS:
- *   1. Get order_ids with active sync records (pending/sent/verified)
+ *   1. Get order_ids with ANY sync record (all statuses)
  *   2. Get orders WHERE id NOT IN those ids
- *   3. Get failed orders eligible for re-dispatch and merge them in
+ *
+ * Failed orders eligible for re-dispatch are handled separately by the handler
+ * via fetchFailedSyncRecords() + dedicated warehouse data fetch.
  */
 export async function fetchUnsyncedOrders(
   companyId: number,
@@ -81,35 +82,9 @@ export async function fetchUnsyncedOrders(
 
   // Cast via unknown: Supabase untyped client infers distribution_centers as array,
   // but the FK on distribution_center_id makes it a single object at runtime.
-  const orders: WarehouseOrder[] = (newOrders ?? []) as unknown as WarehouseOrder[];
-
-  // Step 3: Get failed orders eligible for re-dispatch
-  const failedRecords = await fetchFailedSyncRecords(companyId);
-
-  if (failedRecords.length > 0) {
-    const existingIds = new Set(orders.map((o) => o.id));
-    const failedOrderIds = failedRecords
-      .map((r) => r.order_id)
-      .filter((id) => !existingIds.has(id));
-
-    if (failedOrderIds.length > 0) {
-      const { data: failedOrders, error: failedError } = await supabase
-        .from("orders")
-        .select(ORDER_SELECT)
-        .eq("company_id", companyId)
-        .in("id", failedOrderIds);
-
-      if (failedError) {
-        throw new Error(
-          `Failed to query failed orders for company ${companyId}: ${failedError.message}`,
-        );
-      }
-
-      orders.push(...((failedOrders ?? []) as unknown as WarehouseOrder[]));
-    }
-  }
-
-  return orders;
+  // Note: failed orders are handled separately by the handler (fetchFailedSyncRecords +
+  // dedicated warehouse data fetch) to avoid redundant DB calls.
+  return (newOrders ?? []) as unknown as WarehouseOrder[];
 }
 
 /**
