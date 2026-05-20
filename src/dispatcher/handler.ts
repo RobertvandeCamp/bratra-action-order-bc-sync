@@ -1,7 +1,7 @@
 import type { ScheduledEvent, Context } from "aws-lambda";
 import { randomUUID } from "node:crypto";
 
-import { fetchUnsyncedOrders, fetchFailedSyncRecords } from "./order-fetcher";
+import { fetchUnsyncedOrders, fetchFailedSyncRecords, recoverStalePendingRecords } from "./order-fetcher";
 import {
   mapOrdersToEnvelope,
   groupOrdersIntoBatches,
@@ -51,6 +51,9 @@ export const handler = async (
   }
 
   const supabase = getSupabaseClient();
+
+  // 0. Recover orphaned 'pending' records from Lambda crash/timeout (> 5 min old)
+  await recoverStalePendingRecords(COMPANY_ID);
 
   // 1. Fetch new unsync'd orders
   const newOrders = await fetchUnsyncedOrders(COMPANY_ID);
@@ -218,9 +221,14 @@ export const handler = async (
       .in("id", failedOrderIdsList);
 
     if (failedFetchError) {
-      console.error("Failed to fetch warehouse data for re-dispatch", {
+      console.error("Failed to fetch warehouse data for re-dispatch -- skipping re-dispatch", {
         error: failedFetchError.message,
+        failedOrderCount: failedRecords.length,
       });
+      // Don't silently continue -- log to summary and skip re-dispatch entirely
+      summary.ordersFailed += failedRecords.length;
+      console.log("Dispatch complete (re-dispatch skipped due to DB error)", summary);
+      return;
     }
 
     const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];

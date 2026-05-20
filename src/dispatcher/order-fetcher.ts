@@ -114,3 +114,38 @@ export async function fetchFailedSyncRecords(
     (r: BcSyncOrderRow) => r.retry_count < r.max_retries,
   ) as BcSyncOrderRow[];
 }
+
+/**
+ * Recover orphaned 'pending' records stuck after a Lambda crash/timeout.
+ * Records in 'pending' older than 5 minutes are reset to 'failed' so
+ * the re-dispatch flow can pick them up.
+ */
+export async function recoverStalePendingRecords(
+  companyId: number,
+): Promise<number> {
+  const supabase = getSupabaseClient();
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+  const { data: staleRows, error } = await supabase
+    .from("bc_sync_orders")
+    .update({
+      status: "failed",
+      error_message: "Recovered from stale pending (Lambda crash/timeout)",
+      failed_at: new Date().toISOString(),
+    })
+    .eq("company_id", companyId)
+    .eq("status", "pending")
+    .lt("queued_at", fiveMinutesAgo)
+    .select("id");
+
+  if (error) {
+    console.error("Failed to recover stale pending records", { error: error.message });
+    return 0;
+  }
+
+  const count = staleRows?.length ?? 0;
+  if (count > 0) {
+    console.warn("Recovered stale pending records", { count, companyId });
+  }
+  return count;
+}
