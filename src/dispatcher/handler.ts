@@ -142,7 +142,7 @@ export const handler = async (
             orderCount: batch.orders.length,
           });
           // Fallback: send each order individually
-          await sendOrdersOneByOne(batch.orders, batchId, batch.legalEntity, supabase, summary);
+          await sendOrdersOneByOne(claimedOrders, batchId, batch.legalEntity, supabase, summary);
           summary.batchesProcessed++;
           continue;
         }
@@ -192,7 +192,7 @@ export const handler = async (
           });
         }
 
-        summary.ordersFailed += batch.orders.length;
+        summary.ordersFailed += claimedOrders.length;
       }
 
       summary.batchesProcessed++;

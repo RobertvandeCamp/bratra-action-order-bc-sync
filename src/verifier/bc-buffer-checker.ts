@@ -48,9 +48,19 @@ export async function checkBufferStatuses(
 
   for (const order of sentOrders) {
     try {
-      // Skip orders without external_id
+      // Dead-letter orders without external_id (unverifiable)
       if (!order.external_id) {
-        console.warn("Order has no external_id, skipping", { orderId: order.id });
+        const { error: noExtError } = await supabase
+          .from("bc_sync_orders")
+          .update({
+            status: "dead_letter",
+            bc_error_message: "Missing external_id — cannot verify in BC",
+            failed_at: new Date().toISOString(),
+          })
+          .eq("id", order.id);
+        if (!noExtError) summary.deadLetter++;
+        else summary.errors++;
+        console.warn("Order dead-lettered: no external_id", { orderId: order.id });
         continue;
       }
 
