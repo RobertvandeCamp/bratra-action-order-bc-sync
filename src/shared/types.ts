@@ -163,6 +163,86 @@ export interface BcSyncOrderUpdate {
 }
 
 // ============================================================================
+// Warehouse Order types (Supabase nested select result)
+// ============================================================================
+
+/** Order with nested relations as returned by Supabase nested select */
+export interface WarehouseOrder {
+  id: number;
+  po_number: string;
+  company_id: number;
+  carrier_code: string | null;
+  carrier: string | null;
+  req_delivery_date: string;
+  exp_delivery_date: string | null;
+  order_type: string | null;
+  unloading_location: string | null;
+  truck_proposal: string | null;
+  ship_id: string | null;
+  shipment_status: string | null;
+  req_etd: string | null;
+  exp_etd: string | null;
+  eta: string | null;
+  port_of_departure_code: string | null;
+  port_of_departure: string | null;
+  port_of_arrival_code: string | null;
+  port_of_arrival: string | null;
+  container_type: string | null;
+  // Nested relations from Supabase select
+  distribution_centers: {
+    code: string | null;
+    name: string;
+    location: string | null;
+  } | null;
+  order_lines: WarehouseOrderLine[];
+}
+
+export interface WarehouseOrderLine {
+  id: number;
+  line_number: number | null;
+  contract_number: string | null;
+  req_quantity: number;
+  exp_quantity: number | null;
+  price: number;
+  pallet_pattern: number | null;
+  pallets: number | null;
+  category: string | null;
+  unit_price_currency: string | null;
+  allocation: string | null;
+  hazardous_goods: string | null;
+  adr: string | null;
+  icpe: string | null;
+  logistic_group: string | null;
+  // Nested relations
+  action_articles: {
+    article_number: string;
+    description: string | null;
+  };
+  bratra_articles: {
+    article_number: string;
+  } | null;
+}
+
+// ============================================================================
+// Legal Entity mapping & batch constants
+// ============================================================================
+
+/**
+ * Company ID to BC legal entity mapping.
+ * Exacte strings nog niet bevestigd door Wesley. Update na bevestiging.
+ */
+export const LEGAL_ENTITY_MAP: Record<number | string, string> = {
+  2: "BRATRA-NONFOOD",
+  PP: "BRATRA-PRODUCTS",
+};
+
+/** Maximum orders per Service Bus batch message */
+export const MAX_ORDERS_PER_BATCH = 10;
+
+/** Maximum envelope size in bytes (200 KiB safety margin for 256 KiB SB limit) */
+export const MAX_ENVELOPE_BYTES = 200 * 1024;
+
+// ============================================================================
 // BC API types (adapted from bratra-bc-mcp-server)
 // ============================================================================
 
