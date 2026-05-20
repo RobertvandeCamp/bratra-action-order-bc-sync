@@ -198,8 +198,22 @@ export const handler = async (
       failedOrderMap.set(rec.order_id, rec);
     }
 
-    // Fetch warehouse data for the failed order_ids
-    const failedOrderData = newOrders.filter((o) => failedOrderIds.has(o.id));
+    // Fetch warehouse data separately for failed orders (they're excluded from newOrders
+    // because 'failed' is in the step 1 anti-join exclusion list)
+    const failedOrderIdsList = failedRecords.map((r) => r.order_id);
+    const { data: failedOrderRows, error: failedFetchError } = await supabase
+      .from("orders")
+      .select("id, po_number, company_id, carrier_code, carrier, req_delivery_date, exp_delivery_date, order_type, unloading_location, truck_proposal, ship_id, shipment_status, req_etd, exp_etd, eta, port_of_departure_code, port_of_departure, port_of_arrival_code, port_of_arrival, container_type, distribution_centers (code, name, location), order_lines (id, line_number, contract_number, req_quantity, exp_quantity, price, pallet_pattern, pallets, category, unit_price_currency, allocation, hazardous_goods, adr, icpe, logistic_group, action_articles!inner (article_number, description), bratra_articles (article_number))")
+      .eq("company_id", COMPANY_ID)
+      .in("id", failedOrderIdsList);
+
+    if (failedFetchError) {
+      console.error("Failed to fetch warehouse data for re-dispatch", {
+        error: failedFetchError.message,
+      });
+    }
+
+    const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];
 
     if (failedOrderData.length > 0) {
       const failedBatches = groupOrdersIntoBatches(failedOrderData);
