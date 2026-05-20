@@ -36,12 +36,15 @@ export async function fetchUnsyncedOrders(
 ): Promise<WarehouseOrder[]> {
   const supabase = getSupabaseClient();
 
-  // Step 1: Get order_ids that already have an active sync record
+  // Step 1: Get order_ids that should NOT be fetched as new:
+  // - active sync records (pending/sent/verified)
+  // - dead_letter records (permanently failed)
+  // - skipped records
   const { data: syncedOrders, error: syncError } = await supabase
     .from("bc_sync_orders")
     .select("order_id")
     .eq("company_id", companyId)
-    .in("status", ["pending", "sent", "verified"]);
+    .in("status", ["pending", "sent", "verified", "dead_letter", "skipped"]);
 
   if (syncError) {
     throw new Error(
@@ -117,12 +120,17 @@ export async function fetchFailedSyncRecords(
 ): Promise<BcSyncOrderRow[]> {
   const supabase = getSupabaseClient();
 
-  const { data, error } = await supabase
+  // Fetch all failed records, then filter retry_count < max_retries in JS
+  // (PostgREST cannot compare two columns directly)
+  const { data: allFailed, error } = await supabase
     .from("bc_sync_orders")
     .select("*")
     .eq("company_id", companyId)
-    .eq("status", "failed")
-    .lt("retry_count", 3); // max_retries default is 3
+    .eq("status", "failed");
+
+  const data = (allFailed ?? []).filter(
+    (r: BcSyncOrderRow) => r.retry_count < r.max_retries,
+  );
 
   if (error) {
     throw new Error(
