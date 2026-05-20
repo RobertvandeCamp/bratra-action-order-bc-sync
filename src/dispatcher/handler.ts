@@ -241,7 +241,7 @@ export const handler = async (
             const syncRecord = failedOrderMap.get(order.id);
             if (!syncRecord) continue;
 
-            const { error: updateError } = await supabase
+            const { data: updatedRows, error: updateError } = await supabase
               .from("bc_sync_orders")
               .update({
                 status: "pending",
@@ -254,7 +254,8 @@ export const handler = async (
                 failed_at: null,
               })
               .eq("id", syncRecord.id)
-              .eq("status", "failed"); // Optimistic lock: only update if still 'failed'
+              .eq("status", "failed") // Optimistic lock: only update if still 'failed'
+              .select("id");
 
             if (updateError) {
               console.error("Failed to reset sync record for re-dispatch", {
@@ -262,7 +263,14 @@ export const handler = async (
                 orderId: order.id,
                 error: updateError.message,
               });
-              // Skip this order -- tracking row not reset, would cause duplicate SB messages
+              continue;
+            }
+
+            // PostgREST returns 0 rows if status was no longer 'failed' (concurrent claim)
+            if (!updatedRows || updatedRows.length === 0) {
+              console.warn("Skipping order -- concurrent run already claimed", {
+                syncRecordId: syncRecord.id, orderId: order.id,
+              });
               continue;
             }
             resetOrders.push(order);
