@@ -223,6 +223,7 @@ export const handler = async (
                 message_id: messageId,
                 correlation_id: correlationId,
                 batch_id: batchId,
+                external_id: `BRA-AC-${messageId}-${order.po_number}`,
                 retry_count: syncRecord.retry_count + 1,
                 error_message: null,
                 failed_at: null,
@@ -372,12 +373,13 @@ async function sendOrdersOneByOne(
         continue;
       }
 
-      // Update message_id for tracking before send
+      // Update message_id and external_id for tracking before send
       await supabase
         .from("bc_sync_orders")
         .update({
           message_id: singleMessageId,
           correlation_id: singleCorrelationId,
+          external_id: `BRA-AC-${singleMessageId}-${order.po_number}`,
         })
         .eq("batch_id", originalBatchId)
         .eq("order_id", order.id);

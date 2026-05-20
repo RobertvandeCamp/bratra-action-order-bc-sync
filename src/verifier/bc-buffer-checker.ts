@@ -80,7 +80,7 @@ export async function checkBufferStatuses(
       switch (buffer.status) {
         // D-07: Done -> verified
         case "Done": {
-          await supabase
+          const { error: verifyError } = await supabase
             .from("bc_sync_orders")
             .update({
               status: "verified",
@@ -91,6 +91,13 @@ export async function checkBufferStatuses(
               verified_at: new Date().toISOString(),
             })
             .eq("id", order.id);
+          if (verifyError) {
+            console.error("Failed to update order to verified", {
+              orderId: order.id, error: verifyError.message,
+            });
+            summary.errors++;
+            break;
+          }
           summary.verified++;
           console.log("Order verified", {
             orderId: order.id,
@@ -106,15 +113,24 @@ export async function checkBufferStatuses(
         case "Error":
         case "Fatal": {
           if (order.retry_count < order.max_retries) {
-            await supabase
+            // Set to 'failed' (not 'pending') -- dispatcher's fetchFailedSyncRecords
+            // queries status='failed' for re-dispatch eligibility
+            const { error: retryError } = await supabase
               .from("bc_sync_orders")
               .update({
-                status: "pending",
+                status: "failed",
                 bc_buffer_status: buffer.status,
                 bc_error_message: buffer.errorMessage,
-                retry_count: order.retry_count + 1,
+                failed_at: new Date().toISOString(),
               })
               .eq("id", order.id);
+            if (retryError) {
+              console.error("Failed to update order for retry", {
+                orderId: order.id, error: retryError.message,
+              });
+              summary.errors++;
+              break;
+            }
             summary.retried++;
             console.log("Order retried", {
               orderId: order.id,
@@ -125,7 +141,7 @@ export async function checkBufferStatuses(
               action: "retried",
             });
           } else {
-            await supabase
+            const { error: dlError } = await supabase
               .from("bc_sync_orders")
               .update({
                 status: "dead_letter",
@@ -134,6 +150,13 @@ export async function checkBufferStatuses(
                 failed_at: new Date().toISOString(),
               })
               .eq("id", order.id);
+            if (dlError) {
+              console.error("Failed to update order to dead_letter", {
+                orderId: order.id, error: dlError.message,
+              });
+              summary.errors++;
+              break;
+            }
             summary.deadLetter++;
             console.log("Order dead-lettered", {
               orderId: order.id,
@@ -169,7 +192,7 @@ export async function checkBufferStatuses(
 
         // Cancelled -> dead_letter (RESEARCH pitfall 5)
         case "Cancelled": {
-          await supabase
+          const { error: cancelError } = await supabase
             .from("bc_sync_orders")
             .update({
               status: "dead_letter",
@@ -178,6 +201,13 @@ export async function checkBufferStatuses(
               failed_at: new Date().toISOString(),
             })
             .eq("id", order.id);
+          if (cancelError) {
+            console.error("Failed to update cancelled order to dead_letter", {
+              orderId: order.id, error: cancelError.message,
+            });
+            summary.errors++;
+            break;
+          }
           summary.deadLetter++;
           console.log("Order cancelled in BC", {
             orderId: order.id,
