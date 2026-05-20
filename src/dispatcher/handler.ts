@@ -88,6 +88,8 @@ export const handler = async (
       const messageId = randomUUID();
       const correlationId = `dispatch-${new Date().toISOString()}`;
 
+      // Track claimed orders outside try for catch block access
+      const claimedOrders: WarehouseOrder[] = [];
       try {
         // a. INSERT bc_sync_orders records (status: pending) per D-12
         const insertRecords: BcSyncOrderInsert[] = batch.orders.map(
@@ -104,7 +106,6 @@ export const handler = async (
         );
 
         // Insert per order so unique violations only skip the duplicate, not the whole batch
-        const claimedOrders: WarehouseOrder[] = [];
         for (let i = 0; i < insertRecords.length; i++) {
           const { error: insertError } = await supabase
             .from("bc_sync_orders")
