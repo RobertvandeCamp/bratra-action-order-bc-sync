@@ -2,6 +2,7 @@ import { build } from 'esbuild';
 
 await build({
   entryPoints: {
+    'index': 'src/index.ts',
     'dispatcher/handler': 'src/dispatcher/handler.ts',
     'verifier/handler': 'src/verifier/handler.ts',
   },
