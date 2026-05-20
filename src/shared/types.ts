@@ -269,3 +269,43 @@ export interface BCConfig {
   environment: string;
   companyId: string;
 }
+
+// ============================================================================
+// BC Buffer types (bratraSalesOrderBuffers API response)
+// ============================================================================
+
+/**
+ * Mogelijke statuses van een bratraSalesOrderBuffers record in BC.
+ * Bron: bratra-integration-architecture.pdf section 6.1, table 50100.
+ */
+export type BcBufferStatus =
+  | "Pending"
+  | "Processing"
+  | "Done"
+  | "Error"
+  | "Fatal"
+  | "Cancelled";
+
+/**
+ * Eén record uit de BC bratraSalesOrderBuffers API page.
+ *
+ * BC OData v2.0 API retourneert camelCase property namen.
+ *
+ * NOTE: Exacte OData property namen (met name salesDocumentNo) moeten
+ * geverifieerd worden bij de eerste test-local run (Assumption A2 uit
+ * RESEARCH.md). Als de werkelijke response afwijkt, pas dit interface aan.
+ */
+export interface BcBufferRecord {
+  /** BC system UUID */
+  systemId: string;
+  /** Ons formaat: BRA-AC-{messageId}-{poNumber} */
+  externalId: string;
+  /** Verwerkingsstatus in BC */
+  status: BcBufferStatus;
+  /** Sales Order nummer, gevuld bij status Done */
+  salesDocumentNo: string;
+  /** Error details bij status Error/Fatal */
+  errorMessage: string;
+  /** BC entry nummer */
+  entryNo: number;
+}
