@@ -79,6 +79,9 @@ async function main(): Promise<void> {
     } else {
       const { handler } = await import("../src/verifier/handler");
       await handler(event, context);
+
+      // Post-verify: query bc_sync_orders for verification results
+      await showVerifyResults();
     }
 
     console.log(`\n--- ${target} completed successfully ---\n`);
@@ -165,6 +168,81 @@ async function showDispatchResults(): Promise<void> {
   console.log(`\nDispatch complete: ${sent} sent, ${failed} failed, ${pending} pending`);
   console.log("Check Azure Service Bus queue for messages");
   console.log("Check Supabase bc_sync_orders table for tracking records");
+}
+
+/**
+ * Query bc_sync_orders after verifier run and display verification results.
+ * Shows recent verified, dead_letter, and pending records.
+ */
+async function showVerifyResults(): Promise<void> {
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const supabase = getSupabaseClient();
+
+  console.log("\n--- bc_sync_orders verification results ---\n");
+
+  const { data, error } = await supabase
+    .from("bc_sync_orders")
+    .select("*")
+    .in("status", ["verified", "dead_letter", "pending"])
+    .order("updated_at", { ascending: false })
+    .limit(20);
+
+  if (error) {
+    console.error("Failed to query verification results:", error.message);
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    console.log("No verification results found.");
+    return;
+  }
+
+  type SyncVerifyRow = {
+    po_number: string;
+    status: string;
+    bc_buffer_status: string | null;
+    bc_document_no: string | null;
+    bc_error_message: string | null;
+  };
+
+  // Table header
+  console.log(
+    "po_number".padEnd(15),
+    "status".padEnd(12),
+    "bc_buffer_status".padEnd(12),
+    "bc_document_no".padEnd(15),
+    "bc_error_message",
+  );
+  console.log("-".repeat(110));
+
+  for (const row of data as SyncVerifyRow[]) {
+    const errorMsg = row.bc_error_message ?? "";
+    console.log(
+      (row.po_number ?? "").padEnd(15),
+      (row.status ?? "").padEnd(12),
+      (row.bc_buffer_status ?? "-").padEnd(12),
+      (row.bc_document_no ?? "-").padEnd(15),
+      errorMsg.length > 50 ? errorMsg.slice(0, 50) : errorMsg,
+    );
+  }
+
+  // Count per status
+  const statusCounts = (data as SyncVerifyRow[]).reduce(
+    (acc, row) => {
+      const s = row.status ?? "unknown";
+      acc[s] = (acc[s] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+
+  const verified = statusCounts["verified"] ?? 0;
+  const deadLetter = statusCounts["dead_letter"] ?? 0;
+  const pending = statusCounts["pending"] ?? 0;
+
+  console.log(
+    `\nVerify complete: ${verified} verified, ${deadLetter} dead_letter, ${pending} pending`,
+  );
 }
 
 main();
