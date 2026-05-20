@@ -208,10 +208,10 @@ export const handler = async (
         const messageId = randomUUID();
         const correlationId = `redispatch-${new Date().toISOString()}`;
 
+        // Track which orders were successfully reset -- only send those
+        const resetOrders: WarehouseOrder[] = [];
         try {
           // a. UPDATE (not INSERT) existing bc_sync_orders records
-          // Track which orders were successfully reset -- only send those
-          const resetOrders: WarehouseOrder[] = [];
           for (const order of batch.orders) {
             const syncRecord = failedOrderMap.get(order.id);
             if (!syncRecord) continue;
