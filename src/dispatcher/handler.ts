@@ -149,10 +149,9 @@ export const handler = async (
           .eq("batch_id", batchId);
 
         if (updateError) {
-          console.error("Failed to update sync records to sent", {
-            batchId,
-            error: updateError.message,
-          });
+          // Throw so catch block marks orders as failed -- prevents orphaned
+          // records where SB message was sent but status stays 'pending'
+          throw new Error(`Failed to update sync records to sent: ${updateError.message}`);
         }
 
         summary.ordersSent += batch.orders.length;
@@ -281,10 +280,7 @@ export const handler = async (
             .eq("batch_id", batchId);
 
           if (sentError) {
-            console.error("Failed to update re-dispatched records to sent", {
-              batchId,
-              error: sentError.message,
-            });
+            throw new Error(`Failed to update re-dispatched records to sent: ${sentError.message}`);
           }
 
           summary.ordersSent += resetOrders.length;

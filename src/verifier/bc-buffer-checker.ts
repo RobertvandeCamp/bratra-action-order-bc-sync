@@ -54,8 +54,9 @@ export async function checkBufferStatuses(
         continue;
       }
 
-      // D-04: Query BC buffer by externalId
-      const endpoint = `companies(${bcConfig.companyId})/bratraSalesOrderBuffers?$filter=externalId eq '${order.external_id}'`;
+      // D-04: Query BC buffer by externalId (escape single quotes for OData)
+      const safeExternalId = order.external_id.replace(/'/g, "''");
+      const endpoint = `companies(${bcConfig.companyId})/bratraSalesOrderBuffers?$filter=externalId eq '${safeExternalId}'`;
       const result = await bcGet<BcBufferRecord>(token, bcConfig, endpoint, {
         paginate: false,
       });
