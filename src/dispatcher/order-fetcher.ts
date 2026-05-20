@@ -38,13 +38,14 @@ export async function fetchUnsyncedOrders(
 
   // Step 1: Get order_ids that should NOT be fetched as new:
   // - active sync records (pending/sent/verified)
+  // - failed records (retry-eligible ones are re-fetched in step 3 via fetchFailedSyncRecords)
   // - dead_letter records (permanently failed)
   // - skipped records
   const { data: syncedOrders, error: syncError } = await supabase
     .from("bc_sync_orders")
     .select("order_id")
     .eq("company_id", companyId)
-    .in("status", ["pending", "sent", "verified", "dead_letter", "skipped"]);
+    .in("status", ["pending", "sent", "verified", "failed", "dead_letter", "skipped"]);
 
   if (syncError) {
     throw new Error(
@@ -128,15 +129,13 @@ export async function fetchFailedSyncRecords(
     .eq("company_id", companyId)
     .eq("status", "failed");
 
-  const data = (allFailed ?? []).filter(
-    (r: BcSyncOrderRow) => r.retry_count < r.max_retries,
-  );
-
   if (error) {
     throw new Error(
       `Failed to query failed sync records for company ${companyId}: ${error.message}`,
     );
   }
 
-  return (data ?? []) as BcSyncOrderRow[];
+  return (allFailed ?? []).filter(
+    (r: BcSyncOrderRow) => r.retry_count < r.max_retries,
+  ) as BcSyncOrderRow[];
 }
