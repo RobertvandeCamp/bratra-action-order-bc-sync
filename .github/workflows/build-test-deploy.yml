@@ -92,12 +92,12 @@ jobs:
         run: |
           aws lambda update-function-code \
             --function-name bratra-bc-sync-dispatcher \
-            --image-uri ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            --image-uri ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
             --publish
 
       - name: Update verifier Lambda
         run: |
           aws lambda update-function-code \
             --function-name bratra-bc-sync-verifier \
-            --image-uri ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            --image-uri ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
             --publish

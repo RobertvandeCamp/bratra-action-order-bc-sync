@@ -39,6 +39,8 @@ async function fetchWithRetry(
       const retryAfterSeconds = Number.isNaN(parsed) ? 5 : parsed;
       const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
       const delay = Math.max(retryAfterSeconds * 1000, baseDelay);
+      // Release connection back to pool before sleeping (Node fetch/Undici requirement)
+      await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, delay));
       continue;
     }

@@ -314,7 +314,7 @@ export const handler = async (
             });
           }
 
-          summary.ordersFailed += batch.orders.length;
+          summary.ordersFailed += resetOrders.length;
         }
 
         summary.batchesProcessed++;
