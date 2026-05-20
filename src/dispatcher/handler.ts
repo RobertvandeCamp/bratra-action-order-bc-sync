@@ -253,7 +253,8 @@ export const handler = async (
                 error_message: null,
                 failed_at: null,
               })
-              .eq("id", syncRecord.id);
+              .eq("id", syncRecord.id)
+              .eq("status", "failed"); // Optimistic lock: only update if still 'failed'
 
             if (updateError) {
               console.error("Failed to reset sync record for re-dispatch", {
