@@ -107,7 +107,7 @@ async function main(): Promise<void> {
   const batchId = `${TEST_BATCH_PREFIX}${randomUUID().slice(0, 8)}`;
 
   // Determine legal entity (same logic as dispatcher)
-  const legalEntity = "BRATRA-NONFOOD"; // Hardcoded for test -- no PP detection needed
+  const legalEntity = "BRATRA-NL"; // Matches Postman collection examples
 
   const envelope = mapOrdersToEnvelope(orders, {
     messageId,

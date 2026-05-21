@@ -54,7 +54,7 @@ export interface EnvelopeOrderLine {
   quantities: {
     reqQuantity: number | null;
     expQuantity: number | null;
-    palletPattern: string | null;
+    palletPattern: number | null;
     pallets: number | null;
   };
   pricing: {

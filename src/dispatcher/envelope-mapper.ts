@@ -75,6 +75,10 @@ export function mapOrdersToEnvelope(
   };
 }
 
+// Sensible defaults aligned with Postman happy path examples from ERP Company.
+// ERP Company schema rejects null for numeric fields -- use 0 as default.
+// String fields use "" instead of null where Postman examples show empty strings.
+
 function mapOrder(o: WarehouseOrder): EnvelopeOrder {
   return {
     poNumber: o.po_number,
@@ -90,21 +94,21 @@ function mapOrder(o: WarehouseOrder): EnvelopeOrder {
       unloadingLocation: o.unloading_location || "",
     },
     dates: {
-      reqDeliveryDate: o.req_delivery_date,
-      expDeliveryDate: o.exp_delivery_date,
-      reqETD: o.req_etd,
-      expETD: o.exp_etd,
-      eta: o.eta,
+      reqDeliveryDate: o.req_delivery_date ?? null,
+      expDeliveryDate: o.exp_delivery_date ?? null,
+      reqETD: o.req_etd ?? null,
+      expETD: o.exp_etd ?? null,
+      eta: o.eta ?? null,
     },
     shipping: {
-      truckProposal: o.truck_proposal,
-      shipId: o.ship_id,
-      shipmentStatus: o.shipment_status,
-      portOfDepartureCode: o.port_of_departure_code,
-      portOfDeparture: o.port_of_departure,
-      portOfArrivalCode: o.port_of_arrival_code,
-      portOfArrival: o.port_of_arrival,
-      containerType: o.container_type,
+      truckProposal: o.truck_proposal ?? "",
+      shipId: o.ship_id ?? "",
+      shipmentStatus: o.shipment_status ?? "",
+      portOfDepartureCode: o.port_of_departure_code ?? null,
+      portOfDeparture: o.port_of_departure ?? null,
+      portOfArrivalCode: o.port_of_arrival_code ?? null,
+      portOfArrival: o.port_of_arrival ?? null,
+      containerType: o.container_type ?? null,
     },
     lines: o.order_lines.map(mapOrderLine),
   };
@@ -113,25 +117,25 @@ function mapOrder(o: WarehouseOrder): EnvelopeOrder {
 function mapOrderLine(l: WarehouseOrderLine): EnvelopeOrderLine {
   return {
     lineNumber: l.line_number ?? 0,
-    articleNumberAction: l.action_articles.article_number,
-    articleNumberSupplier: l.bratra_articles?.article_number ?? null,
-    articleDescription: l.action_articles.description,
+    articleNumberAction: l.action_articles.article_number ?? "",
+    articleNumberSupplier: l.bratra_articles?.article_number ?? "",
+    articleDescription: l.action_articles.description ?? "",
     category: l.category || "",
     logisticGroup: l.logistic_group || "",
-    allocation: l.allocation,
+    allocation: l.allocation ?? null,
     quantities: {
-      reqQuantity: l.req_quantity,
-      expQuantity: l.exp_quantity,
-      palletPattern: l.pallet_pattern ? String(l.pallet_pattern) : null,
-      pallets: l.pallets,
+      reqQuantity: l.req_quantity ?? 0,
+      expQuantity: l.exp_quantity ?? 0,
+      palletPattern: l.pallet_pattern ?? 0,
+      pallets: l.pallets ?? 0,
     },
     pricing: {
-      unitPrice: l.price,
+      unitPrice: l.price ?? 0,
       currency: l.unit_price_currency || "EUR",
     },
     compliance: {
       hg: l.hazardous_goods || "",
-      adr: l.adr,
+      adr: l.adr ?? null,
       icpe: l.icpe ? Number(l.icpe) : null,
     },
   };
