@@ -80,6 +80,10 @@ export function mapOrdersToEnvelope(
 // String fields use "" instead of null where Postman examples show empty strings.
 
 function mapOrder(o: WarehouseOrder): EnvelopeOrder {
+  // BC Buffer Processor rejects: null expDeliveryDate, empty truckProposal,
+  // past delivery dates. Apply sensible defaults.
+  const reqDate = o.req_delivery_date ?? new Date().toISOString().slice(0, 10);
+
   return {
     poNumber: o.po_number,
     orderType: o.order_type || "Regular order",
@@ -94,14 +98,14 @@ function mapOrder(o: WarehouseOrder): EnvelopeOrder {
       unloadingLocation: o.unloading_location || "",
     },
     dates: {
-      reqDeliveryDate: o.req_delivery_date ?? null,
-      expDeliveryDate: o.exp_delivery_date ?? null,
+      reqDeliveryDate: reqDate,
+      expDeliveryDate: o.exp_delivery_date ?? reqDate, // fallback to reqDeliveryDate
       reqETD: o.req_etd ?? null,
       expETD: o.exp_etd ?? null,
       eta: o.eta ?? null,
     },
     shipping: {
-      truckProposal: o.truck_proposal ?? "",
+      truckProposal: o.truck_proposal || "0", // BC rejects empty string
       shipId: o.ship_id ?? "",
       shipmentStatus: o.shipment_status ?? "",
       portOfDepartureCode: o.port_of_departure_code ?? null,
@@ -110,13 +114,17 @@ function mapOrder(o: WarehouseOrder): EnvelopeOrder {
       portOfArrival: o.port_of_arrival ?? null,
       containerType: o.container_type ?? null,
     },
-    lines: o.order_lines.map(mapOrderLine),
+    lines: o.order_lines.map((line, idx) => mapOrderLine(line, idx)),
   };
 }
 
-function mapOrderLine(l: WarehouseOrderLine): EnvelopeOrderLine {
+function mapOrderLine(
+  l: WarehouseOrderLine,
+  index: number,
+): EnvelopeOrderLine {
   return {
-    lineNumber: l.line_number ?? 0,
+    // BC rejects lineNumber=0. Generate 10, 20, 30... if not set in DB.
+    lineNumber: l.line_number ?? (index + 1) * 10,
     articleNumberAction: l.action_articles.article_number ?? "",
     articleNumberSupplier: l.bratra_articles?.article_number ?? "",
     articleDescription: l.action_articles.description ?? "",
