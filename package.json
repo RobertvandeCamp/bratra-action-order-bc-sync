@@ -1,0 +1,31 @@
+{
+  "name": "bratra-action-order-bc-sync",
+  "version": "1.0.0",
+  "description": "Lambda voor BC sync van action orders via Azure Service Bus",
+  "main": "dist/index.js",
+  "container-registry": "bratra/bratra-action-order-bc-sync",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "build:check": "tsc --noEmit",
+    "test": "echo \"Add tests here\"",
+    "test:local": "npx tsx scripts/test-local.ts"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^5.2.2",
+    "@supabase/supabase-js": "^2.106.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.161",
+    "@types/node": "^24",
+    "dotenv": "^17",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "author": "Robert van de Camp",
+  "license": "MIT"
+}
