@@ -4,7 +4,8 @@ import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { checkBufferStatuses } from "./bc-buffer-checker";
-import type { BCConfig } from "../shared/types";
+import { checkDlqMessages } from "./dlq-checker";
+import type { BCConfig, DlqSummary } from "../shared/types";
 
 /** Non-food company (consistent with dispatcher) */
 const COMPANY_ID = 2;
@@ -54,26 +55,39 @@ export const handler = async (
     throw new Error(`Failed to query sent orders: ${error.message}`);
   }
 
+  // 5-7. Buffer check (only when sent orders exist)
+  let bufferSummary = null;
+
   if (!sentOrders || sentOrders.length === 0) {
     console.log("No sent orders to verify");
-    return;
+  } else {
+    console.log("Sent orders to verify", { count: sentOrders.length });
+
+    // 5. D-06: M2M auth for BC API
+    const token = await authenticateM2M(config.BC_TENANT_ID);
+
+    // 6. Build BCConfig
+    const bcConfig: BCConfig = {
+      tenantId: config.BC_TENANT_ID,
+      environment: config.BC_ENVIRONMENT,
+      companyId: config.BC_COMPANY_ID,
+    };
+
+    // 7. Check buffer statuses
+    bufferSummary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase);
   }
 
-  console.log("Sent orders to verify", { count: sentOrders.length });
+  // 8. DLQ check (non-fatal, always runs -- D-09)
+  let dlqSummary: DlqSummary | null = null;
+  try {
+    dlqSummary = await checkDlqMessages(supabase);
+  } catch (err) {
+    console.error("DLQ check failed (non-fatal)", { error: (err as Error).message });
+  }
 
-  // 5. D-06: M2M auth for BC API
-  const token = await authenticateM2M(config.BC_TENANT_ID);
-
-  // 6. Build BCConfig
-  const bcConfig: BCConfig = {
-    tenantId: config.BC_TENANT_ID,
-    environment: config.BC_ENVIRONMENT,
-    companyId: config.BC_COMPANY_ID,
-  };
-
-  // 7. Check buffer statuses
-  const summary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase);
-
-  // 8. Log summary
-  console.log("Verification complete", summary);
+  // 9. Log gecombineerde summary (D-10)
+  console.log("Verification complete", {
+    buffer: bufferSummary ?? "no sent orders",
+    dlq: dlqSummary ?? "skipped (error)",
+  });
 };

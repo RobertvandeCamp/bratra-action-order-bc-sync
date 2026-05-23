@@ -35,11 +35,13 @@ Modes:
   dry-run   Haal 2 orders op, bouw envelope, log alles, stuur NIET naar Service Bus
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
+  dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
 
 Examples:
   npm run test:local -- dry-run
   npm run test:local -- live
   npm run test:local -- cleanup
+  npm run test:local -- dlq
 `;
 
 // ============================================================================
@@ -65,9 +67,15 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["dry-run", "live", "cleanup"].includes(mode)) {
+  if (!mode || !["dry-run", "live", "cleanup", "dlq"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
+  }
+
+  // DLQ mode: geen sandbox guard nodig (leest geen BC data)
+  if (mode === "dlq") {
+    await dlqPeek();
+    return;
   }
 
   assertSandbox();
@@ -345,6 +353,53 @@ async function cleanup(supabase: ReturnType<typeof import("../src/shared/supabas
   }
 
   console.log(`\n${ids.length} records verwijderd. Test is herhaalbaar.\n`);
+}
+
+async function dlqPeek(): Promise<void> {
+  console.log("\n--- DLQ Peek: berichten in bratra-inbound/$DeadLetterQueue ---\n");
+
+  const { getConfig } = await import("../src/shared/config");
+  const { generateSasToken } = await import("../src/shared/service-bus-client");
+  const config = getConfig();
+  const token = generateSasToken(config.SB_NAMESPACE, config.SB_QUEUE, config.SB_KEY_NAME, config.SB_KEY_VALUE);
+
+  let count = 0;
+  const MAX_PEEK = 20;
+
+  for (let i = 0; i < MAX_PEEK; i++) {
+    const url = `https://${config.SB_NAMESPACE}.servicebus.windows.net/${config.SB_QUEUE}/$DeadLetterQueue/messages/head?timeout=2`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: token },
+    });
+
+    if (response.status === 204) break;
+    if (response.status !== 201) {
+      console.error(`DLQ receive failed: HTTP ${response.status}`);
+      const body = await response.text();
+      if (body) console.error(`   ${body.slice(0, 300)}`);
+      break;
+    }
+
+    count++;
+    const brokerProps = JSON.parse(response.headers.get("BrokerProperties") ?? "{}");
+    const reason = response.headers.get("DeadLetterReason") ?? "Unknown";
+    const body = await response.text();
+
+    console.log(`Bericht ${count}:`);
+    console.log(`   MessageId:        ${brokerProps.MessageId}`);
+    console.log(`   SequenceNumber:   ${brokerProps.SequenceNumber}`);
+    console.log(`   DeadLetterReason: ${reason}`);
+    console.log(`   EnqueuedTime:     ${brokerProps.EnqueuedTimeUtc}`);
+    console.log(`   Body preview:     ${body.slice(0, 200)}`);
+    console.log();
+
+    // Bericht is nu gelocked -- geen DELETE (peek-only)
+  }
+
+  console.log(`DLQ diepte: minimaal ${count} berichten`);
+  if (count === 0) console.log("DLQ is leeg.");
+  console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
 }
 
 function sleep(ms: number): Promise<void> {
