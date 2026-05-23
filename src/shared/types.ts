@@ -351,3 +351,18 @@ export interface DlqMessage {
   /** Location header voor DELETE URL (complete bericht) */
   locationUrl: string | null;
 }
+
+// ============================================================================
+// SQS Trigger types (Phase 152.2)
+// ============================================================================
+
+/**
+ * SQS message body sent by bratra-action-orders-importer after successful import.
+ * Triggers the dispatcher to process unsynced orders for the specified company.
+ */
+export interface SqsTriggerMessage {
+  /** Company ID to dispatch orders for */
+  companyId: number;
+  /** ISO timestamp of when the import completed (optional, for logging) */
+  timestamp?: string;
+}

@@ -1,4 +1,4 @@
-import type { ScheduledEvent, Context } from "aws-lambda";
+import type { SQSEvent, SQSRecord, ScheduledEvent, Context } from "aws-lambda";
 import { randomUUID } from "node:crypto";
 
 import { fetchUnsyncedOrders, fetchFailedSyncRecords, recoverStalePendingRecords } from "./order-fetcher";
@@ -12,8 +12,36 @@ import { getSupabaseClient } from "../shared/supabase-client";
 import type {
   BcSyncOrderInsert,
   BcSyncOrderRow,
+  SqsTriggerMessage,
   WarehouseOrder,
 } from "../shared/types";
+
+/** Dispatcher accepts both SQS (event-driven) and ScheduledEvent (fallback) triggers */
+type DispatcherEvent = SQSEvent | ScheduledEvent;
+
+/** Type guard: SQS events have Records[], ScheduledEvent does not */
+function isSqsEvent(event: DispatcherEvent): event is SQSEvent {
+  return "Records" in event && Array.isArray((event as SQSEvent).Records);
+}
+
+/** Extract and validate companyId from SQS message body (T-152.2-02) */
+function extractCompanyId(record: SQSRecord): number | null {
+  try {
+    const body = JSON.parse(record.body) as Partial<SqsTriggerMessage>;
+    const { companyId } = body;
+    if (typeof companyId !== "number" || !Number.isFinite(companyId)) {
+      console.error("Invalid companyId in SQS body", { body: record.body });
+      return null;
+    }
+    return companyId;
+  } catch (err) {
+    console.error("Failed to parse SQS body", {
+      body: record.body,
+      error: (err as Error).message,
+    });
+    return null;
+  }
+}
 
 /** Non-food company (D-04: Non-food first) */
 const COMPANY_ID = 2;
@@ -34,12 +62,34 @@ const PG_UNIQUE_VIOLATION = "23505";
  * CONSTRAINT D-02: Sends ONLY to Service Bus via sendToServiceBus(). No direct BC API calls.
  */
 export const handler = async (
-  _event: ScheduledEvent,
+  event: DispatcherEvent,
   context: Context,
 ): Promise<void> => {
-  console.log("Dispatcher handler invoked", {
-    requestId: context.awsRequestId,
-  });
+  // Dual-trigger: detect SQS vs ScheduledEvent (D-10)
+  let companyId: number;
+
+  if (isSqsEvent(event)) {
+    // SQS trigger path: extract companyId from message body (D-11)
+    const record = event.Records[0]; // batch_size=1 per D-12
+    console.log("Dispatcher handler invoked (SQS trigger)", {
+      requestId: context.awsRequestId,
+      sqsMessageId: record.messageId,
+    });
+
+    const extractedId = extractCompanyId(record);
+    if (extractedId === null) {
+      // Invalid message -- return success to delete from queue (avoid DLQ pollution)
+      console.error("Skipping invalid SQS message");
+      return;
+    }
+    companyId = extractedId;
+  } else {
+    // ScheduledEvent / manual invoke path (existing behavior)
+    console.log("Dispatcher handler invoked (scheduled trigger)", {
+      requestId: context.awsRequestId,
+    });
+    companyId = COMPANY_ID;
+  }
 
   // D-01: Warn if BC_ENVIRONMENT is not sandbox
   const bcEnv = process.env.BC_ENVIRONMENT ?? "";
@@ -53,20 +103,20 @@ export const handler = async (
   const supabase = getSupabaseClient();
 
   // 0. Recover orphaned 'pending' records from Lambda crash/timeout (> 5 min old)
-  await recoverStalePendingRecords(COMPANY_ID);
+  await recoverStalePendingRecords(companyId);
 
   // 1. Fetch new unsync'd orders
-  const newOrders = await fetchUnsyncedOrders(COMPANY_ID);
+  const newOrders = await fetchUnsyncedOrders(companyId);
 
   // 2. Fetch failed sync records for re-dispatch
-  const failedRecords = await fetchFailedSyncRecords(COMPANY_ID);
+  const failedRecords = await fetchFailedSyncRecords(companyId);
 
   // 3. Separate new orders from orders that already have a failed sync record
   const failedOrderIds = new Set(failedRecords.map((r) => r.order_id));
   const trulyNewOrders = newOrders.filter((o) => !failedOrderIds.has(o.id));
 
   if (trulyNewOrders.length === 0 && failedRecords.length === 0) {
-    console.log("No orders to dispatch", { companyId: COMPANY_ID });
+    console.log("No orders to dispatch", { companyId });
     return;
   }
 
@@ -217,7 +267,7 @@ export const handler = async (
     const { data: failedOrderRows, error: failedFetchError } = await supabase
       .from("orders")
       .select("id, po_number, company_id, carrier_code, carrier, req_delivery_date, exp_delivery_date, order_type, unloading_location, truck_proposal, ship_id, shipment_status, req_etd, exp_etd, eta, port_of_departure_code, port_of_departure, port_of_arrival_code, port_of_arrival, container_type, distribution_centers (code, name, location), order_lines (id, line_number, contract_number, req_quantity, exp_quantity, price, pallet_pattern, pallets, category, unit_price_currency, allocation, hazardous_goods, adr, icpe, logistic_group, action_articles!inner (article_number, description), bratra_articles (article_number))")
-      .eq("company_id", COMPANY_ID)
+      .eq("company_id", companyId)
       .in("id", failedOrderIdsList);
 
     if (failedFetchError) {
