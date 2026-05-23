@@ -309,3 +309,45 @@ export interface BcBufferRecord {
   /** BC entry nummer */
   entryNo: number;
 }
+
+// ============================================================================
+// DLQ types (Phase 152.1)
+// ============================================================================
+
+/** Summary van DLQ verwerking per verifier run */
+export interface DlqSummary {
+  /** Aantal berichten verwerkt en uit queue verwijderd */
+  processed: number;
+  /** Aantal berichten gematcht aan bc_sync_orders */
+  matched: number;
+  /** Aantal berichten zonder match maar wel opgeslagen */
+  unmatched: number;
+  /** Aantal berichten al eerder verwerkt (idempotent) */
+  skipped: number;
+  /** Aantal verwerkingsfouten */
+  errors: number;
+}
+
+/** Service Bus BrokerProperties header uit DLQ bericht */
+export interface DlqBrokerProperties {
+  MessageId: string;
+  SequenceNumber: number;
+  LockToken: string;
+  DeliveryCount: number;
+  EnqueuedTimeUtc: string;
+  EnqueuedSequenceNumber: number;
+  Label?: string;
+  CorrelationId?: string;
+}
+
+/** Enkel DLQ bericht zoals ontvangen van Service Bus REST API */
+export interface DlqMessage {
+  brokerProperties: DlqBrokerProperties;
+  deadLetterReason: string;
+  deadLetterErrorDescription: string;
+  /** Raw envelope JSON body */
+  body: string;
+  lockToken: string;
+  /** Location header voor DELETE URL (complete bericht) */
+  locationUrl: string | null;
+}
