@@ -69,6 +69,7 @@ export async function checkBufferStatuses(
       const endpoint = `companies(${bcConfig.companyId})/bratraSalesOrderBuffers?$filter=externalId eq '${safeExternalId}'`;
       const result = await bcGet<BcBufferRecord>(token, bcConfig, endpoint, {
         paginate: false,
+        apiRoute: "api/erpcompany/integration/v1.0",
       });
 
       // D-10: Not found -- buffer not yet arrived at BC

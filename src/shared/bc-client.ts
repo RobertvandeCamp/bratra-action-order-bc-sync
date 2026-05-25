@@ -5,8 +5,8 @@ export interface Company {
   name: string;
 }
 
-function getBaseUrl(config: BCConfig): string {
-  return `https://api.businesscentral.dynamics.com/v2.0/${config.tenantId}/${config.environment}/api/v2.0`;
+function getBaseUrl(config: BCConfig, apiRoute = "api/v2.0"): string {
+  return `https://api.businesscentral.dynamics.com/v2.0/${config.tenantId}/${config.environment}/${apiRoute}`;
 }
 
 /**
@@ -69,8 +69,8 @@ export async function bcGet<T = Record<string, unknown>>(
   endpoint: string,
   options?: BcGetOptions,
 ): Promise<BCListResponse<T>> {
-  const { paginate = true, maxPages = 10 } = options ?? {};
-  const baseUrl = getBaseUrl(config);
+  const { paginate = true, maxPages = 10, apiRoute } = options ?? {};
+  const baseUrl = getBaseUrl(config, apiRoute);
   const isFullUrl = endpoint.startsWith("https://");
   const url = isFullUrl ? endpoint : `${baseUrl}/${endpoint}`;
 

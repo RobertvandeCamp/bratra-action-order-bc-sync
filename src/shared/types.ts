@@ -256,6 +256,9 @@ export interface BCListResponse<T> {
 export interface BcGetOptions {
   paginate?: boolean;
   maxPages?: number;
+  /** Custom API route override. Default: "api/v2.0" (standard BC API).
+   *  For ERP Company custom pages: "api/erpcompany/integration/v1.0" */
+  apiRoute?: string;
 }
 
 /**
