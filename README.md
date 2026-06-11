@@ -2,6 +2,8 @@
 
 Automatically sends action orders from the BRATRA data warehouse to Business Central via the ERP Company integration layer (Azure Service Bus).
 
+Full integration documentation (ERP Company architecture guide, Postman collection, test reports, M2M setup) lives in [`docs/`](docs/README.md).
+
 ## What it does
 
 BRATRA employees import weekly action orders (purchase orders from Action) into the data warehouse via Excel uploads. Previously, these orders had to be manually entered into Business Central. This service automates that process:

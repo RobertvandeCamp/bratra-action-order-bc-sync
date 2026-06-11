@@ -1,0 +1,227 @@
+{
+  "info": {
+    "name": "Bratra Inbound (Service Bus)",
+    "description": "Send messages to the Bratra Integration Platform's inbound Service Bus queue (`bratra-inbound`).\n\nEvery request:\n- Auto-generates a fresh SAS token via the pre-request script (HMAC-SHA256 in CryptoJS). Token TTL is 10 minutes — no need to refresh manually.\n- Auto-generates a fresh `meta.messageId` (UUIDv4) and `meta.correlationId` (timestamped) so each send is idempotent and traceable.\n- Sets the right Service Bus broker properties (MessageId, CorrelationId, Label) on the message envelope.\n\nSee `README.md` for setup + auth steps.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "bratra-iris"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Generate a fresh SAS token (10-min TTL) + new messageId/correlationId for every send.",
+          "const namespace = pm.variables.get('sb_namespace');",
+          "const queue     = pm.variables.get('sb_queue');",
+          "const keyName   = pm.variables.get('sb_key_name');",
+          "const keyValue  = pm.variables.get('sb_key_value');",
+          "",
+          "if (!namespace || !queue || !keyName || !keyValue) {",
+          "    throw new Error('Missing variables. Set sb_namespace, sb_queue, sb_key_name, sb_key_value in your environment.');",
+          "}",
+          "",
+          "const resourceUri = `https://${namespace}/${queue}`;",
+          "const ttlSeconds  = 600;",
+          "const expiry      = Math.floor(Date.now() / 1000) + ttlSeconds;",
+          "const stringToSign = encodeURIComponent(resourceUri) + '\\n' + expiry;",
+          "",
+          "const sig = CryptoJS.HmacSHA256(stringToSign, keyValue).toString(CryptoJS.enc.Base64);",
+          "const token = `SharedAccessSignature sr=${encodeURIComponent(resourceUri)}&sig=${encodeURIComponent(sig)}&se=${expiry}&skn=${keyName}`;",
+          "",
+          "pm.variables.set('sas_token', token);",
+          "",
+          "// Fresh ids per send.",
+          "const newMid = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : pm.variables.replaceIn('{{$guid}}');",
+          "pm.variables.set('messageId', newMid);",
+          "pm.variables.set('correlationId', `wesley-${new Date().toISOString().replace(/[:.]/g, '-')}-${newMid.slice(0,8)}`);",
+          "pm.variables.set('occurredOnUtc', new Date().toISOString());",
+          ""
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "sb_namespace",
+      "value": "sb-bratra-int-dev-weu.servicebus.windows.net",
+      "type": "string"
+    },
+    {
+      "key": "sb_queue",
+      "value": "bratra-inbound",
+      "type": "string"
+    },
+    {
+      "key": "sb_key_name",
+      "value": "producer-send",
+      "type": "string"
+    },
+    {
+      "key": "sb_key_value",
+      "value": "<set in environment, never commit>",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Send valid Action order envelope (happy path)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "{{sas_token}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "BrokerProperties",
+            "value": "{\"MessageId\":\"{{messageId}}\",\"CorrelationId\":\"{{correlationId}}\",\"Label\":\"ActionOrderBatchV1\"}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://{{sb_namespace}}/{{sb_queue}}/messages",
+          "protocol": "https",
+          "host": [
+            "{{sb_namespace}}"
+          ],
+          "path": [
+            "{{sb_queue}}",
+            "messages"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"meta\": {\n    \"messageId\":     \"{{messageId}}\",\n    \"correlationId\": \"{{correlationId}}\",\n    \"name\":          \"ActionOrderBatchV1\",\n    \"version\":       \"1\",\n    \"source\":        \"BratraIntegrationPlatform\",\n    \"legalEntity\":   \"BRATRA-NL\",\n    \"occurredOnUtc\": \"{{occurredOnUtc}}\"\n  },\n  \"payload\": {\n    \"orders\": [\n      {\n        \"poNumber\": \"4002845709\",\n        \"orderType\": \"Regular order\",\n        \"contractNumber\": \"A250002419\",\n        \"carrier\": { \"code\": \"50015\", \"name\": \"ID Freight Netherlands B.V.\" },\n        \"distributionCenter\": { \"code\": \"8990\", \"name\": \"Wallersdorf\", \"unloadingLocation\": \"\" },\n        \"dates\": {\n          \"reqDeliveryDate\": \"2026-05-15\",\n          \"expDeliveryDate\": \"2026-05-15\",\n          \"reqETD\": null, \"expETD\": null, \"eta\": null\n        },\n        \"shipping\": {\n          \"truckProposal\": \"1\", \"shipId\": \"\", \"shipmentStatus\": \"\",\n          \"portOfDepartureCode\": null, \"portOfDeparture\": null,\n          \"portOfArrivalCode\": null, \"portOfArrival\": null, \"containerType\": null\n        },\n        \"lines\": [\n          {\n            \"lineNumber\": 10,\n            \"articleNumberAction\": \"3007781\",\n            \"articleNumberSupplier\": \"8721008420981\",\n            \"articleDescription\": \"hr t-shirt mcg katoen m-xxl wit div.var\",\n            \"category\": \"11\",\n            \"logisticGroup\": \"009\",\n            \"allocation\": null,\n            \"quantities\": { \"reqQuantity\": 2352, \"expQuantity\": 2352, \"palletPattern\": 1176, \"pallets\": 2 },\n            \"pricing\": { \"unitPrice\": 2.35, \"currency\": \"EUR\" },\n            \"compliance\": { \"hg\": \"\", \"adr\": null, \"icpe\": 1510 }\n          }\n        ]\n      }\n    ]\n  }\n}"
+        },
+        "description": "Sends a valid `ActionOrderBatchV1` envelope. Expected: HTTP 201 from Service Bus, then within seconds a row appears in BC `bratraSalesOrderBuffers` (status `Pending`)."
+      }
+    },
+    {
+      "name": "2. Send custom envelope (edit the body)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "{{sas_token}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "BrokerProperties",
+            "value": "{\"MessageId\":\"{{messageId}}\",\"CorrelationId\":\"{{correlationId}}\",\"Label\":\"ActionOrderBatchV1\"}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://{{sb_namespace}}/{{sb_queue}}/messages",
+          "protocol": "https",
+          "host": [
+            "{{sb_namespace}}"
+          ],
+          "path": [
+            "{{sb_queue}}",
+            "messages"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"meta\": {\n    \"messageId\":     \"{{messageId}}\",\n    \"correlationId\": \"{{correlationId}}\",\n    \"name\":          \"ActionOrderBatchV1\",\n    \"version\":       \"1\",\n    \"source\":        \"BratraIntegrationPlatform\",\n    \"legalEntity\":   \"BRATRA-NL\",\n    \"occurredOnUtc\": \"{{occurredOnUtc}}\"\n  },\n  \"payload\": {\n    \"orders\": [\n      {\n        \"poNumber\": \"REPLACE_ME\",\n        \"orderType\": \"Regular order\",\n        \"contractNumber\": \"\",\n        \"carrier\": { \"code\": \"\", \"name\": \"\" },\n        \"distributionCenter\": { \"code\": \"\", \"name\": \"\", \"unloadingLocation\": \"\" },\n        \"dates\": { \"reqDeliveryDate\": null, \"expDeliveryDate\": null, \"reqETD\": null, \"expETD\": null, \"eta\": null },\n        \"shipping\": { \"truckProposal\": \"\", \"shipId\": \"\", \"shipmentStatus\": \"\", \"portOfDepartureCode\": null, \"portOfDeparture\": null, \"portOfArrivalCode\": null, \"portOfArrival\": null, \"containerType\": null },\n        \"lines\": [\n          {\n            \"lineNumber\": 10,\n            \"articleNumberAction\": \"\",\n            \"articleNumberSupplier\": \"\",\n            \"articleDescription\": \"\",\n            \"category\": \"\",\n            \"logisticGroup\": \"\",\n            \"allocation\": null,\n            \"quantities\": { \"reqQuantity\": 1, \"expQuantity\": 1, \"palletPattern\": 0, \"pallets\": 0 },\n            \"pricing\": { \"unitPrice\": 0.00, \"currency\": \"EUR\" },\n            \"compliance\": { \"hg\": \"\", \"adr\": null, \"icpe\": null }\n          }\n        ]\n      }\n    ]\n  }\n}"
+        },
+        "description": "Same wire as request #1, with a stripped-down body for you to fill in. Useful for testing your own scenarios. Don't change `meta.name` unless you know which orchestrator you're targeting."
+      }
+    },
+    {
+      "name": "3. Send malformed envelope (DLQ demo)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "{{sas_token}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "BrokerProperties",
+            "value": "{\"MessageId\":\"{{messageId}}\",\"CorrelationId\":\"{{correlationId}}\",\"Label\":\"BadEnvelope\"}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://{{sb_namespace}}/{{sb_queue}}/messages",
+          "protocol": "https",
+          "host": [
+            "{{sb_namespace}}"
+          ],
+          "path": [
+            "{{sb_queue}}",
+            "messages"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"meta\": {\n    \"messageId\":     \"{{messageId}}\",\n    \"correlationId\": \"{{correlationId}}\",\n    \"name\":          \"SomethingThatDoesNotExist\",\n    \"version\":       \"1\",\n    \"source\":        \"WesleyTest\",\n    \"legalEntity\":   \"BRATRA-NL\",\n    \"occurredOnUtc\": \"{{occurredOnUtc}}\"\n  },\n  \"payload\": { \"orders\": [] }\n}"
+        },
+        "description": "Sends an envelope with an unknown `meta.name`. Expected: Service Bus accepts (201) but the consumer dead-letters with reason `UnknownMessageName`. Use this to confirm DLQ behaviour without polluting the BC sandbox."
+      }
+    },
+    {
+      "name": "4. Send multi-order batch (3 orders, fan-out test)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "{{sas_token}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "BrokerProperties",
+            "value": "{\"MessageId\":\"{{messageId}}\",\"CorrelationId\":\"{{correlationId}}\",\"Label\":\"ActionOrderBatchV1\"}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://{{sb_namespace}}/{{sb_queue}}/messages",
+          "protocol": "https",
+          "host": [
+            "{{sb_namespace}}"
+          ],
+          "path": [
+            "{{sb_queue}}",
+            "messages"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"meta\": {\n    \"messageId\":     \"{{messageId}}\",\n    \"correlationId\": \"{{correlationId}}\",\n    \"name\":          \"ActionOrderBatchV1\",\n    \"version\":       \"1\",\n    \"source\":        \"BratraIntegrationPlatform\",\n    \"legalEntity\":   \"BRATRA-NL\",\n    \"occurredOnUtc\": \"{{occurredOnUtc}}\"\n  },\n  \"payload\": {\n    \"orders\": [\n      {\n        \"poNumber\": \"4002845710\",\n        \"orderType\": \"Regular order\",\n        \"contractNumber\": \"A250002419\",\n        \"carrier\": { \"code\": \"50015\", \"name\": \"ID Freight Netherlands B.V.\" },\n        \"distributionCenter\": { \"code\": \"8990\", \"name\": \"Wallersdorf\", \"unloadingLocation\": \"\" },\n        \"dates\": { \"reqDeliveryDate\": \"2026-05-15\", \"expDeliveryDate\": \"2026-05-15\", \"reqETD\": null, \"expETD\": null, \"eta\": null },\n        \"shipping\": { \"truckProposal\": \"1\", \"shipId\": \"\", \"shipmentStatus\": \"\", \"portOfDepartureCode\": null, \"portOfDeparture\": null, \"portOfArrivalCode\": null, \"portOfArrival\": null, \"containerType\": null },\n        \"lines\": [\n          {\n            \"lineNumber\": 10,\n            \"articleNumberAction\": \"3007781\",\n            \"articleNumberSupplier\": \"8721008420981\",\n            \"articleDescription\": \"hr t-shirt mcg katoen m-xxl wit div.var (batch order 1)\",\n            \"category\": \"11\", \"logisticGroup\": \"009\", \"allocation\": null,\n            \"quantities\": { \"reqQuantity\": 1000, \"expQuantity\": 1000, \"palletPattern\": 1176, \"pallets\": 1 },\n            \"pricing\": { \"unitPrice\": 2.35, \"currency\": \"EUR\" },\n            \"compliance\": { \"hg\": \"\", \"adr\": null, \"icpe\": 1510 }\n          }\n        ]\n      },\n      {\n        \"poNumber\": \"4002845711\",\n        \"orderType\": \"Regular order\",\n        \"contractNumber\": \"A250002420\",\n        \"carrier\": { \"code\": \"50015\", \"name\": \"ID Freight Netherlands B.V.\" },\n        \"distributionCenter\": { \"code\": \"8990\", \"name\": \"Wallersdorf\", \"unloadingLocation\": \"Dock A\" },\n        \"dates\": { \"reqDeliveryDate\": \"2026-05-16\", \"expDeliveryDate\": \"2026-05-16\", \"reqETD\": null, \"expETD\": null, \"eta\": null },\n        \"shipping\": { \"truckProposal\": \"2\", \"shipId\": \"\", \"shipmentStatus\": \"\", \"portOfDepartureCode\": null, \"portOfDeparture\": null, \"portOfArrivalCode\": null, \"portOfArrival\": null, \"containerType\": null },\n        \"lines\": [\n          {\n            \"lineNumber\": 10,\n            \"articleNumberAction\": \"3007781\",\n            \"articleNumberSupplier\": \"8721008420981\",\n            \"articleDescription\": \"hr t-shirt mcg katoen m-xxl wit div.var (batch order 2)\",\n            \"category\": \"11\", \"logisticGroup\": \"009\", \"allocation\": null,\n            \"quantities\": { \"reqQuantity\": 2000, \"expQuantity\": 2000, \"palletPattern\": 1176, \"pallets\": 2 },\n            \"pricing\": { \"unitPrice\": 2.35, \"currency\": \"EUR\" },\n            \"compliance\": { \"hg\": \"\", \"adr\": null, \"icpe\": 1510 }\n          }\n        ]\n      },\n      {\n        \"poNumber\": \"4002845712\",\n        \"orderType\": \"Regular order\",\n        \"contractNumber\": \"A250002421\",\n        \"carrier\": { \"code\": \"50015\", \"name\": \"ID Freight Netherlands B.V.\" },\n        \"distributionCenter\": { \"code\": \"8990\", \"name\": \"Wallersdorf\", \"unloadingLocation\": \"Dock B\" },\n        \"dates\": { \"reqDeliveryDate\": \"2026-05-17\", \"expDeliveryDate\": \"2026-05-17\", \"reqETD\": null, \"expETD\": null, \"eta\": null },\n        \"shipping\": { \"truckProposal\": \"3\", \"shipId\": \"\", \"shipmentStatus\": \"\", \"portOfDepartureCode\": null, \"portOfDeparture\": null, \"portOfArrivalCode\": null, \"portOfArrival\": null, \"containerType\": null },\n        \"lines\": [\n          {\n            \"lineNumber\": 10,\n            \"articleNumberAction\": \"3007781\",\n            \"articleNumberSupplier\": \"8721008420981\",\n            \"articleDescription\": \"hr t-shirt mcg katoen m-xxl wit div.var (batch order 3)\",\n            \"category\": \"11\", \"logisticGroup\": \"009\", \"allocation\": null,\n            \"quantities\": { \"reqQuantity\": 500, \"expQuantity\": 500, \"palletPattern\": 1176, \"pallets\": 1 },\n            \"pricing\": { \"unitPrice\": 2.35, \"currency\": \"EUR\" },\n            \"compliance\": { \"hg\": \"\", \"adr\": null, \"icpe\": 1510 }\n          }\n        ]\n      }\n    ]\n  }\n}"
+        },
+        "description": "Sends one envelope with three orders (POs 4002845710, 4002845711, 4002845712). Expected: HTTP 201 from Service Bus; the Function fans out to three independent Durable orchestrations (instance IDs share the correlationId prefix and differ by poNumber); three distinct rows appear in BC's `bratraSalesOrderBuffers` with externalIds `BRA-AC-{messageId}-4002845710/4002845711/4002845712`. Each row processes through the Job Queue independently — one failing does not affect the others. The 3 rows also have visible differences in `Contract Number`, `Unloading Location`, and `Quantity` so they're easy to tell apart on the buffer list page."
+      }
+    }
+  ]
+}
