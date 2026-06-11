@@ -297,12 +297,13 @@ async function fetchTestOrders(supabase: ReturnType<typeof import("../src/shared
 
   const syncedIds = new Set((syncedRows ?? []).map((r: { order_id: number }) => r.order_id));
 
-  // Get all non-food orders
+  // Get recent non-food orders (newest first — oldest are vrijwel altijd al getrackt)
   const { data: allOrders, error } = await supabase
     .from("orders")
     .select(ORDER_SELECT)
     .eq("company_id", COMPANY_ID)
-    .limit(50); // Fetch a small batch to pick from
+    .order("id", { ascending: false })
+    .limit(200);
 
   if (error) throw new Error(`Failed to fetch orders: ${error.message}`);
 
