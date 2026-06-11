@@ -231,9 +231,13 @@ export interface WarehouseOrderLine {
  * Company ID to BC legal entity mapping.
  * Exacte strings nog niet bevestigd door Wesley. Update na bevestiging.
  */
+// TIJDELIJK alles op BRATRA-NL: de enige door ERP Company bevestigd werkende
+// waarde (Postman-collectie, guide, happy-test 2026-06-11). De waarden per
+// Bratra-bedrijf (non-food/PP/food) zijn op 20 mei gevraagd maar nog niet
+// bevestigd — zie open punt 3 in docs/test-overzicht-bc-sync.md.
 export const LEGAL_ENTITY_MAP: Record<number | string, string> = {
-  2: "BRATRA-NONFOOD",
-  PP: "BRATRA-PRODUCTS",
+  2: "BRATRA-NL",
+  PP: "BRATRA-NL",
 };
 
 /** Maximum orders per Service Bus batch message */

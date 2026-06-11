@@ -35,7 +35,9 @@ Verifier checks buffer ◄──────────────────
 
 ### Pet Products routing
 
-Non-food orders may contain Pet Products articles. The dispatcher detects these by checking article EAN numbers against a configurable list (`src/config/pp-articles.json`). If any line in a PO matches, the entire order is routed to the `BRATRA-PRODUCTS` legal entity instead of `BRATRA-NONFOOD`.
+Non-food orders may contain Pet Products articles. The dispatcher detects these by checking article EAN numbers against a configurable list (`src/config/pp-articles.json`). If any line in a PO matches, the entire order is routed to the Pet Products legal entity.
+
+> **Note:** all legal entity values in `LEGAL_ENTITY_MAP` (`src/shared/types.ts`) are temporarily set to `BRATRA-NL` — the only value confirmed working by ERP Company. The per-company values (non-food / Pet Products / food) were requested on 20 May and are still unconfirmed (open punt 3 in `docs/test-overzicht-bc-sync.md`). The PP detection logic stays active so routing works as soon as the real values land.
 
 ## Architecture
 
