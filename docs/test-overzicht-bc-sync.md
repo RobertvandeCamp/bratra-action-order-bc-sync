@@ -49,8 +49,9 @@ Relevant voor de open punten:
 | 4 juni | Volledige dispatch-E2E met echte handler (ScheduledEvent-pad): 11 orders | 11x HTTP 201, 0 fouten, queue daarna leeg (opgepikt door processor). Claim/dedup-laag sloeg reeds verstuurde orders correct over |
 | 4 juni | DLQ-monitor E2E | 6 oude berichten verwerkt, gearchiveerd, queue leeggemaakt. Redenen: InvalidEnvelopeJson, UnknownMessageName, EnvelopeMetaMissing, EmptyPayload, 2x PayloadSchemaViolation |
 | 4 juni | Verifier (buffer terugkoppeling) | HTTP 403: M2M-app mist Read op Table 55001 — open punt 1 |
-| Doorlopend | Automatische dispatches bij imports (SQS-trigger) | 29 mei: 1772 orders sent; 8 juni: 1209 sent; 11 juni (vanochtend 07:07): 156 sent |
+| Doorlopend | Automatische dispatches bij imports (SQS-trigger) | 29 mei: 1772 orders sent; 8 juni: 1209 sent; 11 juni (07:07): 156 sent. Trigger daarna tijdelijk UIT gezet voor de testfase (zie README) |
 | 11 juni | Status-mode van het testscript (read-only) | Zie actuele stand hieronder; buffer-API geeft nog steeds 403 |
+| 11 juni | **Happy-path test GESLAAGD** (`bc-sync-test.sh happy`): canonieke order met vers PO-nummer 4002219265 | HTTP 201; rij in buffer-tabel met status **Done** (visuele controle). messageId `bb24e0fa-5c62-4932-a7a8-9079d0da7124`, externalId `BRA-AC-bb24e0fa-...-4002219265`, verzonden 11:43 UTC. Volledige keten Service Bus -> processor -> buffer -> Job Queue -> Done bewezen |
 
 Gedetailleerd testverslag van 4 juni (gedeeld met Wesley en Leo): `test-status-2026-06-04.md` in deze map.
 
@@ -76,7 +77,7 @@ Buffer-API:  HTTP 403 (Read op Table 55001 ontbreekt nog)
 | # | Punt | Eerste verzoek | Herhaald | Status |
 |---|---|---|---|---|
 | 1 | Read-rechten op buffer-tabel (Table 55001, Bratra SO Buffer) voor onze M2M-app, via de "Bratra Integration" permission set. Pad: `/api/erpcompany/integration/v1.0/.../bratraSalesOrderBuffers` | 23 mei | 4 juni | Open — zonder dit kan de verifier de 3148 `sent`-orders niet afhandelen |
-| 2 | Op 4 juni verstuurde orders (11 stuks, HTTP 201, geen DLQ) zijn bij visuele controle niet zichtbaar in de buffer-tabel | 4 juni (testverslag) | 9 juni | Open — vraag: worden duplicaten vóór de buffer-write genegeerd, of zouden ze als error-entry moeten verschijnen? |
+| 2 | Op 4 juni verstuurde orders (11 stuks, HTTP 201, geen DLQ) zijn bij visuele controle niet zichtbaar in de buffer-tabel | 4 juni (testverslag) | 9 juni | Open, maar AANGESCHERPT door de geslaagde happy-path test van 11 juni: een order met een vers PO-nummer komt wél in de buffer en gaat naar Done. Het verschil: de 11 orders van 4 juni waren re-dispatches van PO's die al als sales order in BC bestaan. Vraag aan ERP Company is nu specifiek: wat gebeurt er met berichten voor een al bestaande PO — volgens Leo's guide zou een vers externalId een Error-rij ("already exists") moeten opleveren, maar er verschijnt niets |
 
 ## 5. Zelf de test draaien (demo)
 
