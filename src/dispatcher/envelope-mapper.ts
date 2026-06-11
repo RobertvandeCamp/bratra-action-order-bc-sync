@@ -21,7 +21,7 @@ const PP_EANS = new Set<string>(ppArticles as string[]);
 
 /**
  * Check if any order line has a bratra_articles.article_number in the PP EAN set.
- * If true, the entire PO is routed to BRATRA-PRODUCTS legal entity.
+ * If true, the entire PO is routed to the Pet Products legal entity (LEGAL_ENTITY_MAP.PP).
  */
 function isPetProductsOrder(order: WarehouseOrder): boolean {
   return order.order_lines.some(
@@ -33,13 +33,16 @@ function isPetProductsOrder(order: WarehouseOrder): boolean {
 
 /**
  * Determine the legal entity for an order based on PP detection and company_id.
- * PP orders -> BRATRA-PRODUCTS, otherwise -> company_id mapping or fallback.
+ * NB: alle map-waarden staan tijdelijk op BRATRA-NL totdat ERP Company de
+ * waarden per Bratra-bedrijf bevestigt (zie LEGAL_ENTITY_MAP in types.ts).
+ * De PP-detectie blijft actief zodat de routing direct werkt zodra de
+ * echte waarden bekend zijn.
  */
 export function determineLegalEntity(order: WarehouseOrder): string {
   if (PP_EANS.size > 0 && isPetProductsOrder(order)) {
     return LEGAL_ENTITY_MAP.PP;
   }
-  return LEGAL_ENTITY_MAP[order.company_id] ?? "BRATRA-NONFOOD";
+  return LEGAL_ENTITY_MAP[order.company_id] ?? "BRATRA-NL";
 }
 
 // ============================================================================

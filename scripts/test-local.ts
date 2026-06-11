@@ -32,12 +32,21 @@ const USAGE = `
 Usage: npm run test:local -- <mode>
 
 Modes:
+  status    Toon waar we staan: tellingen per sync-status, laatste verzending,
+            DLQ-archief, en een live check op de BC buffer-API (leesrechten)
+  happy     Stuur de canonieke happy-path order (verbatim payload uit Leo's
+            Postman-collectie) met een VERS PO-nummer naar de Service Bus.
+            Optioneel: eigen PO-nummer (arg 1) en legalEntity (arg 2), voor
+            duplicaat- en routing-experimenten (open punt 2/3).
   dry-run   Haal 2 orders op, bouw envelope, log alles, stuur NIET naar Service Bus
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
   dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
 
 Examples:
+  npm run test:local -- status
+  npm run test:local -- happy
+  npm run test:local -- happy 4002845777
   npm run test:local -- dry-run
   npm run test:local -- live
   npm run test:local -- cleanup
@@ -67,7 +76,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["dry-run", "live", "cleanup", "dlq"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -75,6 +84,16 @@ async function main(): Promise<void> {
   // DLQ mode: geen sandbox guard nodig (leest geen BC data)
   if (mode === "dlq") {
     await dlqPeek();
+    return;
+  }
+
+  if (mode === "status") {
+    await statusOverview();
+    return;
+  }
+
+  if (mode === "happy") {
+    await happyPath(process.argv[3], process.argv[4]);
     return;
   }
 
@@ -353,6 +372,256 @@ async function cleanup(supabase: ReturnType<typeof import("../src/shared/supabas
   }
 
   console.log(`\n${ids.length} records verwijderd. Test is herhaalbaar.\n`);
+}
+
+/**
+ * Happy-path test: stuur de canonieke testorder uit Leo's Postman-collectie.
+ *
+ * Leest de payload VERBATIM uit docs/bratra-inbound.postman_collection.json
+ * (request 1, "happy path") zodat we gegarandeerd dezelfde, door ERP Company
+ * gevalideerde master data sturen (contract, artikel, DC, carrier). Alleen:
+ * - meta.messageId / correlationId / occurredOnUtc worden vers gegenereerd
+ * - poNumber wordt vervangen door een vers nummer (default: tijdgebaseerd),
+ *   want het canned nummer 4002845709 bestaat al in BC ("already exists")
+ *
+ * Gaat bewust BUITEN onze tracking om (geen bc_sync_orders record): dit test
+ * puur de draad Service Bus -> processor -> buffer -> Job Queue, identiek aan
+ * de Postman-test uit Leo's guide.
+ *
+ * Na verzending: wacht 75s en probeer de buffer-rij via de BC API te lezen.
+ * Zolang de leesrechten (Table 55001) ontbreken geeft dat 403; dan volgt
+ * instructie voor visuele controle in BC.
+ */
+async function happyPath(poNumberArg?: string, legalEntityArg?: string): Promise<void> {
+  assertSandbox();
+
+  const fs = await import("node:fs");
+  const pathMod = await import("node:path");
+
+  console.log("\n--- HAPPY PATH: canonieke testorder naar Service Bus ---\n");
+
+  // 1. Canned payload uit de Postman-collectie laden (__dirname = scripts/)
+  const repoRoot = pathMod.resolve(__dirname, "..");
+  const collectionPath = pathMod.join(repoRoot, "docs", "bratra-inbound.postman_collection.json");
+  const collection = JSON.parse(fs.readFileSync(collectionPath, "utf-8"));
+  const happyItem = collection.item.find((i: { name: string }) => i.name.includes("happy path"));
+  if (!happyItem) {
+    console.error("Happy-path request niet gevonden in de Postman-collectie.");
+    process.exit(1);
+  }
+  console.log(`Stap 1: payload geladen uit Postman-collectie ("${happyItem.name}")`);
+
+  // 2. Meta vers genereren (zelfde gedrag als het Postman pre-request script)
+  const messageId = randomUUID();
+  const correlationId = `robert-happy-${new Date().toISOString().replace(/[:.]/g, "-")}-${messageId.slice(0, 8)}`;
+  const occurredOnUtc = new Date().toISOString();
+  // Vers PO-nummer: canned 4002845709 bestaat al in BC -> Job Queue "already exists"
+  const poNumber = poNumberArg ?? `4002${String(Date.now()).slice(-6)}`;
+
+  const rawBody: string = happyItem.request.body.raw;
+  const bodyStr = rawBody
+    .replaceAll("{{messageId}}", messageId)
+    .replaceAll("{{correlationId}}", correlationId)
+    .replaceAll("{{occurredOnUtc}}", occurredOnUtc);
+
+  const envelope = JSON.parse(bodyStr) as import("../src/shared/types").ActionOrderBatchV1Envelope;
+  const originalPo = envelope.payload.orders[0].poNumber;
+  envelope.payload.orders[0].poNumber = poNumber;
+  if (legalEntityArg) {
+    envelope.meta.legalEntity = legalEntityArg; // experiment: afwijkende routing testen
+  }
+
+  const externalId = `BRA-AC-${messageId}-${poNumber}`;
+
+  console.log("\nStap 2: envelope gereed");
+  console.log(`   messageId:      ${messageId}`);
+  console.log(`   correlationId:  ${correlationId}`);
+  console.log(`   poNumber:       ${poNumber} (canned was ${originalPo})`);
+  console.log(`   legalEntity:    ${envelope.meta.legalEntity}`);
+  console.log(`   verwachte External ID in BC-buffer: ${externalId}`);
+
+  // 3. Versturen
+  console.log("\nStap 3: versturen naar Service Bus...");
+  const { sendToServiceBus } = await import("../src/shared/service-bus-client");
+  try {
+    await sendToServiceBus(envelope);
+    console.log("   HTTP 201 Created — Service Bus heeft het bericht geaccepteerd.");
+  } catch (err) {
+    console.error("   Verzenden MISLUKT:", (err as Error).message);
+    process.exit(1);
+  }
+
+  console.log("\nVolgens Leo's guide verschijnt binnen ~1s een buffer-rij (status Pending)");
+  console.log("en zet de BC Job Queue hem binnen ~1 min op Done (+ Created Document No.).");
+
+  // 4. Wacht en probeer de buffer-rij te lezen
+  console.log("\nStap 4: 75 seconden wachten (BC Job Queue draait ~elke minuut)...");
+  await sleep(75_000);
+
+  console.log("\nStap 5: buffer-rij opvragen via BC API...");
+  try {
+    const { authenticateM2M } = await import("../src/shared/bc-auth");
+    const { getConfig } = await import("../src/shared/config");
+    const config = getConfig();
+    const token = await authenticateM2M(config.BC_TENANT_ID);
+
+    const url =
+      `https://api.businesscentral.dynamics.com/v2.0/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}` +
+      `/api/erpcompany/integration/v1.0/companies(${config.BC_COMPANY_ID})/bratraSalesOrderBuffers` +
+      `?$filter=externalId eq '${externalId}'`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Data-Access-Intent": "ReadOnly",
+      },
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { value?: Array<Record<string, unknown>> };
+      const row = data.value?.[0];
+      if (row) {
+        console.log("   Buffer-rij gevonden:");
+        console.log(`   status:              ${row.status ?? "-"}`);
+        console.log(`   createdDocumentNo:   ${row.createdDocumentNo ?? row.documentNo ?? "-"}`);
+        console.log(`   errorMessage:        ${row.errorMessage ?? "-"}`);
+        console.log("\n--- HAPPY PATH RESULTAAT: zie status hierboven (Done = geslaagd) ---");
+      } else {
+        console.log("   Geen buffer-rij gevonden voor deze externalId.");
+        console.log("   Dat is hetzelfde symptoom als open punt 2 — check de DLQ (mode 'dlq')");
+        console.log("   en noteer messageId + tijdstip voor ERP Company.");
+      }
+    } else if (response.status === 403) {
+      console.log("   HTTP 403 — leesrechten op Table 55001 ontbreken nog (open punt 1).");
+      console.log("\n   VISUELE CONTROLE in BC nodig:");
+      console.log("   1. Open de sandbox:");
+      console.log(`      https://businesscentral.dynamics.com/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}?page=22&noSignUpCheck=1`);
+      console.log('   2. Zoek de pagina "Bratra Sales Order Buffers" (zoekterm: Bratra Integration)');
+      console.log(`   3. Zoek de rij met External ID: ${externalId}`);
+      console.log("   4. Verwacht: status Pending -> Done met Created Document No. (VO26-xxxxx)");
+      console.log("      Geen rij? Check de DLQ (mode 'dlq') en meld messageId aan ERP Company.");
+    } else {
+      const body = await response.text();
+      console.log(`   Onverwachte status HTTP ${response.status}: ${body.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.error("   Buffer-check fout:", (err as Error).message);
+  }
+
+  console.log(`\nTraceerbaarheid (voor mail/overleg met Wesley en Leo):`);
+  console.log(`   messageId:     ${messageId}`);
+  console.log(`   correlationId: ${correlationId}`);
+  console.log(`   externalId:    ${externalId}`);
+  console.log(`   verzonden om:  ${occurredOnUtc}`);
+  console.log();
+}
+
+/**
+ * Status-overzicht: waar staan we nu.
+ *
+ * Read-only — wijzigt niets. Toont:
+ * 1. Tellingen per status in bc_sync_orders (de tracking-tabel)
+ * 2. Laatste verzending naar Service Bus
+ * 3. Aantal verwerkte DLQ-berichten (archief)
+ * 4. Live check op de BC buffer-API: hebben we al leesrechten op Table 55001?
+ */
+async function statusOverview(): Promise<void> {
+  assertSandbox();
+
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const supabase = getSupabaseClient();
+
+  console.log("\n=== BC Sync status-overzicht ===");
+  console.log(`Datum: ${new Date().toISOString()}\n`);
+
+  // 1. Tellingen per status
+  console.log("1. Tracking-tabel bc_sync_orders (status per order):");
+  const statuses = ["pending", "sent", "verified", "failed", "dead_letter", "skipped"];
+  let total = 0;
+  for (const s of statuses) {
+    const { count, error } = await supabase
+      .from("bc_sync_orders")
+      .select("*", { count: "exact", head: true })
+      .eq("status", s);
+    if (error) {
+      console.error(`   ${s}: telling mislukt (${error.message})`);
+      continue;
+    }
+    total += count ?? 0;
+    console.log(`   ${s.padEnd(13)} ${String(count ?? 0).padStart(5)}`);
+  }
+  console.log(`   ${"totaal".padEnd(13)} ${String(total).padStart(5)}`);
+
+  // 2. Laatste verzending
+  const { data: lastSent } = await supabase
+    .from("bc_sync_orders")
+    .select("po_number, sent_at, batch_id, status")
+    .not("sent_at", "is", null)
+    .order("sent_at", { ascending: false })
+    .limit(1);
+
+  console.log("\n2. Laatste verzending naar Service Bus:");
+  if (lastSent && lastSent.length > 0) {
+    const row = lastSent[0];
+    console.log(`   ${row.sent_at}  PO ${row.po_number}  (status: ${row.status}, batch: ${row.batch_id})`);
+  } else {
+    console.log("   Nog geen orders verstuurd.");
+  }
+
+  // 3. DLQ-archief
+  const { count: dlqCount } = await supabase
+    .from("bc_sync_dlq_messages")
+    .select("*", { count: "exact", head: true });
+  console.log("\n3. DLQ-archief (bc_sync_dlq_messages):");
+  console.log(`   ${dlqCount ?? 0} dead-letter-berichten verwerkt en gearchiveerd`);
+
+  // 4. BC buffer-API check (het openstaande leesrechten-punt)
+  console.log("\n4. BC buffer-API check (Read op Table 55001, Bratra SO Buffer):");
+  try {
+    const { authenticateM2M } = await import("../src/shared/bc-auth");
+    const { getConfig } = await import("../src/shared/config");
+    const config = getConfig();
+
+    const token = await authenticateM2M(config.BC_TENANT_ID);
+    console.log("   M2M-authenticatie: OK (token ontvangen van Microsoft Entra)");
+
+    const url =
+      `https://api.businesscentral.dynamics.com/v2.0/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}` +
+      `/api/erpcompany/integration/v1.0/companies(${config.BC_COMPANY_ID})/bratraSalesOrderBuffers?$top=1`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Data-Access-Intent": "ReadOnly",
+      },
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { value?: unknown[] };
+      console.log(`   Buffer-API: HTTP ${response.status} — leesrechten AANWEZIG`);
+      console.log(`   ${data.value?.length ?? 0} record(s) gelezen.`);
+      console.log("   >> Open punt 1 is opgelost: de verifier kan de orderstatus terugkoppelen.");
+    } else {
+      const body = await response.text();
+      console.log(`   Buffer-API: HTTP ${response.status}`);
+      if (body) console.log(`   ${body.slice(0, 200)}`);
+      if (response.status === 403) {
+        console.log("   >> OPEN PUNT 1: onze M2M-app mist Read op Table 55001 (Bratra SO Buffer).");
+        console.log("      Zolang dit ontbreekt kan de verifier de 'sent'-orders niet naar 'verified' brengen.");
+        console.log("      Gevraagd aan ERP Company op 23 mei, herhaald op 4 juni.");
+      }
+    }
+  } catch (err) {
+    console.error("   Buffer-check fout:", (err as Error).message);
+  }
+
+  console.log("\nOpen punten richting ERP Company:");
+  console.log("   1. Read-rechten op de buffer-tabel (Table 55001) voor onze M2M-app — zie check hierboven");
+  console.log("   2. Op 4 juni verstuurde orders (11 stuks, HTTP 201, geen DLQ) zijn bij visuele");
+  console.log("      controle niet zichtbaar in de buffer-tabel — vraag uitstaand bij Wesley/Leo");
+  console.log();
 }
 
 async function dlqPeek(): Promise<void> {
