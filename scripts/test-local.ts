@@ -36,7 +36,8 @@ Modes:
             DLQ-archief, en een live check op de BC buffer-API (leesrechten)
   happy     Stuur de canonieke happy-path order (verbatim payload uit Leo's
             Postman-collectie) met een VERS PO-nummer naar de Service Bus.
-            Optioneel: eigen PO-nummer als extra argument.
+            Optioneel: eigen PO-nummer (arg 1) en legalEntity (arg 2), voor
+            duplicaat- en routing-experimenten (open punt 2/3).
   dry-run   Haal 2 orders op, bouw envelope, log alles, stuur NIET naar Service Bus
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
@@ -92,7 +93,7 @@ async function main(): Promise<void> {
   }
 
   if (mode === "happy") {
-    await happyPath(process.argv[3]);
+    await happyPath(process.argv[3], process.argv[4]);
     return;
   }
 
@@ -391,7 +392,7 @@ async function cleanup(supabase: ReturnType<typeof import("../src/shared/supabas
  * Zolang de leesrechten (Table 55001) ontbreken geeft dat 403; dan volgt
  * instructie voor visuele controle in BC.
  */
-async function happyPath(poNumberArg?: string): Promise<void> {
+async function happyPath(poNumberArg?: string, legalEntityArg?: string): Promise<void> {
   assertSandbox();
 
   const fs = await import("node:fs");
@@ -426,6 +427,9 @@ async function happyPath(poNumberArg?: string): Promise<void> {
   const envelope = JSON.parse(bodyStr) as import("../src/shared/types").ActionOrderBatchV1Envelope;
   const originalPo = envelope.payload.orders[0].poNumber;
   envelope.payload.orders[0].poNumber = poNumber;
+  if (legalEntityArg) {
+    envelope.meta.legalEntity = legalEntityArg; // experiment: afwijkende routing testen
+  }
 
   const externalId = `BRA-AC-${messageId}-${poNumber}`;
 
