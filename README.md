@@ -158,8 +158,54 @@ CI/CD via GitHub Actions (`.github/workflows/build-test-deploy.yml`) — builds,
 | ECR repository | `bratra/bratra-action-order-bc-sync` |
 | Lambda (dispatcher) | `bratra-bc-sync-dispatcher` |
 | Lambda (verifier) | `bratra-bc-sync-verifier` |
+| SQS trigger queue | `bc-sync-trigger` (+ `bc-sync-trigger-dlq`), event source mapping UUID `74760256-d580-4a6a-8de4-2d3d9c21ab8d` |
 | Execution role | `codaeva-lambda-execution-role` |
 | Region | `eu-central-1` |
+
+## Temporarily disabling the dispatcher (test phase)
+
+> **Status: the dispatcher trigger is DISABLED since 2026-06-11.** During the test phase with ERP Company we don't want every import to automatically dispatch orders to the (sandbox) Service Bus. The verifier has no active schedule, so disabling the SQS trigger stops all automatic syncing.
+
+The dispatcher's only trigger is the SQS event source mapping on the `bc-sync-trigger` queue.
+
+**Disable (sync off):**
+
+```bash
+aws lambda update-event-source-mapping \
+  --uuid 74760256-d580-4a6a-8de4-2d3d9c21ab8d \
+  --no-enabled --region eu-central-1
+```
+
+**Re-enable (sync on):**
+
+```bash
+aws lambda update-event-source-mapping \
+  --uuid 74760256-d580-4a6a-8de4-2d3d9c21ab8d \
+  --enabled --region eu-central-1
+```
+
+**Verify current state:**
+
+```bash
+aws lambda list-event-source-mappings \
+  --function-name bratra-bc-sync-dispatcher \
+  --region eu-central-1 --query "EventSourceMappings[].State"
+```
+
+### Behavior while disabled
+
+- Imports keep working normally; the importer keeps sending trigger messages to `bc-sync-trigger`. Those messages wait in the queue (retention: 4 days) and are processed when the mapping is re-enabled. Messages older than 4 days expire.
+- No orders are lost either way: the dispatcher fetches *all* unsynced orders from the warehouse on every run (anti-join on `bc_sync_orders`), not just the triggering batch. After re-enabling, the first run catches up everything.
+- If no trigger message is left in the queue after re-enabling (all expired), force a catch-up run manually:
+
+```bash
+aws lambda invoke --function-name bratra-bc-sync-dispatcher \
+  --payload '{"source":"manual-catchup"}' \
+  --cli-binary-format raw-in-base64-out \
+  --region eu-central-1 /tmp/dispatcher-out.json && cat /tmp/dispatcher-out.json
+```
+
+(Any payload without an SQS `Records` array takes the ScheduledEvent path = full dispatch run.)
 
 ## Related services
 
