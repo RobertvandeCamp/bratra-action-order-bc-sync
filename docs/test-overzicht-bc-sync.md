@@ -52,6 +52,7 @@ Relevant voor de open punten:
 | Doorlopend | Automatische dispatches bij imports (SQS-trigger) | 29 mei: 1772 orders sent; 8 juni: 1209 sent; 11 juni (07:07): 156 sent. Trigger daarna tijdelijk UIT gezet voor de testfase (zie README) |
 | 11 juni | Status-mode van het testscript (read-only) | Zie actuele stand hieronder; buffer-API geeft nog steeds 403 |
 | 11 juni | **Happy-path test GESLAAGD** (`bc-sync-test.sh happy`): canonieke order met vers PO-nummer 4002219265 | HTTP 201; rij in buffer-tabel met status **Done** (visuele controle). messageId `bb24e0fa-5c62-4932-a7a8-9079d0da7124`, externalId `BRA-AC-bb24e0fa-...-4002219265`, verzonden 11:43 UTC. Volledige keten Service Bus -> processor -> buffer -> Job Queue -> Done bewezen |
+| 11 juni | Sales order **VO26-00160** geverifieerd in BC (screenshot) | Alle mappings kloppen: External Doc No. 4002219265, klant C00006 (conform CUSTOMER_MAP), EAN 8721008420981 als Item No., Item Reference 3007781, qty 2.352, Req. Delivery 15-5, Wallersdorf. **Bespreekpunt prijs:** wire `unitPrice 2.35` is niet gebruikt; BC prijst uit eigen stamdata (1,00 EUR, totaal 2.352,00 i.p.v. 5.527,20). Vraag aan ERP Company: is onze unitPrice ergens leidend, of moet de contractprijs in BC-stamdata staan? |
 
 Gedetailleerd testverslag van 4 juni (gedeeld met Wesley en Leo): `test-status-2026-06-04.md` in deze map.
 
