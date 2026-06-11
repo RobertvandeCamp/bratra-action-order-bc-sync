@@ -34,6 +34,9 @@ Usage: npm run test:local -- <mode>
 Modes:
   status    Toon waar we staan: tellingen per sync-status, laatste verzending,
             DLQ-archief, en een live check op de BC buffer-API (leesrechten)
+  happy     Stuur de canonieke happy-path order (verbatim payload uit Leo's
+            Postman-collectie) met een VERS PO-nummer naar de Service Bus.
+            Optioneel: eigen PO-nummer als extra argument.
   dry-run   Haal 2 orders op, bouw envelope, log alles, stuur NIET naar Service Bus
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
@@ -41,6 +44,8 @@ Modes:
 
 Examples:
   npm run test:local -- status
+  npm run test:local -- happy
+  npm run test:local -- happy 4002845777
   npm run test:local -- dry-run
   npm run test:local -- live
   npm run test:local -- cleanup
@@ -70,7 +75,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["status", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -83,6 +88,11 @@ async function main(): Promise<void> {
 
   if (mode === "status") {
     await statusOverview();
+    return;
+  }
+
+  if (mode === "happy") {
+    await happyPath(process.argv[3]);
     return;
   }
 
@@ -361,6 +371,146 @@ async function cleanup(supabase: ReturnType<typeof import("../src/shared/supabas
   }
 
   console.log(`\n${ids.length} records verwijderd. Test is herhaalbaar.\n`);
+}
+
+/**
+ * Happy-path test: stuur de canonieke testorder uit Leo's Postman-collectie.
+ *
+ * Leest de payload VERBATIM uit docs/bratra-inbound.postman_collection.json
+ * (request 1, "happy path") zodat we gegarandeerd dezelfde, door ERP Company
+ * gevalideerde master data sturen (contract, artikel, DC, carrier). Alleen:
+ * - meta.messageId / correlationId / occurredOnUtc worden vers gegenereerd
+ * - poNumber wordt vervangen door een vers nummer (default: tijdgebaseerd),
+ *   want het canned nummer 4002845709 bestaat al in BC ("already exists")
+ *
+ * Gaat bewust BUITEN onze tracking om (geen bc_sync_orders record): dit test
+ * puur de draad Service Bus -> processor -> buffer -> Job Queue, identiek aan
+ * de Postman-test uit Leo's guide.
+ *
+ * Na verzending: wacht 75s en probeer de buffer-rij via de BC API te lezen.
+ * Zolang de leesrechten (Table 55001) ontbreken geeft dat 403; dan volgt
+ * instructie voor visuele controle in BC.
+ */
+async function happyPath(poNumberArg?: string): Promise<void> {
+  assertSandbox();
+
+  const fs = await import("node:fs");
+  const pathMod = await import("node:path");
+
+  console.log("\n--- HAPPY PATH: canonieke testorder naar Service Bus ---\n");
+
+  // 1. Canned payload uit de Postman-collectie laden (__dirname = scripts/)
+  const repoRoot = pathMod.resolve(__dirname, "..");
+  const collectionPath = pathMod.join(repoRoot, "docs", "bratra-inbound.postman_collection.json");
+  const collection = JSON.parse(fs.readFileSync(collectionPath, "utf-8"));
+  const happyItem = collection.item.find((i: { name: string }) => i.name.includes("happy path"));
+  if (!happyItem) {
+    console.error("Happy-path request niet gevonden in de Postman-collectie.");
+    process.exit(1);
+  }
+  console.log(`Stap 1: payload geladen uit Postman-collectie ("${happyItem.name}")`);
+
+  // 2. Meta vers genereren (zelfde gedrag als het Postman pre-request script)
+  const messageId = randomUUID();
+  const correlationId = `robert-happy-${new Date().toISOString().replace(/[:.]/g, "-")}-${messageId.slice(0, 8)}`;
+  const occurredOnUtc = new Date().toISOString();
+  // Vers PO-nummer: canned 4002845709 bestaat al in BC -> Job Queue "already exists"
+  const poNumber = poNumberArg ?? `4002${String(Date.now()).slice(-6)}`;
+
+  const rawBody: string = happyItem.request.body.raw;
+  const bodyStr = rawBody
+    .replaceAll("{{messageId}}", messageId)
+    .replaceAll("{{correlationId}}", correlationId)
+    .replaceAll("{{occurredOnUtc}}", occurredOnUtc);
+
+  const envelope = JSON.parse(bodyStr) as import("../src/shared/types").ActionOrderBatchV1Envelope;
+  const originalPo = envelope.payload.orders[0].poNumber;
+  envelope.payload.orders[0].poNumber = poNumber;
+
+  const externalId = `BRA-AC-${messageId}-${poNumber}`;
+
+  console.log("\nStap 2: envelope gereed");
+  console.log(`   messageId:      ${messageId}`);
+  console.log(`   correlationId:  ${correlationId}`);
+  console.log(`   poNumber:       ${poNumber} (canned was ${originalPo})`);
+  console.log(`   legalEntity:    ${envelope.meta.legalEntity}`);
+  console.log(`   verwachte External ID in BC-buffer: ${externalId}`);
+
+  // 3. Versturen
+  console.log("\nStap 3: versturen naar Service Bus...");
+  const { sendToServiceBus } = await import("../src/shared/service-bus-client");
+  try {
+    await sendToServiceBus(envelope);
+    console.log("   HTTP 201 Created — Service Bus heeft het bericht geaccepteerd.");
+  } catch (err) {
+    console.error("   Verzenden MISLUKT:", (err as Error).message);
+    process.exit(1);
+  }
+
+  console.log("\nVolgens Leo's guide verschijnt binnen ~1s een buffer-rij (status Pending)");
+  console.log("en zet de BC Job Queue hem binnen ~1 min op Done (+ Created Document No.).");
+
+  // 4. Wacht en probeer de buffer-rij te lezen
+  console.log("\nStap 4: 75 seconden wachten (BC Job Queue draait ~elke minuut)...");
+  await sleep(75_000);
+
+  console.log("\nStap 5: buffer-rij opvragen via BC API...");
+  try {
+    const { authenticateM2M } = await import("../src/shared/bc-auth");
+    const { getConfig } = await import("../src/shared/config");
+    const config = getConfig();
+    const token = await authenticateM2M(config.BC_TENANT_ID);
+
+    const url =
+      `https://api.businesscentral.dynamics.com/v2.0/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}` +
+      `/api/erpcompany/integration/v1.0/companies(${config.BC_COMPANY_ID})/bratraSalesOrderBuffers` +
+      `?$filter=externalId eq '${externalId}'`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Data-Access-Intent": "ReadOnly",
+      },
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { value?: Array<Record<string, unknown>> };
+      const row = data.value?.[0];
+      if (row) {
+        console.log("   Buffer-rij gevonden:");
+        console.log(`   status:              ${row.status ?? "-"}`);
+        console.log(`   createdDocumentNo:   ${row.createdDocumentNo ?? row.documentNo ?? "-"}`);
+        console.log(`   errorMessage:        ${row.errorMessage ?? "-"}`);
+        console.log("\n--- HAPPY PATH RESULTAAT: zie status hierboven (Done = geslaagd) ---");
+      } else {
+        console.log("   Geen buffer-rij gevonden voor deze externalId.");
+        console.log("   Dat is hetzelfde symptoom als open punt 2 — check de DLQ (mode 'dlq')");
+        console.log("   en noteer messageId + tijdstip voor ERP Company.");
+      }
+    } else if (response.status === 403) {
+      console.log("   HTTP 403 — leesrechten op Table 55001 ontbreken nog (open punt 1).");
+      console.log("\n   VISUELE CONTROLE in BC nodig:");
+      console.log("   1. Open de sandbox:");
+      console.log(`      https://businesscentral.dynamics.com/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}?page=22&noSignUpCheck=1`);
+      console.log('   2. Zoek de pagina "Bratra Sales Order Buffers" (zoekterm: Bratra Integration)');
+      console.log(`   3. Zoek de rij met External ID: ${externalId}`);
+      console.log("   4. Verwacht: status Pending -> Done met Created Document No. (VO26-xxxxx)");
+      console.log("      Geen rij? Check de DLQ (mode 'dlq') en meld messageId aan ERP Company.");
+    } else {
+      const body = await response.text();
+      console.log(`   Onverwachte status HTTP ${response.status}: ${body.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.error("   Buffer-check fout:", (err as Error).message);
+  }
+
+  console.log(`\nTraceerbaarheid (voor mail/overleg met Wesley en Leo):`);
+  console.log(`   messageId:     ${messageId}`);
+  console.log(`   correlationId: ${correlationId}`);
+  console.log(`   externalId:    ${externalId}`);
+  console.log(`   verzonden om:  ${occurredOnUtc}`);
+  console.log();
 }
 
 /**

@@ -17,6 +17,13 @@
 #                                        leesrechten-punt richting ERP Company).
 #                                        Read-only, altijd veilig.
 #
+#   ./scripts/bc-sync-test.sh happy [po] Stuur de canonieke happy-path order (verbatim
+#                                        payload uit Leo's Postman-collectie) met een
+#                                        VERS PO-nummer naar de Service Bus. Wacht 75s
+#                                        en leest de buffer-rij in BC terug (bij 403
+#                                        volgen instructies voor visuele controle).
+#                                        Optioneel eigen PO-nummer meegeven.
+#
 #   ./scripts/bc-sync-test.sh dry-run    Haal 2 echte orders uit het datawarehouse en
 #                                        bouw het bericht (envelope) dat naar BC zou
 #                                        gaan. Verstuurt NIETS. Laat zien wat we
@@ -41,6 +48,7 @@
 # Typische demo-volgorde (bijv. voor Wesley):
 #   1. status    -> waar staan we, incl. de 403 op de buffer-API
 #   2. dry-run   -> dit bericht sturen we ("wat doe je dan precies?")
+#   2b. happy    -> de officiele happy-path test uit Leo's guide, end-to-end
 #   3. live      -> en zo gaat hij echt de Service Bus op
 #   4. dlq       -> en zo bewaken we afgekeurde berichten
 #   5. cleanup   -> testdata opruimen
@@ -58,6 +66,7 @@ usage() {
   echo ""
   echo "Modes:"
   echo "  status    Statusoverzicht: tellingen, laatste verzending, DLQ, buffer-API check (read-only)"
+  echo "  happy     Stuur canonieke happy-path order (Leo's payload, vers PO) + check buffer"
   echo "  dry-run   Bouw het BC-bericht voor 2 orders, verstuur niets"
   echo "  live      Verstuur 2 orders naar Service Bus sandbox + verifieer in BC"
   echo "  dlq       Bekijk Dead Letter Queue (peek-only)"
@@ -73,7 +82,7 @@ if [[ -z "$MODE" ]]; then
 fi
 
 case "$MODE" in
-  status|dry-run|live|dlq|cleanup) ;;
+  status|happy|dry-run|live|dlq|cleanup) ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "Onbekende mode: $MODE"
@@ -112,4 +121,5 @@ echo ""
 echo "BC Sync test — mode: $MODE (repo: $REPO_DIR)"
 echo "------------------------------------------------------------"
 
-npm run --silent test:local -- "$MODE"
+shift
+npm run --silent test:local -- "$MODE" "$@"
