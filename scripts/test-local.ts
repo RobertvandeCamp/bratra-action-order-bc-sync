@@ -32,12 +32,15 @@ const USAGE = `
 Usage: npm run test:local -- <mode>
 
 Modes:
+  status    Toon waar we staan: tellingen per sync-status, laatste verzending,
+            DLQ-archief, en een live check op de BC buffer-API (leesrechten)
   dry-run   Haal 2 orders op, bouw envelope, log alles, stuur NIET naar Service Bus
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
   dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
 
 Examples:
+  npm run test:local -- status
   npm run test:local -- dry-run
   npm run test:local -- live
   npm run test:local -- cleanup
@@ -67,7 +70,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["dry-run", "live", "cleanup", "dlq"].includes(mode)) {
+  if (!mode || !["status", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -75,6 +78,11 @@ async function main(): Promise<void> {
   // DLQ mode: geen sandbox guard nodig (leest geen BC data)
   if (mode === "dlq") {
     await dlqPeek();
+    return;
+  }
+
+  if (mode === "status") {
+    await statusOverview();
     return;
   }
 
@@ -353,6 +361,113 @@ async function cleanup(supabase: ReturnType<typeof import("../src/shared/supabas
   }
 
   console.log(`\n${ids.length} records verwijderd. Test is herhaalbaar.\n`);
+}
+
+/**
+ * Status-overzicht: waar staan we nu.
+ *
+ * Read-only — wijzigt niets. Toont:
+ * 1. Tellingen per status in bc_sync_orders (de tracking-tabel)
+ * 2. Laatste verzending naar Service Bus
+ * 3. Aantal verwerkte DLQ-berichten (archief)
+ * 4. Live check op de BC buffer-API: hebben we al leesrechten op Table 55001?
+ */
+async function statusOverview(): Promise<void> {
+  assertSandbox();
+
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const supabase = getSupabaseClient();
+
+  console.log("\n=== BC Sync status-overzicht ===");
+  console.log(`Datum: ${new Date().toISOString()}\n`);
+
+  // 1. Tellingen per status
+  console.log("1. Tracking-tabel bc_sync_orders (status per order):");
+  const statuses = ["pending", "sent", "verified", "failed", "dead_letter", "skipped"];
+  let total = 0;
+  for (const s of statuses) {
+    const { count, error } = await supabase
+      .from("bc_sync_orders")
+      .select("*", { count: "exact", head: true })
+      .eq("status", s);
+    if (error) {
+      console.error(`   ${s}: telling mislukt (${error.message})`);
+      continue;
+    }
+    total += count ?? 0;
+    console.log(`   ${s.padEnd(13)} ${String(count ?? 0).padStart(5)}`);
+  }
+  console.log(`   ${"totaal".padEnd(13)} ${String(total).padStart(5)}`);
+
+  // 2. Laatste verzending
+  const { data: lastSent } = await supabase
+    .from("bc_sync_orders")
+    .select("po_number, sent_at, batch_id, status")
+    .not("sent_at", "is", null)
+    .order("sent_at", { ascending: false })
+    .limit(1);
+
+  console.log("\n2. Laatste verzending naar Service Bus:");
+  if (lastSent && lastSent.length > 0) {
+    const row = lastSent[0];
+    console.log(`   ${row.sent_at}  PO ${row.po_number}  (status: ${row.status}, batch: ${row.batch_id})`);
+  } else {
+    console.log("   Nog geen orders verstuurd.");
+  }
+
+  // 3. DLQ-archief
+  const { count: dlqCount } = await supabase
+    .from("bc_sync_dlq_messages")
+    .select("*", { count: "exact", head: true });
+  console.log("\n3. DLQ-archief (bc_sync_dlq_messages):");
+  console.log(`   ${dlqCount ?? 0} dead-letter-berichten verwerkt en gearchiveerd`);
+
+  // 4. BC buffer-API check (het openstaande leesrechten-punt)
+  console.log("\n4. BC buffer-API check (Read op Table 55001, Bratra SO Buffer):");
+  try {
+    const { authenticateM2M } = await import("../src/shared/bc-auth");
+    const { getConfig } = await import("../src/shared/config");
+    const config = getConfig();
+
+    const token = await authenticateM2M(config.BC_TENANT_ID);
+    console.log("   M2M-authenticatie: OK (token ontvangen van Microsoft Entra)");
+
+    const url =
+      `https://api.businesscentral.dynamics.com/v2.0/${config.BC_TENANT_ID}/${config.BC_ENVIRONMENT}` +
+      `/api/erpcompany/integration/v1.0/companies(${config.BC_COMPANY_ID})/bratraSalesOrderBuffers?$top=1`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Data-Access-Intent": "ReadOnly",
+      },
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { value?: unknown[] };
+      console.log(`   Buffer-API: HTTP ${response.status} — leesrechten AANWEZIG`);
+      console.log(`   ${data.value?.length ?? 0} record(s) gelezen.`);
+      console.log("   >> Open punt 1 is opgelost: de verifier kan de orderstatus terugkoppelen.");
+    } else {
+      const body = await response.text();
+      console.log(`   Buffer-API: HTTP ${response.status}`);
+      if (body) console.log(`   ${body.slice(0, 200)}`);
+      if (response.status === 403) {
+        console.log("   >> OPEN PUNT 1: onze M2M-app mist Read op Table 55001 (Bratra SO Buffer).");
+        console.log("      Zolang dit ontbreekt kan de verifier de 'sent'-orders niet naar 'verified' brengen.");
+        console.log("      Gevraagd aan ERP Company op 23 mei, herhaald op 4 juni.");
+      }
+    }
+  } catch (err) {
+    console.error("   Buffer-check fout:", (err as Error).message);
+  }
+
+  console.log("\nOpen punten richting ERP Company:");
+  console.log("   1. Read-rechten op de buffer-tabel (Table 55001) voor onze M2M-app — zie check hierboven");
+  console.log("   2. Op 4 juni verstuurde orders (11 stuks, HTTP 201, geen DLQ) zijn bij visuele");
+  console.log("      controle niet zichtbaar in de buffer-tabel — vraag uitstaand bij Wesley/Leo");
+  console.log();
 }
 
 async function dlqPeek(): Promise<void> {
