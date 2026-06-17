@@ -166,11 +166,19 @@ export interface BcSyncOrderUpdate {
 // Warehouse Order types (Supabase nested select result)
 // ============================================================================
 
+/**
+ * Bratra business unit, spiegelt enum public.company_type (169-D-06).
+ * Bron van de legal-entity-routing (SEG-03).
+ */
+export type CompanyType = "food" | "non_food" | "pet_products";
+
 /** Order with nested relations as returned by Supabase nested select */
 export interface WarehouseOrder {
   id: number;
   po_number: string;
   company_id: number;
+  business_unit: CompanyType | null;
+  approval_status: string;
   carrier_code: string | null;
   carrier: string | null;
   req_delivery_date: string;
@@ -235,9 +243,10 @@ export interface WarehouseOrderLine {
 // waarde (Postman-collectie, guide, happy-test 2026-06-11). De waarden per
 // Bratra-bedrijf (non-food/PP/food) zijn op 20 mei gevraagd maar nog niet
 // bevestigd — zie open punt 3 in docs/test-overzicht-bc-sync.md.
-export const LEGAL_ENTITY_MAP: Record<number | string, string> = {
-  2: "BRATRA-NL",
-  PP: "BRATRA-NL",
+export const LEGAL_ENTITY_MAP: Record<CompanyType, string> = {
+  food: "BRATRA-NL",
+  non_food: "BRATRA-NL",
+  pet_products: "BRATRA-NL",
 };
 
 /** Maximum orders per Service Bus batch message */

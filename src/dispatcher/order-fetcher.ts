@@ -2,7 +2,7 @@ import { getSupabaseClient } from "../shared/supabase-client";
 import type { WarehouseOrder, BcSyncOrderRow } from "../shared/types";
 
 const ORDER_SELECT = `
-  id, po_number, company_id, carrier_code, carrier,
+  id, po_number, company_id, business_unit, approval_status, carrier_code, carrier,
   req_delivery_date, exp_delivery_date,
   order_type, unloading_location, truck_proposal,
   ship_id, shipment_status,
