@@ -62,7 +62,8 @@ export async function fetchUnsyncedOrders(
   let query = supabase
     .from("orders")
     .select(ORDER_SELECT)
-    .eq("company_id", companyId);
+    .eq("company_id", companyId)
+    .eq("approval_status", "approved");
 
   if (syncedOrderIds.length > 0) {
     query = query.not(
