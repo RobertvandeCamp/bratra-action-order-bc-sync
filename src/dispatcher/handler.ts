@@ -134,7 +134,41 @@ export const handler = async (
 
   // ---- Process NEW orders ----
   if (trulyNewOrders.length > 0) {
-    const batches = groupOrdersIntoBatches(trulyNewOrders);
+    const { batches, skipped } = groupOrdersIntoBatches(trulyNewOrders);
+
+    // Fail-fast (D-04): ongeclassificeerde NEW orders hebben nog geen
+    // bc_sync_orders-rij. INSERT een rij met status 'failed' zodat de order
+    // traceerbaar is i.p.v. stilletjes te verdwijnen (RESEARCH Open Question 1).
+    for (const { order, reason } of skipped) {
+      const failedAt = new Date().toISOString();
+      console.error("Skipping unclassified NEW order (fail-fast routing)", {
+        orderId: order.id,
+        poNumber: order.po_number,
+        reason,
+      });
+
+      const failedInsert: BcSyncOrderInsert = {
+        status: "failed",
+        company_id: order.company_id,
+        order_id: order.id,
+        po_number: order.po_number,
+        error_message: reason,
+        failed_at: failedAt,
+      };
+
+      const { error: skipInsertError } = await supabase
+        .from("bc_sync_orders")
+        .insert(failedInsert);
+
+      if (skipInsertError) {
+        console.error("Failed to insert failed sync record for skipped order", {
+          orderId: order.id,
+          error: skipInsertError.message,
+        });
+      }
+
+      summary.ordersFailed++;
+    }
 
     for (const batch of batches) {
       const batchId = randomUUID();
@@ -285,7 +319,44 @@ export const handler = async (
     const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];
 
     if (failedOrderData.length > 0) {
-      const failedBatches = groupOrdersIntoBatches(failedOrderData);
+      const { batches: failedBatches, skipped: failedSkipped } =
+        groupOrdersIntoBatches(failedOrderData);
+
+      // Fail-fast (D-04): ongeclassificeerde re-dispatch orders hebben AL een
+      // bc_sync_orders-rij. Markeer die 'failed' met de skip-reason (match op
+      // order_id, want de order zit niet in een batch).
+      for (const { order, reason } of failedSkipped) {
+        const failedAt = new Date().toISOString();
+        console.error("Skipping unclassified re-dispatch order (fail-fast routing)", {
+          orderId: order.id,
+          poNumber: order.po_number,
+          reason,
+        });
+
+        const syncRecord = failedOrderMap.get(order.id);
+        if (!syncRecord) {
+          summary.ordersFailed++;
+          continue;
+        }
+
+        const { error: skipUpdateError } = await supabase
+          .from("bc_sync_orders")
+          .update({
+            status: "failed",
+            error_message: reason,
+            failed_at: failedAt,
+          })
+          .eq("order_id", order.id);
+
+        if (skipUpdateError) {
+          console.error("Failed to mark skipped re-dispatch order as failed", {
+            orderId: order.id,
+            error: skipUpdateError.message,
+          });
+        }
+
+        summary.ordersFailed++;
+      }
 
       for (const batch of failedBatches) {
         const batchId = randomUUID();
