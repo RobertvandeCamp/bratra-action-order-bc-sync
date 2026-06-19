@@ -23,6 +23,48 @@ const ORDER_SELECT = `
 `;
 
 /**
+ * WR-05: lightweight runtime guard at the warehouse-fetch I/O boundary.
+ *
+ * The Supabase client is untyped, so the result is cast to WarehouseOrder[].
+ * Because the WarehouseOrder type is hand-synced (not generated), a renamed
+ * column or dropped relation surfaces later as an opaque undefined/NaN deep
+ * inside mapOrder. This guard asserts only the non-null assumptions that
+ * mapOrder/mapOrderLine actually dereference (order_lines array,
+ * action_articles.article_number), failing fast at the boundary instead.
+ *
+ * Not a full schema validation (Zod would be over-engineering here per the
+ * review) -- just the load-bearing shape mapOrder relies on.
+ */
+export function assertWarehouseOrders(
+  rows: unknown,
+  context: string,
+): WarehouseOrder[] {
+  if (!Array.isArray(rows)) {
+    throw new Error(`${context}: expected an array of orders, got ${typeof rows}`);
+  }
+  for (const row of rows) {
+    const o = row as Partial<WarehouseOrder>;
+    if (o == null || typeof o.id !== "number") {
+      throw new Error(`${context}: order row missing numeric 'id'`);
+    }
+    if (!Array.isArray(o.order_lines)) {
+      throw new Error(
+        `${context}: order ${o.id} missing 'order_lines' array (relation renamed/dropped?)`,
+      );
+    }
+    for (const line of o.order_lines) {
+      const article = line?.action_articles;
+      if (article == null || typeof article.article_number !== "string") {
+        throw new Error(
+          `${context}: order ${o.id} line ${line?.id ?? "?"} missing action_articles.article_number`,
+        );
+      }
+    }
+  }
+  return rows as WarehouseOrder[];
+}
+
+/**
  * Fetch orders that have not been synced to BC yet (no bc_sync_orders record in any status).
  *
  * Uses a two-step anti-join pattern because Supabase JS does not support NOT EXISTS:
@@ -83,9 +125,10 @@ export async function fetchUnsyncedOrders(
 
   // Cast via unknown: Supabase untyped client infers distribution_centers as array,
   // but the FK on distribution_center_id makes it a single object at runtime.
+  // WR-05: guard the load-bearing shape at the boundary before casting.
   // Note: failed orders are handled separately by the handler (fetchFailedSyncRecords +
   // dedicated warehouse data fetch) to avoid redundant DB calls.
-  return (newOrders ?? []) as unknown as WarehouseOrder[];
+  return assertWarehouseOrders(newOrders ?? [], "fetchUnsyncedOrders");
 }
 
 /**

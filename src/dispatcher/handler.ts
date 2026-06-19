@@ -1,7 +1,12 @@
 import type { SQSEvent, SQSRecord, ScheduledEvent, Context } from "aws-lambda";
 import { randomUUID } from "node:crypto";
 
-import { fetchUnsyncedOrders, fetchFailedSyncRecords, recoverStalePendingRecords } from "./order-fetcher";
+import {
+  fetchUnsyncedOrders,
+  fetchFailedSyncRecords,
+  recoverStalePendingRecords,
+  assertWarehouseOrders,
+} from "./order-fetcher";
 import {
   mapOrdersToEnvelope,
   groupOrdersIntoBatches,
@@ -325,7 +330,11 @@ export const handler = async (
       return;
     }
 
-    const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];
+    // WR-05: guard the load-bearing shape at the re-dispatch fetch boundary.
+    const failedOrderData = assertWarehouseOrders(
+      failedOrderRows ?? [],
+      "re-dispatch warehouse fetch",
+    );
 
     // WR-02: failed rows whose order is no longer 'approved' (rejected/pending)
     // are excluded from failedOrderData by the approval filter above. Without
