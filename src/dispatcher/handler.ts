@@ -478,6 +478,7 @@ export const handler = async (
               batch.legalEntity,
               supabase,
               summary,
+              messageId, // WR-04: keep the external_id assigned at claim time
             );
             summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
@@ -553,9 +554,17 @@ async function sendOrdersOneByOne(
   legalEntity: string,
   supabase: ReturnType<typeof getSupabaseClient>,
   summary: { ordersSent: number; ordersFailed: number },
+  // WR-04: on re-dispatch the row was already claimed-as-pending with a stable
+  // message_id/external_id (the verifier reconciles BC buffer records by
+  // external_id). Re-randomizing here would churn the id and break that
+  // reconciliation, so the re-dispatch caller passes the already-assigned
+  // messageId to keep the externalId stable. The NEW path omits it and gets a
+  // fresh single-send id as before.
+  redispatchMessageId?: string,
 ): Promise<void> {
   for (const order of orders) {
-    const singleMessageId = randomUUID();
+    const preserveId = redispatchMessageId != null;
+    const singleMessageId = redispatchMessageId ?? randomUUID();
     const singleCorrelationId = `dispatch-single-${new Date().toISOString()}`;
 
     try {
@@ -585,14 +594,20 @@ async function sendOrdersOneByOne(
         continue;
       }
 
-      // Update message_id and external_id for tracking before send
+      // WR-04: only (re)assign message_id/external_id on the NEW path. On
+      // re-dispatch the row already carries the stable id chosen at claim time
+      // (line ~382), so we leave it untouched and only refresh correlation_id.
+      const metaUpdate = preserveId
+        ? { correlation_id: singleCorrelationId }
+        : {
+            message_id: singleMessageId,
+            correlation_id: singleCorrelationId,
+            external_id: `BRA-AC-${singleMessageId}-${order.po_number}`,
+          };
+
       const { error: metaError } = await supabase
         .from("bc_sync_orders")
-        .update({
-          message_id: singleMessageId,
-          correlation_id: singleCorrelationId,
-          external_id: `BRA-AC-${singleMessageId}-${order.po_number}`,
-        })
+        .update(metaUpdate)
         .eq("batch_id", originalBatchId)
         .eq("order_id", order.id);
 
