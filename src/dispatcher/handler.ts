@@ -327,6 +327,40 @@ export const handler = async (
 
     const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];
 
+    // WR-02: failed rows whose order is no longer 'approved' (rejected/pending)
+    // are excluded from failedOrderData by the approval filter above. Without
+    // terminating them they keep retry_count < max_retries and are re-fetched
+    // every run forever (same unbounded-loop family as CR-01). Mark them
+    // terminal ('skipped') so they leave the candidate set. SYNC-01 already
+    // guarantees we do not re-send unapproved orders; this also stops the churn.
+    const fetchedOrderIds = new Set(failedOrderData.map((o) => o.id));
+    const unapprovedRecords = failedRecords.filter(
+      (rec) => !fetchedOrderIds.has(rec.order_id),
+    );
+    for (const rec of unapprovedRecords) {
+      const { error: skipError } = await supabase
+        .from("bc_sync_orders")
+        .update({
+          status: "skipped",
+          error_message: "Order no longer approved -- not re-dispatched",
+          failed_at: new Date().toISOString(),
+        })
+        .eq("id", rec.id);
+
+      if (skipError) {
+        console.error("Failed to mark unapproved failed record as skipped", {
+          syncRecordId: rec.id,
+          orderId: rec.order_id,
+          error: skipError.message,
+        });
+      } else {
+        console.warn("Marked failed record skipped -- order no longer approved", {
+          syncRecordId: rec.id,
+          orderId: rec.order_id,
+        });
+      }
+    }
+
     if (failedOrderData.length > 0) {
       const { batches: failedBatches, skipped: failedSkipped } =
         groupOrdersIntoBatches(failedOrderData);
