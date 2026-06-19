@@ -337,15 +337,56 @@ export const handler = async (
     );
 
     // WR-02: failed rows whose order is no longer 'approved' (rejected/pending)
-    // are excluded from failedOrderData by the approval filter above. Without
-    // terminating them they keep retry_count < max_retries and are re-fetched
-    // every run forever (same unbounded-loop family as CR-01). Mark them
-    // terminal ('skipped') so they leave the candidate set. SYNC-01 already
-    // guarantees we do not re-send unapproved orders; this also stops the churn.
+    // must be terminated ('skipped') so they leave the candidate set, otherwise
+    // they keep retry_count < max_retries and are re-fetched every run forever
+    // (same unbounded-loop family as CR-01). SYNC-01 already guarantees we do
+    // not re-send unapproved orders; this also stops the churn.
+    //
+    // BUGFIX: absence from failedOrderData is NOT proof of disapproval. The
+    // re-dispatch fetch above also drops rows via `action_articles!inner` and
+    // other line filters, so a STILL-approved order can be missing purely
+    // because a join filtered it out. Marking those 'skipped' would wrongly
+    // terminate a healthy order that should be retried. Therefore re-check
+    // approval_status explicitly for the absent order_ids with a targeted query
+    // and only skip the ones that are GENUINELY not approved.
     const fetchedOrderIds = new Set(failedOrderData.map((o) => o.id));
-    const unapprovedRecords = failedRecords.filter(
-      (rec) => !fetchedOrderIds.has(rec.order_id),
-    );
+    const absentOrderIds = failedRecords
+      .map((r) => r.order_id)
+      .filter((id) => !fetchedOrderIds.has(id));
+
+    let unapprovedRecords: BcSyncOrderRow[] = [];
+    if (absentOrderIds.length > 0) {
+      const { data: approvalRows, error: approvalCheckError } = await supabase
+        .from("orders")
+        .select("id, approval_status")
+        .eq("company_id", companyId)
+        .in("id", absentOrderIds);
+
+      if (approvalCheckError) {
+        // Cannot determine approval -- do NOT skip on inference. Leave the rows
+        // 'failed' so they remain candidates; a later run re-checks them. This
+        // is safe: SYNC-01 still prevents re-sending unapproved orders.
+        console.error(
+          "Failed to re-check approval_status for absent failed records -- not terminating them",
+          { error: approvalCheckError.message, absentCount: absentOrderIds.length },
+        );
+      } else {
+        // An order is genuinely not approved if it is present with a non-approved
+        // status, OR if it no longer exists in orders at all (deleted). Orders
+        // absent ONLY due to inner-join/article filters re-appear here as
+        // 'approved' and are deliberately left for retry.
+        const approvedAbsentIds = new Set(
+          (approvalRows ?? [])
+            .filter((row) => row.approval_status === "approved")
+            .map((row) => row.id),
+        );
+        unapprovedRecords = failedRecords.filter(
+          (rec) =>
+            !fetchedOrderIds.has(rec.order_id) &&
+            !approvedAbsentIds.has(rec.order_id),
+        );
+      }
+    }
     for (const rec of unapprovedRecords) {
       const { error: skipError } = await supabase
         .from("bc_sync_orders")
