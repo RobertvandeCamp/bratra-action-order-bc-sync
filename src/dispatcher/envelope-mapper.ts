@@ -10,39 +10,32 @@ import {
   MAX_ORDERS_PER_BATCH,
   MAX_ENVELOPE_BYTES,
 } from "../shared/types";
-import ppArticles from "../config/pp-articles.json";
-
-// PP EAN set loaded once at module init
-const PP_EANS = new Set<string>(ppArticles as string[]);
 
 // ============================================================================
-// PP Article Detection & Legal Entity Routing
+// Legal Entity Routing (SEG-03)
 // ============================================================================
 
 /**
- * Check if any order line has a bratra_articles.article_number in the PP EAN set.
- * If true, the entire PO is routed to the Pet Products legal entity (LEGAL_ENTITY_MAP.PP).
- */
-function isPetProductsOrder(order: WarehouseOrder): boolean {
-  return order.order_lines.some(
-    (line) =>
-      line.bratra_articles?.article_number != null &&
-      PP_EANS.has(line.bratra_articles.article_number),
-  );
-}
-
-/**
- * Determine the legal entity for an order based on PP detection and company_id.
- * NB: alle map-waarden staan tijdelijk op BRATRA-NL totdat ERP Company de
- * waarden per Bratra-bedrijf bevestigt (zie LEGAL_ENTITY_MAP in types.ts).
- * De PP-detectie blijft actief zodat de routing direct werkt zodra de
- * echte waarden bekend zijn.
+ * Determine the legal entity for an order via data-driven routing on
+ * orders.business_unit (D-02). Fail-fast (throw) bij null/onbekende
+ * business_unit (D-04) -- geen stille fallback, zodat ongeclassificeerde
+ * orders direct opvallen i.p.v. naar de verkeerde entity gerouteerd te worden.
+ *
+ * NB: alle LEGAL_ENTITY_MAP-waarden staan tijdelijk op BRATRA-NL totdat ERP
+ * Company de waarden per Bratra-bedrijf bevestigt (zie types.ts).
  */
 export function determineLegalEntity(order: WarehouseOrder): string {
-  if (PP_EANS.size > 0 && isPetProductsOrder(order)) {
-    return LEGAL_ENTITY_MAP.PP;
+  const entity =
+    order.business_unit != null
+      ? LEGAL_ENTITY_MAP[order.business_unit]
+      : undefined;
+  if (entity == null) {
+    throw new Error(
+      `Cannot route order ${order.id} (PO ${order.po_number}): ` +
+        `business_unit=${order.business_unit ?? "null"} not in LEGAL_ENTITY_MAP`,
+    );
   }
-  return LEGAL_ENTITY_MAP[order.company_id] ?? "BRATRA-NL";
+  return entity;
 }
 
 // ============================================================================
@@ -175,17 +168,37 @@ interface BatchGroup {
   legalEntity: string;
 }
 
+/** Een order die niet gerouteerd kon worden (fail-fast) en wordt overgeslagen. */
+export interface SkippedOrder {
+  order: WarehouseOrder;
+  reason: string;
+}
+
 /**
  * Group orders by legal entity and split into sub-batches of max MAX_ORDERS_PER_BATCH.
+ *
+ * Fail-fast isolatie (D-04, RESEARCH Pitfall 1): determineLegalEntity throwt bij
+ * een ongeclassificeerde order. Die throw wordt PER ORDER opgevangen zodat één
+ * slechte order de batch (en daarmee de hele Lambda-invocatie) niet keldert --
+ * deze functie wordt namelijk BUITEN de per-batch try/catch in de handler
+ * aangeroepen. Overgeslagen orders komen in `skipped`; de handler markeert die
+ * als `failed` in bc_sync_orders.
  */
 export function groupOrdersIntoBatches(
   orders: WarehouseOrder[],
-): BatchGroup[] {
+): { batches: BatchGroup[]; skipped: SkippedOrder[] } {
   // Group by legalEntity
   const groups = new Map<string, WarehouseOrder[]>();
+  const skipped: SkippedOrder[] = [];
 
   for (const order of orders) {
-    const entity = determineLegalEntity(order);
+    let entity: string;
+    try {
+      entity = determineLegalEntity(order);
+    } catch (err) {
+      skipped.push({ order, reason: (err as Error).message });
+      continue;
+    }
     const existing = groups.get(entity);
     if (existing) {
       existing.push(order);
@@ -206,5 +219,5 @@ export function groupOrdersIntoBatches(
     }
   }
 
-  return batches;
+  return { batches, skipped };
 }

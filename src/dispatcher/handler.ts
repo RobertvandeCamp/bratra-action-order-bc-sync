@@ -1,7 +1,12 @@
 import type { SQSEvent, SQSRecord, ScheduledEvent, Context } from "aws-lambda";
 import { randomUUID } from "node:crypto";
 
-import { fetchUnsyncedOrders, fetchFailedSyncRecords, recoverStalePendingRecords } from "./order-fetcher";
+import {
+  fetchUnsyncedOrders,
+  fetchFailedSyncRecords,
+  recoverStalePendingRecords,
+  assertWarehouseOrders,
+} from "./order-fetcher";
 import {
   mapOrdersToEnvelope,
   groupOrdersIntoBatches,
@@ -134,7 +139,50 @@ export const handler = async (
 
   // ---- Process NEW orders ----
   if (trulyNewOrders.length > 0) {
-    const batches = groupOrdersIntoBatches(trulyNewOrders);
+    const { batches, skipped } = groupOrdersIntoBatches(trulyNewOrders);
+
+    // Fail-fast (D-04): ongeclassificeerde NEW orders hebben nog geen
+    // bc_sync_orders-rij. INSERT een rij met status 'failed' zodat de order
+    // traceerbaar is i.p.v. stilletjes te verdwijnen (RESEARCH Open Question 1).
+    for (const { order, reason } of skipped) {
+      const failedAt = new Date().toISOString();
+      console.error("Skipping unclassified NEW order (fail-fast routing)", {
+        orderId: order.id,
+        poNumber: order.po_number,
+        reason,
+      });
+
+      const failedInsert: BcSyncOrderInsert = {
+        status: "failed",
+        company_id: order.company_id,
+        order_id: order.id,
+        po_number: order.po_number,
+        error_message: reason,
+        failed_at: failedAt,
+      };
+
+      const { error: skipInsertError } = await supabase
+        .from("bc_sync_orders")
+        .insert(failedInsert);
+
+      if (skipInsertError) {
+        if (skipInsertError.code === PG_UNIQUE_VIOLATION) {
+          // WR-01: concurrent run already inserted a tracking row for this
+          // order. The failed-trace row exists, so this is benign -- mirror the
+          // batch INSERT path which also skips silently on 23505.
+          console.warn("Skipping unclassified order -- concurrent run already claimed", {
+            orderId: order.id,
+          });
+        } else {
+          console.error("Failed to insert failed sync record for skipped order", {
+            orderId: order.id,
+            error: skipInsertError.message,
+          });
+        }
+      }
+
+      summary.ordersFailed++;
+    }
 
     for (const batch of batches) {
       const batchId = randomUUID();
@@ -266,8 +314,9 @@ export const handler = async (
     const failedOrderIdsList = failedRecords.map((r) => r.order_id);
     const { data: failedOrderRows, error: failedFetchError } = await supabase
       .from("orders")
-      .select("id, po_number, company_id, carrier_code, carrier, req_delivery_date, exp_delivery_date, order_type, unloading_location, truck_proposal, ship_id, shipment_status, req_etd, exp_etd, eta, port_of_departure_code, port_of_departure, port_of_arrival_code, port_of_arrival, container_type, distribution_centers (code, name, location), order_lines (id, line_number, contract_number, req_quantity, exp_quantity, price, pallet_pattern, pallets, category, unit_price_currency, allocation, hazardous_goods, adr, icpe, logistic_group, action_articles!inner (article_number, description), bratra_articles (article_number))")
+      .select("id, po_number, company_id, business_unit, approval_status, carrier_code, carrier, req_delivery_date, exp_delivery_date, order_type, unloading_location, truck_proposal, ship_id, shipment_status, req_etd, exp_etd, eta, port_of_departure_code, port_of_departure, port_of_arrival_code, port_of_arrival, container_type, distribution_centers (code, name, location), order_lines (id, line_number, contract_number, req_quantity, exp_quantity, price, pallet_pattern, pallets, category, unit_price_currency, allocation, hazardous_goods, adr, icpe, logistic_group, action_articles!inner (article_number, description), bratra_articles (article_number))")
       .eq("company_id", companyId)
+      .eq("approval_status", "approved")
       .in("id", failedOrderIdsList);
 
     if (failedFetchError) {
@@ -281,10 +330,132 @@ export const handler = async (
       return;
     }
 
-    const failedOrderData = (failedOrderRows ?? []) as unknown as WarehouseOrder[];
+    // WR-05: guard the load-bearing shape at the re-dispatch fetch boundary.
+    const failedOrderData = assertWarehouseOrders(
+      failedOrderRows ?? [],
+      "re-dispatch warehouse fetch",
+    );
+
+    // WR-02: failed rows whose order is no longer 'approved' (rejected/pending)
+    // must be terminated ('skipped') so they leave the candidate set, otherwise
+    // they keep retry_count < max_retries and are re-fetched every run forever
+    // (same unbounded-loop family as CR-01). SYNC-01 already guarantees we do
+    // not re-send unapproved orders; this also stops the churn.
+    //
+    // BUGFIX: absence from failedOrderData is NOT proof of disapproval. The
+    // re-dispatch fetch above also drops rows via `action_articles!inner` and
+    // other line filters, so a STILL-approved order can be missing purely
+    // because a join filtered it out. Marking those 'skipped' would wrongly
+    // terminate a healthy order that should be retried. Therefore re-check
+    // approval_status explicitly for the absent order_ids with a targeted query
+    // and only skip the ones that are GENUINELY not approved.
+    const fetchedOrderIds = new Set(failedOrderData.map((o) => o.id));
+    const absentOrderIds = failedRecords
+      .map((r) => r.order_id)
+      .filter((id) => !fetchedOrderIds.has(id));
+
+    let unapprovedRecords: BcSyncOrderRow[] = [];
+    if (absentOrderIds.length > 0) {
+      const { data: approvalRows, error: approvalCheckError } = await supabase
+        .from("orders")
+        .select("id, approval_status")
+        .eq("company_id", companyId)
+        .in("id", absentOrderIds);
+
+      if (approvalCheckError) {
+        // Cannot determine approval -- do NOT skip on inference. Leave the rows
+        // 'failed' so they remain candidates; a later run re-checks them. This
+        // is safe: SYNC-01 still prevents re-sending unapproved orders.
+        console.error(
+          "Failed to re-check approval_status for absent failed records -- not terminating them",
+          { error: approvalCheckError.message, absentCount: absentOrderIds.length },
+        );
+      } else {
+        // An order is genuinely not approved if it is present with a non-approved
+        // status, OR if it no longer exists in orders at all (deleted). Orders
+        // absent ONLY due to inner-join/article filters re-appear here as
+        // 'approved' and are deliberately left for retry.
+        const approvedAbsentIds = new Set(
+          (approvalRows ?? [])
+            .filter((row) => row.approval_status === "approved")
+            .map((row) => row.id),
+        );
+        unapprovedRecords = failedRecords.filter(
+          (rec) =>
+            !fetchedOrderIds.has(rec.order_id) &&
+            !approvedAbsentIds.has(rec.order_id),
+        );
+      }
+    }
+    for (const rec of unapprovedRecords) {
+      const { error: skipError } = await supabase
+        .from("bc_sync_orders")
+        .update({
+          status: "skipped",
+          error_message: "Order no longer approved -- not re-dispatched",
+          failed_at: new Date().toISOString(),
+        })
+        .eq("id", rec.id);
+
+      if (skipError) {
+        console.error("Failed to mark unapproved failed record as skipped", {
+          syncRecordId: rec.id,
+          orderId: rec.order_id,
+          error: skipError.message,
+        });
+      } else {
+        console.warn("Marked failed record skipped -- order no longer approved", {
+          syncRecordId: rec.id,
+          orderId: rec.order_id,
+        });
+      }
+    }
 
     if (failedOrderData.length > 0) {
-      const failedBatches = groupOrdersIntoBatches(failedOrderData);
+      const { batches: failedBatches, skipped: failedSkipped } =
+        groupOrdersIntoBatches(failedOrderData);
+
+      // Fail-fast (D-04): ongeclassificeerde re-dispatch orders hebben AL een
+      // bc_sync_orders-rij. Markeer die 'failed' met de skip-reason (match op
+      // order_id, want de order zit niet in een batch).
+      for (const { order, reason } of failedSkipped) {
+        const failedAt = new Date().toISOString();
+        console.error("Skipping unclassified re-dispatch order (fail-fast routing)", {
+          orderId: order.id,
+          poNumber: order.po_number,
+          reason,
+        });
+
+        const syncRecord = failedOrderMap.get(order.id);
+        if (!syncRecord) {
+          summary.ordersFailed++;
+          continue;
+        }
+
+        // CR-01: increment retry_count so a structurally unroutable order
+        // (permanent null/unknown business_unit) eventually reaches max_retries
+        // and drops out of fetchFailedSyncRecords -- without this it is
+        // re-fetched and re-skipped on every invocation forever (never reaches
+        // dead_letter). Mirrors the batch-failure path below (handler.ts ~382).
+        const { error: skipUpdateError } = await supabase
+          .from("bc_sync_orders")
+          .update({
+            status: "failed",
+            error_message: reason,
+            failed_at: failedAt,
+            retry_count: syncRecord.retry_count + 1,
+          })
+          .eq("order_id", order.id);
+
+        if (skipUpdateError) {
+          console.error("Failed to mark skipped re-dispatch order as failed", {
+            orderId: order.id,
+            error: skipUpdateError.message,
+          });
+        }
+
+        summary.ordersFailed++;
+      }
 
       for (const batch of failedBatches) {
         const batchId = randomUUID();
@@ -357,6 +528,7 @@ export const handler = async (
               batch.legalEntity,
               supabase,
               summary,
+              true, // re-dispatch: keep stable external_id, unique per-send messageId
             );
             summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
@@ -432,8 +604,23 @@ async function sendOrdersOneByOne(
   legalEntity: string,
   supabase: ReturnType<typeof getSupabaseClient>,
   summary: { ordersSent: number; ordersFailed: number },
+  // WR-04: on re-dispatch the row was already claimed-as-pending with a stable
+  // external_id (the verifier reconciles BC buffer records by external_id).
+  // Re-randomizing the external_id here would churn it and break that
+  // reconciliation, so the re-dispatch caller signals (isRedispatch) that the
+  // row's external_id must be left untouched. The NEW path omits it and gets a
+  // fresh single-send external_id as before.
+  isRedispatch = false,
 ): Promise<void> {
   for (const order of orders) {
+    // BUGFIX (Duplicate Service Bus message IDs): every individual send MUST get
+    // a UNIQUE broker MessageId. Previously the re-dispatch path reused one
+    // shared batch messageId for every one-by-one POST, so each envelope (and
+    // thus each BrokerProperties.MessageId) was identical -> the broker
+    // deduplicated/rejected the later sends. The broker messageId is decoupled
+    // from external_id: we always mint a fresh per-send id for the envelope,
+    // while the stable external_id on the row is preserved on re-dispatch.
+    const preserveExternalId = isRedispatch;
     const singleMessageId = randomUUID();
     const singleCorrelationId = `dispatch-single-${new Date().toISOString()}`;
 
@@ -464,14 +651,21 @@ async function sendOrdersOneByOne(
         continue;
       }
 
-      // Update message_id and external_id for tracking before send
+      // WR-04: keep the stable external_id on re-dispatch (verifier reconciles
+      // by external_id), but still record THIS send's unique broker message_id
+      // so the row reflects the id actually sent to the broker. On the NEW path
+      // we assign a fresh external_id derived from that same unique messageId.
+      const metaUpdate = preserveExternalId
+        ? { message_id: singleMessageId, correlation_id: singleCorrelationId }
+        : {
+            message_id: singleMessageId,
+            correlation_id: singleCorrelationId,
+            external_id: `BRA-AC-${singleMessageId}-${order.po_number}`,
+          };
+
       const { error: metaError } = await supabase
         .from("bc_sync_orders")
-        .update({
-          message_id: singleMessageId,
-          correlation_id: singleCorrelationId,
-          external_id: `BRA-AC-${singleMessageId}-${order.po_number}`,
-        })
+        .update(metaUpdate)
         .eq("batch_id", originalBatchId)
         .eq("order_id", order.id);
 
