@@ -339,12 +339,18 @@ export const handler = async (
           continue;
         }
 
+        // CR-01: increment retry_count so a structurally unroutable order
+        // (permanent null/unknown business_unit) eventually reaches max_retries
+        // and drops out of fetchFailedSyncRecords -- without this it is
+        // re-fetched and re-skipped on every invocation forever (never reaches
+        // dead_letter). Mirrors the batch-failure path below (handler.ts ~382).
         const { error: skipUpdateError } = await supabase
           .from("bc_sync_orders")
           .update({
             status: "failed",
             error_message: reason,
             failed_at: failedAt,
+            retry_count: syncRecord.retry_count + 1,
           })
           .eq("order_id", order.id);
 
