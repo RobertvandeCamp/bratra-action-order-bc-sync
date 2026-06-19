@@ -161,10 +161,19 @@ export const handler = async (
         .insert(failedInsert);
 
       if (skipInsertError) {
-        console.error("Failed to insert failed sync record for skipped order", {
-          orderId: order.id,
-          error: skipInsertError.message,
-        });
+        if (skipInsertError.code === PG_UNIQUE_VIOLATION) {
+          // WR-01: concurrent run already inserted a tracking row for this
+          // order. The failed-trace row exists, so this is benign -- mirror the
+          // batch INSERT path which also skips silently on 23505.
+          console.warn("Skipping unclassified order -- concurrent run already claimed", {
+            orderId: order.id,
+          });
+        } else {
+          console.error("Failed to insert failed sync record for skipped order", {
+            orderId: order.id,
+            error: skipInsertError.message,
+          });
+        }
       }
 
       summary.ordersFailed++;
