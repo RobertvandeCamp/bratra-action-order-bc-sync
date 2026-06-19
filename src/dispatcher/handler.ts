@@ -528,7 +528,7 @@ export const handler = async (
               batch.legalEntity,
               supabase,
               summary,
-              messageId, // WR-04: keep the external_id assigned at claim time
+              true, // re-dispatch: keep stable external_id, unique per-send messageId
             );
             summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
@@ -605,16 +605,23 @@ async function sendOrdersOneByOne(
   supabase: ReturnType<typeof getSupabaseClient>,
   summary: { ordersSent: number; ordersFailed: number },
   // WR-04: on re-dispatch the row was already claimed-as-pending with a stable
-  // message_id/external_id (the verifier reconciles BC buffer records by
-  // external_id). Re-randomizing here would churn the id and break that
-  // reconciliation, so the re-dispatch caller passes the already-assigned
-  // messageId to keep the externalId stable. The NEW path omits it and gets a
-  // fresh single-send id as before.
-  redispatchMessageId?: string,
+  // external_id (the verifier reconciles BC buffer records by external_id).
+  // Re-randomizing the external_id here would churn it and break that
+  // reconciliation, so the re-dispatch caller signals (isRedispatch) that the
+  // row's external_id must be left untouched. The NEW path omits it and gets a
+  // fresh single-send external_id as before.
+  isRedispatch = false,
 ): Promise<void> {
   for (const order of orders) {
-    const preserveId = redispatchMessageId != null;
-    const singleMessageId = redispatchMessageId ?? randomUUID();
+    // BUGFIX (Duplicate Service Bus message IDs): every individual send MUST get
+    // a UNIQUE broker MessageId. Previously the re-dispatch path reused one
+    // shared batch messageId for every one-by-one POST, so each envelope (and
+    // thus each BrokerProperties.MessageId) was identical -> the broker
+    // deduplicated/rejected the later sends. The broker messageId is decoupled
+    // from external_id: we always mint a fresh per-send id for the envelope,
+    // while the stable external_id on the row is preserved on re-dispatch.
+    const preserveExternalId = isRedispatch;
+    const singleMessageId = randomUUID();
     const singleCorrelationId = `dispatch-single-${new Date().toISOString()}`;
 
     try {
@@ -644,11 +651,12 @@ async function sendOrdersOneByOne(
         continue;
       }
 
-      // WR-04: only (re)assign message_id/external_id on the NEW path. On
-      // re-dispatch the row already carries the stable id chosen at claim time
-      // (line ~382), so we leave it untouched and only refresh correlation_id.
-      const metaUpdate = preserveId
-        ? { correlation_id: singleCorrelationId }
+      // WR-04: keep the stable external_id on re-dispatch (verifier reconciles
+      // by external_id), but still record THIS send's unique broker message_id
+      // so the row reflects the id actually sent to the broker. On the NEW path
+      // we assign a fresh external_id derived from that same unique messageId.
+      const metaUpdate = preserveExternalId
+        ? { message_id: singleMessageId, correlation_id: singleCorrelationId }
         : {
             message_id: singleMessageId,
             correlation_id: singleCorrelationId,
