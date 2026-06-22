@@ -1,14 +1,15 @@
 name: Claude Code Review
 
-# Automatische code review door Claude op elke PR.
-# Auth via Claude Pro/Max abonnement (OAuth-token), niet via API-key.
-# Secret CLAUDE_CODE_OAUTH_TOKEN moet als repository secret (Actions) staan.
+# Automated code review by Claude on every PR.
+# Auth via Claude Pro/Max subscription (OAuth token), not via an API key.
+# Secret CLAUDE_CODE_OAUTH_TOKEN must be set as a repository secret (Actions).
+# Review behavior is tuned by REVIEW.md in the repo root (see this folder).
 
 on:
   pull_request:
     types: [opened, synchronize]
 
-# Voorkom dubbele/parallelle reviews op snelle opeenvolgende pushes.
+# Avoid duplicate/parallel reviews on rapid successive pushes.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -30,25 +31,17 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Keep the other PR bot's comments out of Claude's context.
+          exclude_comments_by_actor: "cursor[bot]"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this pull request as an experienced engineer.
-            The PR branch is already checked out in the working directory.
-
-            Focus on:
-            - Correctness and bugs (edge cases, error handling, async/concurrency)
-            - Security (auth, secrets, input validation, injection; for IaC/Lambda
-              check IAM least-privilege and resource scoping)
-            - Types and schema validation at I/O boundaries
-            - Clear, high-signal failure modes
-            - Unnecessary complexity or duplication
-
-            Add inline comments on specific lines; use a top-level comment for
-            general observations. Write in English. No emoji. Do not merge the
-            PR and do not push changes; review only.
-          # Kostenbeheersing (--max-turns) + tools om comments te kunnen plaatsen.
+            Review this pull request. The PR branch is already checked out in the
+            working directory. Follow REVIEW.md in the repo root and honor any
+            CLAUDE.md conventions. Add inline comments on specific lines and use a
+            top-level comment for the summary.
+          # Cost control (--max-turns) + tools needed to post comments.
           claude_args: |
             --max-turns 15
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
