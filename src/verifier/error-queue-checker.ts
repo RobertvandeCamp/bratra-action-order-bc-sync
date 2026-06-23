@@ -36,6 +36,28 @@ interface ReceivedErrorMessage {
   locationUrl: string | null;
 }
 
+// ============================================================================
+// BrokerProperties is een externe I/O-grens (Service Bus response-header) en
+// MOET door Zod (coding-principles: validate every external boundary). MessageId
+// is de idempotentie-sleutel; LockToken/SequenceNumber zijn nodig om het bericht
+// te DELETE'en. Een header die niet valideert -> behandel als een onbruikbaar
+// bericht (log, errors++, NIET verwijderen -- laat voor retry), exact zoals de
+// bestaande missing-MessageId branch (claude Important, PR#5).
+// ============================================================================
+
+const brokerPropertiesSchema = z
+  .object({
+    MessageId: z.string().min(1),
+    SequenceNumber: z.number(),
+    LockToken: z.string().min(1),
+    DeliveryCount: z.number().optional(),
+    EnqueuedTimeUtc: z.string().optional(),
+    EnqueuedSequenceNumber: z.number().optional(),
+    Label: z.string().optional(),
+    CorrelationId: z.string().optional(),
+  })
+  .passthrough();
+
 /**
  * Receive a single message from the ORDINARY bratra-error queue via peek-lock.
  *
@@ -43,11 +65,21 @@ interface ReceivedErrorMessage {
  * Returns null when the queue is empty (HTTP 204).
  * Uses the Location header for the DELETE URL when available.
  */
+/**
+ * Resultaat van een receive: "empty" (queue leeg), "ok" (gevalideerd bericht),
+ * of "invalid-header" (BrokerProperties ontbreekt/valideert niet -- het bericht
+ * is un-keyable en mag NIET verwijderd worden; behandeld als errors++).
+ */
+type ReceiveResult =
+  | { kind: "empty" }
+  | { kind: "ok"; message: ReceivedErrorMessage }
+  | { kind: "invalid-header"; reason: string };
+
 async function receiveErrorMessage(
   namespace: string,
   queue: string,
   sasToken: string,
-): Promise<ReceivedErrorMessage | null> {
+): Promise<ReceiveResult> {
   const url = `https://${namespace}.servicebus.windows.net/${queue}/messages/head?timeout=5`;
 
   const response = await fetch(url, {
@@ -56,28 +88,53 @@ async function receiveErrorMessage(
   });
 
   // HTTP 204 = queue leeg
-  if (response.status === 204) return null;
+  if (response.status === 204) return { kind: "empty" };
 
   if (response.status !== 201) {
     const body = await response.text();
     throw new Error(`Error-queue receive failed (${response.status}): ${body.slice(0, 300)}`);
   }
 
-  // BrokerProperties envelope-header (MessageId, SequenceNumber, LockToken, ...)
+  // BrokerProperties envelope-header (MessageId, SequenceNumber, LockToken, ...).
+  // Externe I/O-grens: valideer met Zod (claude Important, PR#5). Body altijd
+  // consumeren zodat de connection vrijkomt, ook bij een ongeldige header.
   const brokerPropsRaw = response.headers.get("BrokerProperties");
-  if (!brokerPropsRaw) {
-    throw new Error("Missing BrokerProperties header in error-queue response");
-  }
-  const brokerProperties: DlqBrokerProperties = JSON.parse(brokerPropsRaw);
-
   const body = await response.text();
   const locationUrl = response.headers.get("Location") ?? null;
 
+  if (!brokerPropsRaw) {
+    return { kind: "invalid-header", reason: "Missing BrokerProperties header" };
+  }
+
+  let brokerParsed: unknown;
+  try {
+    brokerParsed = JSON.parse(brokerPropsRaw);
+  } catch {
+    return { kind: "invalid-header", reason: "BrokerProperties header is not valid JSON" };
+  }
+
+  const result = brokerPropertiesSchema.safeParse(brokerParsed);
+  if (!result.success) {
+    // MessageId/LockToken/SequenceNumber ontbreken of zijn van het verkeerde
+    // type -> bericht is niet veilig te completen of te dedupliceren.
+    return {
+      kind: "invalid-header",
+      reason: `BrokerProperties header failed validation: ${result.error.issues
+        .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
+        .join("; ")}`,
+    };
+  }
+
+  const brokerProperties = result.data as unknown as DlqBrokerProperties;
+
   return {
-    brokerProperties,
-    body,
-    lockToken: brokerProperties.LockToken,
-    locationUrl,
+    kind: "ok",
+    message: {
+      brokerProperties,
+      body,
+      lockToken: brokerProperties.LockToken,
+      locationUrl,
+    },
   };
 }
 
@@ -154,6 +211,14 @@ function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
 
 type MatchedOrder = { id: number; status: string };
 
+/**
+ * Terminale statussen: een order in een van deze toestanden is al definitief
+ * gesetteld en mag NIET door een (mogelijk stale) error-queue bericht worden
+ * overschreven naar bc_rejected (claude Important, PR#5). `bc_rejected` zit hier
+ * ook in maar wordt apart als idempotent-skip behandeld voor een duidelijke log.
+ */
+const TERMINAL_STATUSES = new Set(["verified", "dead_letter", "skipped", "bc_rejected"]);
+
 /** Resultaat van een match-poging: de order (of null) plus de berekende external_id. */
 interface MatchResult {
   matchedOrder: MatchedOrder | null;
@@ -214,12 +279,21 @@ async function matchOrder(
 }
 
 /**
- * Zet een gematchte order op `bc_rejected` (D-04, idempotent).
+ * Zet een gematchte order op `bc_rejected` (D-04, idempotent + terminal-guard).
  *
  * Returns:
- *  - "updated"     -- order succesvol op bc_rejected gezet (matched++)
- *  - "already"     -- order was al bc_rejected, niets te doen (matched++)
- *  - "failed"      -- UPDATE faalde; order NIET op bc_rejected (errors++, NIET completen)
+ *  - "updated"  -- order succesvol op bc_rejected gezet (matched++)
+ *  - "already"  -- order was al bc_rejected, niets te doen (matched++)
+ *  - "terminal" -- order zit al in een ANDERE terminale status
+ *                  (verified/dead_letter/skipped); NIET overschrijven, wel
+ *                  archiveren+completen als "al gesetteld" (geen error)
+ *  - "failed"   -- UPDATE faalde; order NIET op bc_rejected (errors++, NIET completen)
+ *
+ * Een (mogelijk stale) error-queue bericht dat matcht aan een order die al
+ * verified/dead_letter/skipped is, mag die definitieve uitkomst NIET terugzetten
+ * naar bc_rejected met een verse failed_at (claude Important, PR#5). De order
+ * blijft ongemoeid; het bericht wordt wel gearchiveerd voor traceability en uit
+ * de queue gehaald.
  *
  * Gebruikt door zowel het hoofdpad als het idempotency-skip pad (self-heal van
  * een eerder gefaalde update).
@@ -229,13 +303,25 @@ async function applyRejection(
   matchedOrder: MatchedOrder,
   errorMessage: string,
   messageId: string,
-): Promise<"updated" | "already" | "failed"> {
+): Promise<"updated" | "already" | "terminal" | "failed"> {
   if (matchedOrder.status === "bc_rejected") {
     console.log("Order already bc_rejected (idempotent skip)", {
       orderId: matchedOrder.id,
       messageId,
     });
     return "already";
+  }
+
+  if (TERMINAL_STATUSES.has(matchedOrder.status)) {
+    console.warn(
+      "Order already in a terminal status -- NOT overwriting to bc_rejected (already settled)",
+      {
+        orderId: matchedOrder.id,
+        currentStatus: matchedOrder.status,
+        messageId,
+      },
+    );
+    return "terminal";
   }
 
   const { error: updateError } = await supabase
@@ -290,23 +376,43 @@ export async function checkErrorQueue(
 
   // SAS token scoped op de error-queue. Listen-key kan afwijken van de inbound-key;
   // valt terug op SB_KEY_NAME/VALUE als niet apart gezet (D-01, mirror errorQueuePeek).
+  // De error-key is een PAAR: resolve atomisch zodat name/value NOOIT van een
+  // andere key-set komen (config.superRefine garandeert beide-of-geen, PR#5).
+  const useErrorKey = config.SB_ERROR_KEY_NAME !== undefined;
+  const sasKeyName = useErrorKey ? config.SB_ERROR_KEY_NAME! : config.SB_KEY_NAME;
+  const sasKeyValue = useErrorKey ? config.SB_ERROR_KEY_VALUE! : config.SB_KEY_VALUE;
   const sasToken = generateSasToken(
     config.SB_NAMESPACE,
     config.SB_ERROR_QUEUE,
-    config.SB_ERROR_KEY_NAME ?? config.SB_KEY_NAME,
-    config.SB_ERROR_KEY_VALUE ?? config.SB_KEY_VALUE,
+    sasKeyName,
+    sasKeyValue,
   );
 
   for (let i = 0; i < MAX_MESSAGES; i++) {
     try {
-      const msg = await receiveErrorMessage(
+      const received = await receiveErrorMessage(
         config.SB_NAMESPACE,
         config.SB_ERROR_QUEUE,
         sasToken,
       );
-      if (!msg) break; // Queue leeg
+      if (received.kind === "empty") break; // Queue leeg
 
-      // 1. Idempotentie-sleutel uit de ENVELOPE (D-10: ook bij malformed body)
+      if (received.kind === "invalid-header") {
+        // BrokerProperties ontbreekt/valideert niet -> bericht is un-keyable en
+        // niet veilig te completen. Zelfde behandeling als missing-MessageId:
+        // log, errors++, NIET verwijderen (laat voor retry) (claude Important, PR#5).
+        console.error("Error-queue message met ongeldige BrokerProperties -- niet verwijderd", {
+          reason: received.reason,
+        });
+        summary.errors++;
+        continue;
+      }
+
+      const msg = received.message;
+
+      // 1. Idempotentie-sleutel uit de ENVELOPE (D-10: ook bij malformed body).
+      //    Door de Zod-validatie in receiveErrorMessage is MessageId gegarandeerd
+      //    non-empty -- deze guard blijft als defense-in-depth.
       const messageId = msg.brokerProperties.MessageId;
       if (!messageId) {
         console.error("Error-queue message zonder MessageId -- niet verwijderd (un-keyable)", {
@@ -359,6 +465,14 @@ export async function checkErrorQueue(
               summary.errors++;
               // NIET completen -- update moet alsnog slagen in een volgende run
               continue;
+            }
+            // Self-heal slaagde (of was niet nodig): tel matched, consistent met
+            // het hoofdpad. `skipped` blijft staan (archief bestond al), maar het
+            // matched-signaal mag niet verloren gaan (claude Nit, PR#5). Een
+            // terminale order (verified/dead_letter/skipped) is NIET door ons
+            // gerejecteerd -> niet als matched tellen.
+            if (outcome === "updated" || outcome === "already") {
+              summary.matched++;
             }
           }
         }
@@ -435,13 +549,26 @@ export async function checkErrorQueue(
           continue;
         }
 
-        summary.matched++;
-        console.log("Error-queue message processed (matched)", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-          externalId,
-          orderId: matchedOrder.id,
-        });
+        if (outcome === "terminal") {
+          // Order zit al in een andere terminale status (verified/dead_letter/
+          // skipped). Niet overschreven, maar wel gearchiveerd voor traceability;
+          // tel als unmatched (geen bc_rejected-transitie door ons). Completen mag.
+          summary.unmatched++;
+          console.warn("Error-queue message archived but order already settled (terminal)", {
+            messageId,
+            sequenceNumber: msg.brokerProperties.SequenceNumber,
+            externalId,
+            orderId: matchedOrder.id,
+          });
+        } else {
+          summary.matched++;
+          console.log("Error-queue message processed (matched)", {
+            messageId,
+            sequenceNumber: msg.brokerProperties.SequenceNumber,
+            externalId,
+            orderId: matchedOrder.id,
+          });
+        }
       } else {
         // D-03: geen match of niet goed-gevormd -> gearchiveerd zonder match
         summary.unmatched++;
