@@ -66,16 +66,19 @@ Receive-semantiek: POST `/messages/head` = peek-lock (niet-destructief, lock ~30
 géén DELETE doen — dan blijven berichten staan. Voor definitieve verwerking/replay pas DELETE
 (complete) ná succesvolle opslag, net als de DLQ-checker.
 
-## 4. Blokkade: credentials op bratra-error
+## 4. Credentials — GEEN blokkade (empirisch bevestigd 23-06)
 
-De huidige SAS-key `producer-send` is scoped op de queue `bratra-inbound`. Een queue-level SAS-key
-geeft **geen** toegang tot een andere queue. Om `bratra-error` te lezen hebben we nodig:
+Aanvankelijke aanname was dat we een aparte Listen-key nodig hadden, omdat de Postman-key
+`producer-send` queue-scoped Send is. **Die aanname was onjuist.** De key in `.env.local` is
+`BratraDev` en heeft Listen-rechten (vermoedelijk namespace-breed).
 
-- een **Listen-rechten SAS-key op `bratra-error`** (of een namespace-level Listen-key).
+Empirische test (`./scripts/bc-sync-test.sh error-queue`, 23-06) slaagde zonder 401: we lazen
+`bratra-error` direct uit. Er stond op dat moment 1 bericht in de queue — Leo's eigen
+currency-overflow test (`OVERFLOW-CUR-0001`, `stage: BcBufferWrite`, HTTP 400, `retryable: false`),
+contract exact zoals gedocumenteerd in §2.
 
-**Actie richting ERP Company (Leo/Wesley):** lever een Listen-key voor `bratra-error` aan
-(key-naam + waarde), of bevestig dat `producer-send` namespace-breed is. Dit is de enige harde
-blokkade; de rest is gebouwd.
+**Conclusie:** geen actie richting ERP Company nodig voor toegang. De `SB_ERROR_KEY_*`-vars uit §5
+blijven optioneel (fallback op de bestaande key volstaat).
 
 ## 5. Wat in dit onderzoek is gebouwd (op de branch)
 
@@ -98,11 +101,11 @@ SB_ERROR_KEY_NAME=<listen-key-naam van ERP Company>
 SB_ERROR_KEY_VALUE=<listen-key-waarde>
 ```
 
-Typecheck: `npm run build:check` groen. **Live nog niet gedraaid** — wacht op de Listen-key (§4).
+Typecheck: `npm run build:check` groen. **Live gedraaid 23-06** — peek werkt, zie §4.
 
-## 6. Volgende stappen (na ontvangst key)
+## 6. Volgende stappen
 
-1. `./scripts/bc-sync-test.sh error-queue` — bevestig toegang en zie of er berichten staan.
+1. ~~Toegang bevestigen~~ — gedaan (§4): `./scripts/bc-sync-test.sh error-queue` leest de queue.
 2. Reproduceer punt 2 gericht: stuur een bewust foute order (bv. `happy` met te lange currency)
    en verifieer dat hij in `bratra-error` belandt met `retryable: false`.
 3. **Productie-integratie (apart, ná validatie contract + key):** verifier laten lezen van
@@ -115,8 +118,9 @@ Typecheck: `npm run build:check` groen. **Live nog niet gedraaid** — wacht op 
 
 ## 7. Open vragen aan ERP Company
 
-1. Listen-key op `bratra-error` (zie §4) — graag aanleveren.
-2. Is het berichtcontract (§2) stabiel? Met name veldnamen in `error` en `order` (één order per bericht).
-3. Worden `retryable: true`-berichten ook door jullie automatisch opnieuw aangeboden, of verwachten
+(Toegang is geregeld — §4. Resteren inhoudelijke vragen:)
+
+1. Is het berichtcontract (§2) stabiel? Met name veldnamen in `error` en `order` (één order per bericht).
+2. Worden `retryable: true`-berichten ook door jullie automatisch opnieuw aangeboden, of verwachten
    jullie dat wij replayen vanaf `bratra-error`?
-4. Bevestiging dat de 4/11 juni verdwenen orders (vóór 15 juni) inderdaad niet in `bratra-error` staan.
+3. Bevestiging dat de 4/11 juni verdwenen orders (vóór 15 juni) inderdaad niet in `bratra-error` staan.
