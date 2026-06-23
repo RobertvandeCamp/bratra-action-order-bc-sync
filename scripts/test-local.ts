@@ -42,6 +42,8 @@ Modes:
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
   dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
+  error-queue  Peek de bratra-error queue: BC-afgekeurde orders + foutsectie
+            (stage/httpStatus/retryable/message). Read-only, verwijdert niets.
 
 Examples:
   npm run test:local -- status
@@ -76,7 +78,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -84,6 +86,12 @@ async function main(): Promise<void> {
   // DLQ mode: geen sandbox guard nodig (leest geen BC data)
   if (mode === "dlq") {
     await dlqPeek();
+    return;
+  }
+
+  // Error-queue mode: read-only peek op bratra-error (geen sandbox guard)
+  if (mode === "error-queue") {
+    await errorQueuePeek();
     return;
   }
 
@@ -669,6 +677,93 @@ async function dlqPeek(): Promise<void> {
 
   console.log(`DLQ diepte: minimaal ${count} berichten`);
   if (count === 0) console.log("DLQ is leeg.");
+  console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
+}
+
+/**
+ * Read-only peek op de bratra-error queue (Leo, 15-06-2026).
+ *
+ * Anders dan de DLQ:
+ *  - gewone queue (geen $DeadLetterQueue-subqueue);
+ *  - foutinformatie zit in de BODY (error-sectie), niet in response-headers;
+ *  - SAS-token scoped op de error-queue. Gebruikt SB_ERROR_KEY_* indien gezet,
+ *    valt anders terug op SB_KEY_* (om empirisch te testen of de inbound-key
+ *    al toegang heeft -- verwachting: niet, dan komt hier een 401).
+ *
+ * Peek-lock zonder DELETE: berichten blijven in de queue (lock ~30s).
+ */
+async function errorQueuePeek(): Promise<void> {
+  const { getConfig } = await import("../src/shared/config");
+  const { generateSasToken } = await import("../src/shared/service-bus-client");
+  const config = getConfig();
+
+  const keyName = config.SB_ERROR_KEY_NAME ?? config.SB_KEY_NAME;
+  const keyValue = config.SB_ERROR_KEY_VALUE ?? config.SB_KEY_VALUE;
+  const usingFallbackKey = !config.SB_ERROR_KEY_NAME;
+
+  console.log(`\n--- Error-queue Peek: berichten in ${config.SB_ERROR_QUEUE} ---\n`);
+  console.log(`   queue:    ${config.SB_ERROR_QUEUE}`);
+  console.log(`   SAS-key:  ${keyName}${usingFallbackKey ? " (fallback: inbound-key -- 401 = geen rechten op error-queue)" : ""}\n`);
+
+  const token = generateSasToken(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, keyName, keyValue);
+
+  let count = 0;
+  const MAX_PEEK = 20;
+
+  for (let i = 0; i < MAX_PEEK; i++) {
+    const url = `https://${config.SB_NAMESPACE}.servicebus.windows.net/${config.SB_ERROR_QUEUE}/messages/head?timeout=2`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: token },
+    });
+
+    if (response.status === 204) break;
+    if (response.status === 401) {
+      console.error("HTTP 401 -- geen Listen-rechten op de error-queue met deze SAS-key.");
+      console.error("   Vraag ERP Company om een Listen-key op bratra-error (of namespace-level),");
+      console.error("   en zet die in .env.local als SB_ERROR_KEY_NAME / SB_ERROR_KEY_VALUE.");
+      return;
+    }
+    if (response.status !== 201) {
+      console.error(`Error-queue receive failed: HTTP ${response.status}`);
+      const body = await response.text();
+      if (body) console.error(`   ${body.slice(0, 300)}`);
+      break;
+    }
+
+    count++;
+    const brokerProps = JSON.parse(response.headers.get("BrokerProperties") ?? "{}");
+    const rawBody = await response.text();
+
+    let parsed: import("../src/shared/types").ErrorQueueMessage | null = null;
+    try {
+      parsed = JSON.parse(rawBody) as import("../src/shared/types").ErrorQueueMessage;
+    } catch {
+      // body niet parseable -- toon raw preview
+    }
+
+    console.log(`Bericht ${count}:`);
+    console.log(`   MessageId:      ${brokerProps.MessageId}`);
+    console.log(`   SequenceNumber: ${brokerProps.SequenceNumber}`);
+    console.log(`   EnqueuedTime:   ${brokerProps.EnqueuedTimeUtc}`);
+    if (parsed?.error) {
+      console.log(`   poNumber:       ${parsed.order?.poNumber ?? "-"}`);
+      console.log(`   correlationId:  ${parsed.meta?.correlationId ?? "-"}`);
+      console.log(`   stage:          ${parsed.error.stage}`);
+      console.log(`   httpStatus:     ${parsed.error.httpStatus ?? "-"}`);
+      console.log(`   retryable:      ${parsed.error.retryable}`);
+      console.log(`   failedAtUtc:    ${parsed.error.failedAtUtc ?? "-"}`);
+      console.log(`   message:        ${parsed.error.message}`);
+    } else {
+      console.log(`   Body preview:   ${rawBody.slice(0, 200)}`);
+    }
+    console.log();
+
+    // Peek-only: geen DELETE -- bericht blijft in de queue (lock ~30s)
+  }
+
+  console.log(`Error-queue diepte: minimaal ${count} berichten`);
+  if (count === 0) console.log("Error-queue is leeg (of geen toegang -- zie meldingen hierboven).");
   console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
 }
 

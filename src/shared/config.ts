@@ -17,6 +17,13 @@ const configSchema = z.object({
   SB_QUEUE: z.string().min(1),
   SB_KEY_NAME: z.string().min(1),
   SB_KEY_VALUE: z.string().min(1),
+  // Error queue (Leo, 15-06-2026): BC-afgekeurde orders belanden hier verrijkt
+  // met een error-sectie. Aparte queue -- geen $DeadLetterQueue-subqueue.
+  // SB_ERROR_QUEUE default "bratra-error". De Listen-key kan afwijken van de
+  // inbound-key; valt terug op SB_KEY_NAME/VALUE als niet apart gezet.
+  SB_ERROR_QUEUE: z.string().min(1).default("bratra-error"),
+  SB_ERROR_KEY_NAME: z.string().min(1).optional(),
+  SB_ERROR_KEY_VALUE: z.string().min(1).optional(),
   BC_TENANT_ID: z.string().uuid(),
   BC_CLIENT_ID: z.string().uuid(),
   BC_CLIENT_SECRET: z.string().min(1),

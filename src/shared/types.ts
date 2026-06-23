@@ -373,3 +373,41 @@ export interface SqsTriggerMessage {
   /** ISO timestamp of when the import completed (optional, for logging) */
   timestamp?: string;
 }
+
+// ============================================================================
+// Error queue types (Leo, 15-06-2026) -- bratra-error
+// ============================================================================
+
+/**
+ * Foutsectie die ERP Company aan het bericht toevoegt voordat het naar de
+ * `bratra-error` queue gaat. Contract afgeleid uit Leo's voorbeeldbericht
+ * (docs/BC sync error queue.md). Verifieer tegen echte berichten.
+ */
+export interface ErrorQueueErrorSection {
+  /** Waar het misging, bv. "BcBufferWrite" of "FunctionError" */
+  stage: string;
+  /** BC HTTP-status (bv. 400, 422, 5xx) */
+  httpStatus?: number;
+  /** Foutmelding van Business Central */
+  message: string;
+  /** Aantal pogingen voor het naar de error queue ging */
+  attempts?: number;
+  /** true = transient, veilig te replayen; false = permanente data/validatiefout */
+  retryable: boolean;
+  /** ISO-timestamp van de definitieve fout */
+  failedAtUtc?: string;
+  /** Correlatie-ID voor App Insights-tracing */
+  correlationId?: string;
+}
+
+/**
+ * Berichtstructuur op de `bratra-error` queue: oorspronkelijke meta + de
+ * afgekeurde order + de toegevoegde error-sectie. Let op: anders dan de DLQ
+ * zit de foutinformatie in de BODY, niet in response-headers. Eén order per
+ * bericht (`order`, niet `payload.orders[]`).
+ */
+export interface ErrorQueueMessage {
+  meta: ActionOrderBatchV1Envelope["meta"];
+  order: EnvelopeOrder;
+  error: ErrorQueueErrorSection;
+}
