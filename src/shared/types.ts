@@ -78,7 +78,10 @@ export type SyncStatus =
   | "verified"
   | "failed"
   | "dead_letter"
-  | "skipped";
+  | "skipped"
+  // Terminal BC-content-rejection status (order verworpen door BC op inhoud),
+  // onderscheiden van `dead_letter` (transport/not-found).
+  | "bc_rejected";
 
 // ============================================================================
 // bc_sync_orders database types (copied from bratra-data-warehouse)
@@ -410,4 +413,62 @@ export interface ErrorQueueMessage {
   meta: ActionOrderBatchV1Envelope["meta"];
   order: EnvelopeOrder;
   error: ErrorQueueErrorSection;
+}
+
+/**
+ * Samenvatting van error-queue-verwerking per verifier run. Gemodelleerd naar
+ * `DlqSummary`, met per-run tellers voor de `bratra-error` queue.
+ */
+export interface ErrorQueueSummary {
+  /** Aantal berichten succesvol weggeschreven naar bc_sync_error_messages */
+  archived: number;
+  /** Aantal gearchiveerd EN gematcht (bc_sync_orders gevonden, op bc_rejected gezet) */
+  matched: number;
+  /** Aantal gearchiveerd zonder match (matched_sync_order_id NULL) */
+  unmatched: number;
+  /** Aantal idempotent overgeslagen (message_id al gearchiveerd) */
+  skipped: number;
+  /** Aantal berichten voltooid/verwijderd uit de queue */
+  deleted: number;
+  /** Aantal verwerkingsfouten */
+  errors: number;
+}
+
+/**
+ * Insert-vorm voor `action_orders.bc_sync_error_messages`. Velden spiegelen de
+ * kolommen uit migratie 20260623151847 een-op-een. `id` en `created_at` zijn
+ * DB-defaulted en daarom weggelaten; `message_id` is verplicht (UNIQUE,
+ * idempotentie-sleutel). `message_body` en `broker_properties` zijn JSONB.
+ */
+export interface BcSyncErrorMessageInsert {
+  /** Service Bus BrokerProperties.MessageId -- verplicht, idempotentie-sleutel */
+  message_id: string;
+  /** Ons dispatch-id (uuid) uit de meta-sectie */
+  meta_message_id?: string | null;
+  /** Purchase order nummer uit de payload */
+  po_number?: string | null;
+  /** Externe order-identifier */
+  external_id?: string | null;
+  /** Service Bus BrokerProperties.SequenceNumber */
+  sequence_number?: number | null;
+  /** Fase in het sync-proces waar de fout optrad */
+  error_stage?: string | null;
+  /** HTTP-status van de BC-respons bij de fout */
+  error_http_status?: number | null;
+  /** Foutomschrijving zoals teruggegeven door BC */
+  error_message?: string | null;
+  /** Aantal pogingen voordat het bericht in de error-queue belandde */
+  error_attempts?: number | null;
+  /** Of de fout (volgens BC/dispatcher) herhaalbaar is */
+  error_retryable?: boolean | null;
+  /** Tijdstip (UTC) waarop de fout optrad */
+  failed_at_utc?: string | null;
+  /** Volledige originele ErrorQueueMessage als JSONB */
+  message_body?: unknown;
+  /** Volledige BrokerProperties header als JSONB */
+  broker_properties?: unknown;
+  /** FK naar bc_sync_orders -- NULL als bericht niet gematcht kon worden */
+  matched_sync_order_id?: number | null;
+  /** Tijdstip waarop het bericht is gearchiveerd */
+  received_at?: string | null;
 }
