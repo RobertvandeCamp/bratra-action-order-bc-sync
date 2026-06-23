@@ -66,10 +66,19 @@ export const handler = async (
     throw new Error(`Failed to query sent orders: ${error.message}`);
   }
 
-  // 5-7. Buffer check (only when sent orders exist)
+  // 5-7. Buffer check (only when sent orders exist AND the error-queue check
+  // succeeded this run). When the error-queue check FAILED (threw -> summary
+  // null), a BC-rejected order may still be in the 'sent' set; running the
+  // buffer check then risks aging it to 'dead_letter' (NotFound > 1h) before
+  // it can be moved to 'bc_rejected'. Defer the buffer check to the next
+  // successful cycle -- both checks will run together then.
   let bufferSummary = null;
 
-  if (!sentOrders || sentOrders.length === 0) {
+  if (errorQueueSummary === null) {
+    console.warn(
+      "Buffer check deferred: error-queue check failed this run -- skipping to avoid mislabeling bc_rejected orders as dead_letter",
+    );
+  } else if (!sentOrders || sentOrders.length === 0) {
     console.log("No sent orders to verify");
   } else {
     console.log("Sent orders to verify", { count: sentOrders.length });

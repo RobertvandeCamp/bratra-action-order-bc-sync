@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 import { getConfig } from "../shared/config";
 import { generateSasToken } from "../shared/service-bus-client";
 import type { getSupabaseClient } from "../shared/supabase-client";
@@ -115,17 +117,146 @@ function parseJsonOrNull(body: string, messageId: string): unknown {
   }
 }
 
-/** Een bericht is goed-gevormd als body als JSON parst EN error- en order-secties heeft */
-function isWellFormed(parsed: unknown): parsed is ErrorQueueMessage {
-  if (typeof parsed !== "object" || parsed === null) return false;
-  const candidate = parsed as Partial<ErrorQueueMessage>;
-  const error = candidate.error;
-  const hasError =
-    typeof error === "object" &&
-    error !== null &&
-    (typeof error.message === "string" || typeof error.stage === "string");
-  const hasOrder = typeof candidate.order === "object" && candidate.order !== null;
-  return hasError && hasOrder;
+// ============================================================================
+// Schema-validatie van de externe I/O-grens (coding-principles: Zod op elke
+// external I/O boundary). Een bericht is ALLEEN goed-gevormd als de error-sectie
+// BOTH een non-empty `stage` EN een non-empty `message` heeft -- een incomplete/
+// hernoemde error-sectie routeert naar archive-as-unmatched (D-09/D-10), nooit
+// naar een silently-incomplete matched archive. Onbekende velden worden bewust
+// genegeerd (.passthrough) zodat de volledige body bewaard blijft (D-09).
+// ============================================================================
+
+const errorQueueErrorSchema = z
+  .object({
+    stage: z.string().min(1),
+    httpStatus: z.number().optional(),
+    message: z.string().min(1),
+    attempts: z.number().optional(),
+    retryable: z.boolean().optional(),
+    failedAtUtc: z.string().optional(),
+    correlationId: z.string().optional(),
+  })
+  .passthrough();
+
+const errorQueueMessageSchema = z
+  .object({
+    meta: z.object({ messageId: z.string().optional() }).passthrough().optional(),
+    order: z.object({ poNumber: z.string().optional() }).passthrough(),
+    error: errorQueueErrorSchema,
+  })
+  .passthrough();
+
+/** Een bericht is goed-gevormd als de body het ErrorQueueMessage-schema haalt. */
+function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
+  const result = errorQueueMessageSchema.safeParse(parsed);
+  return result.success ? (result.data as unknown as ErrorQueueMessage) : null;
+}
+
+type MatchedOrder = { id: number; status: string };
+
+/** Resultaat van een match-poging: de order (of null) plus de berekende external_id. */
+interface MatchResult {
+  matchedOrder: MatchedOrder | null;
+  externalId: string | null;
+}
+
+/**
+ * Match een goed-gevormd bericht aan een bc_sync_orders-rij (D-03).
+ *
+ * Primair: `external_id` = `BRA-AC-{metaMessageId}-{poNumber}` (uniek per PO).
+ * Fallback: `message_id` = metaMessageId. Batch-dispatches DELEN een message_id,
+ * dus de fallback haalt candidates ZONDER limit op: bij meer dan een hit is de
+ * match ambigu -> behandel als UNMATCHED (geen wilde order op bc_rejected zetten).
+ */
+async function matchOrder(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  parsed: ErrorQueueMessage,
+): Promise<MatchResult> {
+  const metaMessageId = parsed.meta?.messageId ?? null;
+  const poNumber = parsed.order?.poNumber ?? null;
+
+  let externalId: string | null = null;
+  let matchedOrder: MatchedOrder | null = null;
+
+  if (metaMessageId && poNumber) {
+    externalId = `BRA-AC-${metaMessageId}-${poNumber}`;
+    const { data: byExternal } = await supabase
+      .from("bc_sync_orders")
+      .select("id, status")
+      .eq("external_id", externalId)
+      .limit(1);
+    if (byExternal && byExternal.length > 0) {
+      matchedOrder = byExternal[0] as MatchedOrder;
+    }
+  }
+
+  // Fallback: meta.messageId -> bc_sync_orders.message_id. GEEN limit(1):
+  // bij meerdere hits is de match ambigu en mag GEEN willekeurige order
+  // gemislabeld worden (cursor/claude: batch deelt een message_id).
+  if (!matchedOrder && metaMessageId) {
+    const { data: byMessageId } = await supabase
+      .from("bc_sync_orders")
+      .select("id, status")
+      .eq("message_id", metaMessageId)
+      .limit(2);
+    if (byMessageId && byMessageId.length === 1) {
+      matchedOrder = byMessageId[0] as MatchedOrder;
+    } else if (byMessageId && byMessageId.length > 1) {
+      console.warn(
+        "Error-queue fallback match ambiguous (multiple orders share message_id) -- treating as UNMATCHED",
+        { metaMessageId, candidates: byMessageId.length },
+      );
+      // matchedOrder blijft null -> archive-as-unmatched
+    }
+  }
+
+  return { matchedOrder, externalId };
+}
+
+/**
+ * Zet een gematchte order op `bc_rejected` (D-04, idempotent).
+ *
+ * Returns:
+ *  - "updated"     -- order succesvol op bc_rejected gezet (matched++)
+ *  - "already"     -- order was al bc_rejected, niets te doen (matched++)
+ *  - "failed"      -- UPDATE faalde; order NIET op bc_rejected (errors++, NIET completen)
+ *
+ * Gebruikt door zowel het hoofdpad als het idempotency-skip pad (self-heal van
+ * een eerder gefaalde update).
+ */
+async function applyRejection(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  matchedOrder: MatchedOrder,
+  errorMessage: string,
+  messageId: string,
+): Promise<"updated" | "already" | "failed"> {
+  if (matchedOrder.status === "bc_rejected") {
+    console.log("Order already bc_rejected (idempotent skip)", {
+      orderId: matchedOrder.id,
+      messageId,
+    });
+    return "already";
+  }
+
+  const { error: updateError } = await supabase
+    .from("bc_sync_orders")
+    .update({
+      status: "bc_rejected",
+      bc_error_message: errorMessage,
+      failed_at: new Date().toISOString(),
+    })
+    .eq("id", matchedOrder.id);
+
+  if (updateError) {
+    console.error("Failed to update bc_sync_orders to bc_rejected", {
+      orderId: matchedOrder.id,
+      messageId,
+      error: updateError.message,
+    });
+    return "failed";
+  }
+
+  return "updated";
 }
 
 /**
@@ -186,62 +317,66 @@ export async function checkErrorQueue(
         continue;
       }
 
-      // 2. Idempotency check (D-02)
-      const { data: existing } = await supabase
+      // 3. Parse body DEFENSIVELY (D-09, D-10): nooit crashen, nooit droppen.
+      //    Schema-validatie op de I/O-grens (Zod): incomplete error-sectie ->
+      //    archive-as-unmatched, geen silently-incomplete matched archive.
+      const parsedRaw: unknown = parseJsonOrNull(msg.body, messageId);
+      const parsed: ErrorQueueMessage | null = parseWellFormed(parsedRaw);
+      const wellFormed = parsed !== null;
+
+      // 2. Idempotency check (D-02). Captureer OOK de error: een transiente
+      //    DB-fout geeft data=null + error!=null; zonder check zou de guard
+      //    doorvallen en een duplicate INSERT (UNIQUE-violation) proberen.
+      const { data: existing, error: existingErr } = await supabase
         .from("bc_sync_error_messages")
         .select("id")
         .eq("message_id", messageId)
         .limit(1);
 
+      if (existingErr) {
+        console.error("Idempotency check failed (DB error) -- skipping message this run", {
+          messageId,
+          sequenceNumber: msg.brokerProperties.SequenceNumber,
+          error: existingErr.message,
+        });
+        summary.errors++;
+        // NIET completen -- bericht blijft in queue voor een volgende run
+        continue;
+      }
+
       if (existing && existing.length > 0) {
-        console.log("Error-queue message already archived (idempotent skip)", {
+        // Al gearchiveerd. Self-heal (D-04): re-attempt de match + bc_rejected
+        // update voor het geval een eerdere run wel archiveerde maar de update
+        // faalde. Pas completen NA een geslaagde (of niet-nodige) update.
+        summary.skipped++;
+
+        if (parsed) {
+          const { matchedOrder } = await matchOrder(supabase, parsed);
+          if (matchedOrder) {
+            const errorMessage = parsed.error?.message ?? "(no error message)";
+            const outcome = await applyRejection(supabase, matchedOrder, errorMessage, messageId);
+            if (outcome === "failed") {
+              summary.errors++;
+              // NIET completen -- update moet alsnog slagen in een volgende run
+              continue;
+            }
+          }
+        }
+
+        console.log("Error-queue message already archived (idempotent skip, re-checked match)", {
           messageId,
           sequenceNumber: msg.brokerProperties.SequenceNumber,
         });
-        summary.skipped++;
-        // Al gearchiveerd -> alsnog completen uit de queue
+        // Niets meer te updaten (of al bc_rejected / unmatched) -> completen uit de queue
         await completeErrorMessage(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, sasToken, msg);
         summary.deleted++;
         continue;
       }
 
-      // 3. Parse body DEFENSIVELY (D-09, D-10): nooit crashen, nooit droppen
-      const parsedRaw: unknown = parseJsonOrNull(msg.body, messageId);
-      const parsed: ErrorQueueMessage | null = isWellFormed(parsedRaw) ? parsedRaw : null;
-      const wellFormed = parsed !== null;
-
       // 4. Match (D-03), ALLEEN als goed-gevormd
-      let matchedOrder: { id: number; status: string } | null = null;
-      let externalId: string | null = null;
-
-      if (parsed) {
-        const metaMessageId = parsed.meta?.messageId ?? null;
-        const poNumber = parsed.order?.poNumber ?? null;
-
-        if (metaMessageId && poNumber) {
-          externalId = `BRA-AC-${metaMessageId}-${poNumber}`;
-          const { data: byExternal } = await supabase
-            .from("bc_sync_orders")
-            .select("id, status")
-            .eq("external_id", externalId)
-            .limit(1);
-          if (byExternal && byExternal.length > 0) {
-            matchedOrder = byExternal[0] as { id: number; status: string };
-          }
-        }
-
-        // Fallback: meta.messageId -> bc_sync_orders.message_id
-        if (!matchedOrder && metaMessageId) {
-          const { data: byMessageId } = await supabase
-            .from("bc_sync_orders")
-            .select("id, status")
-            .eq("message_id", metaMessageId)
-            .limit(1);
-          if (byMessageId && byMessageId.length > 0) {
-            matchedOrder = byMessageId[0] as { id: number; status: string };
-          }
-        }
-      }
+      const { matchedOrder, externalId } = parsed
+        ? await matchOrder(supabase, parsed)
+        : { matchedOrder: null, externalId: null };
 
       // 5. Bouw de archief-rij. Body altijd volledig bewaren: parsed object bij
       // goed-gevormd, anders de raw string (D-09: niets verliezen).
@@ -280,31 +415,24 @@ export async function checkErrorQueue(
       }
       summary.archived++;
 
-      // 7. Bij match: order op bc_rejected zetten (D-04, idempotent skip)
+      // 7. Bij match: order op bc_rejected zetten (D-04, idempotent skip).
+      //    Als de UPDATE faalt: errors++, NIET completen (bericht blijft in de
+      //    queue zodat een volgende run de update opnieuw probeert -- via het
+      //    self-heal pad in de idempotency-skip). matched++ is CONDITIONEEL op
+      //    een geslaagde (of niet-nodige) update.
       if (matchedOrder) {
-        if (matchedOrder.status !== "bc_rejected") {
-          const { error: updateError } = await supabase
-            .from("bc_sync_orders")
-            .update({
-              status: "bc_rejected",
-              bc_error_message: error?.message ?? "(no error message)",
-              failed_at: new Date().toISOString(),
-            })
-            .eq("id", matchedOrder.id);
+        const outcome = await applyRejection(
+          supabase,
+          matchedOrder,
+          error?.message ?? "(no error message)",
+          messageId,
+        );
 
-          if (updateError) {
-            console.error("Failed to update bc_sync_orders to bc_rejected", {
-              orderId: matchedOrder.id,
-              messageId,
-              error: updateError.message,
-            });
-            // Insert is al gelukt -- doorgaan met completen
-          }
-        } else {
-          console.log("Order already bc_rejected (idempotent skip)", {
-            orderId: matchedOrder.id,
-            messageId,
-          });
+        if (outcome === "failed") {
+          summary.errors++;
+          // Insert is al gelukt, maar de order staat NOG NIET op bc_rejected.
+          // NIET completen -- self-heal in de skip-path probeert het opnieuw.
+          continue;
         }
 
         summary.matched++;
