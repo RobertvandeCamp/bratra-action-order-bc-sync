@@ -5,7 +5,8 @@ import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { checkBufferStatuses } from "./bc-buffer-checker";
 import { checkDlqMessages } from "./dlq-checker";
-import type { BCConfig, DlqSummary } from "../shared/types";
+import { checkErrorQueue } from "./error-queue-checker";
+import type { BCConfig, DlqSummary, ErrorQueueSummary } from "../shared/types";
 
 /** Non-food company (consistent with dispatcher) */
 const COMPANY_ID = 2;
@@ -41,7 +42,17 @@ export const handler = async (
     );
   }
 
-  // 4. D-03: Query sent orders older than 2 minutes
+  // 4. Error-queue check FIRST (non-fatal, D-05/ERR-03). Runs BEFORE the sent-orders
+  // query so a BC-rejected order is moved to 'bc_rejected' and leaves the 'sent' set
+  // before the buffer-check's "NotFound > 1h -> dead_letter" path can mislabel it.
+  let errorQueueSummary: ErrorQueueSummary | null = null;
+  try {
+    errorQueueSummary = await checkErrorQueue(supabase);
+  } catch (err) {
+    console.error("Error-queue check failed (non-fatal)", { error: (err as Error).message });
+  }
+
+  // 5. D-03: Query sent orders older than 2 minutes
   const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
 
   const { data: sentOrders, error } = await supabase
@@ -87,6 +98,7 @@ export const handler = async (
 
   // 9. Log gecombineerde summary (D-10)
   console.log("Verification complete", {
+    errorQueue: errorQueueSummary ?? "skipped (error)",
     buffer: bufferSummary ?? "no sent orders",
     dlq: dlqSummary ?? "skipped (error)",
   });

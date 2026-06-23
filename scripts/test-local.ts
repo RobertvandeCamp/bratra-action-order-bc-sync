@@ -44,6 +44,10 @@ Modes:
   dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
   error-queue  Peek de bratra-error queue: BC-afgekeurde orders + foutsectie
             (stage/httpStatus/retryable/message). Read-only, verwijdert niets.
+  error-queue-process  Draai checkErrorQueue tegen de sandbox-queue: archiveert in
+            bc_sync_error_messages, zet gematchte orders op bc_rejected en print de
+            geschreven rijen + summary. WAARSCHUWING: consumeert/verwijdert berichten
+            (anders dan de read-only error-queue peek).
 
 Examples:
   npm run test:local -- status
@@ -78,7 +82,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue", "error-queue-process"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -92,6 +96,13 @@ async function main(): Promise<void> {
   // Error-queue mode: read-only peek op bratra-error (geen sandbox guard)
   if (mode === "error-queue") {
     await errorQueuePeek();
+    return;
+  }
+
+  // Error-queue-process mode: draai checkErrorQueue (consumeert/verwijdert berichten,
+  // geen sandbox guard -- raakt queue + DB, niet de BC API).
+  if (mode === "error-queue-process") {
+    await errorQueueProcess();
     return;
   }
 
@@ -765,6 +776,69 @@ async function errorQueuePeek(): Promise<void> {
   console.log(`Error-queue diepte: minimaal ${count} berichten`);
   if (count === 0) console.log("Error-queue is leeg (of geen toegang -- zie meldingen hierboven).");
   console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
+}
+
+/**
+ * Processing-mode tegen de bratra-error queue (D-07).
+ *
+ * Anders dan errorQueuePeek() (read-only): dit draait de echte checkErrorQueue,
+ * die berichten archiveert in bc_sync_error_messages, gematchte orders op
+ * 'bc_rejected' zet en de berichten daarna VERWIJDERT uit de queue.
+ *
+ * Print de meest recente geschreven archief-rijen + de ErrorQueueSummary, zodat
+ * een sandbox-run end-to-end te verifieren is. Geen sandbox guard: raakt de queue
+ * + DB, niet de BC API (mirror dlq/error-queue).
+ */
+async function errorQueueProcess(): Promise<void> {
+  const { getConfig } = await import("../src/shared/config");
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const { checkErrorQueue } = await import("../src/verifier/error-queue-checker");
+  const config = getConfig();
+  const supabase = getSupabaseClient();
+
+  console.log(`\n--- Error-queue PROCESS: checkErrorQueue tegen ${config.SB_ERROR_QUEUE} ---\n`);
+  console.log("   WAARSCHUWING: deze mode CONSUMEERT/VERWIJDERT berichten uit de queue");
+  console.log("   (archiveert ze eerst in bc_sync_error_messages). Anders dan de read-only");
+  console.log("   'error-queue' peek. Draai alleen tegen de sandbox.\n");
+
+  const summary = await checkErrorQueue(supabase);
+
+  // Meest recente geschreven archief-rijen tonen
+  console.log("\n--- Geschreven bc_sync_error_messages (laatste 10) ---\n");
+  const { data: rows, error } = await supabase
+    .from("bc_sync_error_messages")
+    .select(
+      "message_id, po_number, external_id, error_stage, error_message, error_retryable, matched_sync_order_id, received_at",
+    )
+    .order("received_at", { ascending: false })
+    .limit(10);
+
+  if (error) {
+    console.error(`   Kon archief-rijen niet ophalen: ${error.message}`);
+  } else if (!rows || rows.length === 0) {
+    console.log("   Geen rijen in bc_sync_error_messages.");
+  } else {
+    for (const row of rows) {
+      console.log(`messageId:        ${row.message_id}`);
+      console.log(`   poNumber:        ${row.po_number ?? "-"}`);
+      console.log(`   externalId:      ${row.external_id ?? "-"}`);
+      console.log(`   stage:           ${row.error_stage ?? "-"}`);
+      console.log(`   retryable:       ${row.error_retryable ?? "-"}`);
+      console.log(`   matchedOrderId:  ${row.matched_sync_order_id ?? "-"}`);
+      console.log(`   receivedAt:      ${row.received_at ?? "-"}`);
+      console.log(`   message:         ${row.error_message ?? "-"}`);
+      console.log();
+    }
+  }
+
+  console.log("--- ErrorQueueSummary ---");
+  console.log(`   archived:  ${summary.archived}`);
+  console.log(`   matched:   ${summary.matched}`);
+  console.log(`   unmatched: ${summary.unmatched}`);
+  console.log(`   skipped:   ${summary.skipped}`);
+  console.log(`   deleted:   ${summary.deleted}`);
+  console.log(`   errors:    ${summary.errors}`);
+  console.log();
 }
 
 function sleep(ms: number): Promise<void> {

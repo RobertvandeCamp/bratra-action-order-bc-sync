@@ -42,11 +42,15 @@ export async function fetchUnsyncedOrders(
   // - failed records (retry-eligible ones are re-fetched in step 3 via fetchFailedSyncRecords)
   // - dead_letter records (permanently failed)
   // - skipped records
+  // - bc_rejected records (BC content-rejection, terminal -- permanently excluded from
+  //   re-dispatch, like dead_letter/skipped). REQUIRED here because the phase-183 unique
+  //   partial index excludes bc_rejected from its uniqueness scope, so a new pending row
+  //   for the same order_id would NOT conflict -- the fetcher must anti-join it out (ERR-04).
   const { data: syncedOrders, error: syncError } = await supabase
     .from("bc_sync_orders")
     .select("order_id")
     .eq("company_id", companyId)
-    .in("status", ["pending", "sent", "verified", "failed", "dead_letter", "skipped"]);
+    .in("status", ["pending", "sent", "verified", "failed", "dead_letter", "skipped", "bc_rejected"]);
 
   if (syncError) {
     throw new Error(
