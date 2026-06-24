@@ -10,6 +10,14 @@ import {
 import { sendToServiceBus } from "../shared/service-bus-client";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
+import {
+  buildDispatchedEvent,
+  buildSentEvent,
+  buildSentFallbackEvent,
+  buildSendFailedEvent,
+  buildRedispatchedEvent,
+  type DispatchContext,
+} from "./event-builders";
 import type {
   BcSyncEventInsert,
   BcSyncOrderInsert,
@@ -208,19 +216,17 @@ export const handler = async (
               company_id: order.company_id,
             });
             // `dispatched`-event: null -> pending (per geslaagde insert).
-            dispatchedEvents.push({
-              sync_order_id: syncOrderId,
-              order_id: order.id,
-              company_id: order.company_id,
-              event_type: "dispatched",
-              from_status: null,
-              to_status: "pending",
-              retry_count: 0,
-              message_id: messageId,
-              correlation_id: correlationId,
-              batch_id: batchId,
-              detail: { po_number: order.po_number, batch_id: batchId, message_id: messageId },
-            });
+            dispatchedEvents.push(
+              buildDispatchedEvent(
+                {
+                  sync_order_id: syncOrderId,
+                  order_id: order.id,
+                  company_id: order.company_id,
+                  po_number: order.po_number,
+                },
+                { batchId, messageId, correlationId },
+              ),
+            );
           }
         }
 
@@ -270,38 +276,22 @@ export const handler = async (
             batchId, error: updateError.message,
           });
           // D-06 edge: `.select()` gaf niets -> val terug op de in-memory map.
+          const ctx: DispatchContext = { batchId, messageId, correlationId };
           const fallbackEvents: BcSyncEventInsert[] = [];
           for (const o of claimedOrders) {
             const ident = dispatchedIdByOrderId.get(o.id);
             if (!ident) continue;
-            fallbackEvents.push({
-              sync_order_id: ident.sync_order_id,
-              order_id: o.id,
-              company_id: o.company_id,
-              event_type: "sent",
-              from_status: "pending",
-              to_status: "sent",
-              message_id: messageId,
-              correlation_id: correlationId,
-              batch_id: batchId,
-              detail: { po_number: o.po_number, batch_id: batchId, message_id: messageId, db_update_failed: true },
-            });
+            fallbackEvents.push(
+              buildSentFallbackEvent(
+                { sync_order_id: ident.sync_order_id, order_id: o.id, company_id: o.company_id, po_number: o.po_number },
+                ctx,
+              ),
+            );
           }
           await logSyncEvent(supabase, fallbackEvents);
         } else {
-          const sentEvents: BcSyncEventInsert[] = (sentRows ?? []).map((r) => ({
-            sync_order_id: r.id,
-            order_id: r.order_id,
-            company_id: r.company_id,
-            retry_count: r.retry_count,
-            event_type: "sent",
-            from_status: "pending",
-            to_status: "sent",
-            message_id: messageId,
-            correlation_id: correlationId,
-            batch_id: batchId,
-            detail: { po_number: r.po_number, batch_id: batchId, message_id: messageId },
-          }));
+          const ctx: DispatchContext = { batchId, messageId, correlationId };
+          const sentEvents = (sentRows ?? []).map((r) => buildSentEvent(r, ctx));
           await logSyncEvent(supabase, sentEvents);
         }
 
@@ -332,17 +322,9 @@ export const handler = async (
             error: failUpdateError.message,
           });
         } else {
-          const sendFailedEvents: BcSyncEventInsert[] = (failedRows ?? []).map((r) => ({
-            sync_order_id: r.id,
-            order_id: r.order_id,
-            company_id: r.company_id,
-            retry_count: r.retry_count,
-            event_type: "send_failed",
-            from_status: "pending",
-            to_status: "failed",
-            batch_id: batchId,
-            detail: { po_number: r.po_number, error_message: errorMessage, batch_id: batchId },
-          }));
+          const sendFailedEvents = (failedRows ?? []).map((r) =>
+            buildSendFailedEvent(r, batchId, errorMessage),
+          );
           await logSyncEvent(supabase, sendFailedEvents);
         }
 
@@ -443,19 +425,16 @@ export const handler = async (
 
             // `redispatched`-event: failed -> pending (per gereset order).
             await logSyncEvent(supabase, [
-              {
-                sync_order_id: syncRecord.id,
-                order_id: order.id,
-                company_id: order.company_id,
-                event_type: "redispatched",
-                from_status: "failed",
-                to_status: "pending",
-                retry_count: newRetryCount,
-                message_id: messageId,
-                correlation_id: correlationId,
-                batch_id: batchId,
-                detail: { po_number: order.po_number, batch_id: batchId, message_id: messageId },
-              },
+              buildRedispatchedEvent(
+                {
+                  sync_order_id: syncRecord.id,
+                  order_id: order.id,
+                  company_id: order.company_id,
+                  po_number: order.po_number,
+                  retry_count: newRetryCount,
+                },
+                { batchId, messageId, correlationId },
+              ),
             ]);
           }
 
@@ -504,38 +483,22 @@ export const handler = async (
               batchId, error: sentError.message,
             });
             // D-06 edge (re-dispatch): val terug op de in-memory map.
+            const ctx: DispatchContext = { batchId, messageId, correlationId };
             const fallbackEvents: BcSyncEventInsert[] = [];
             for (const o of resetOrders) {
               const ident = dispatchedIdByOrderId.get(o.id);
               if (!ident) continue;
-              fallbackEvents.push({
-                sync_order_id: ident.sync_order_id,
-                order_id: o.id,
-                company_id: o.company_id,
-                event_type: "sent",
-                from_status: "pending",
-                to_status: "sent",
-                message_id: messageId,
-                correlation_id: correlationId,
-                batch_id: batchId,
-                detail: { po_number: o.po_number, batch_id: batchId, message_id: messageId, db_update_failed: true },
-              });
+              fallbackEvents.push(
+                buildSentFallbackEvent(
+                  { sync_order_id: ident.sync_order_id, order_id: o.id, company_id: o.company_id, po_number: o.po_number },
+                  ctx,
+                ),
+              );
             }
             await logSyncEvent(supabase, fallbackEvents);
           } else {
-            const sentEvents: BcSyncEventInsert[] = (redispatchSentRows ?? []).map((r) => ({
-              sync_order_id: r.id,
-              order_id: r.order_id,
-              company_id: r.company_id,
-              retry_count: r.retry_count,
-              event_type: "sent",
-              from_status: "pending",
-              to_status: "sent",
-              message_id: messageId,
-              correlation_id: correlationId,
-              batch_id: batchId,
-              detail: { po_number: r.po_number, batch_id: batchId, message_id: messageId },
-            }));
+            const ctx: DispatchContext = { batchId, messageId, correlationId };
+            const sentEvents = (redispatchSentRows ?? []).map((r) => buildSentEvent(r, ctx));
             await logSyncEvent(supabase, sentEvents);
           }
 
@@ -567,17 +530,9 @@ export const handler = async (
               error: failError.message,
             });
           } else {
-            const sendFailedEvents: BcSyncEventInsert[] = (redispatchFailedRows ?? []).map((r) => ({
-              sync_order_id: r.id,
-              order_id: r.order_id,
-              company_id: r.company_id,
-              retry_count: r.retry_count,
-              event_type: "send_failed",
-              from_status: "pending",
-              to_status: "failed",
-              batch_id: batchId,
-              detail: { po_number: r.po_number, error_message: errorMessage, batch_id: batchId },
-            }));
+            const sendFailedEvents = (redispatchFailedRows ?? []).map((r) =>
+              buildSendFailedEvent(r, batchId, errorMessage),
+            );
             await logSyncEvent(supabase, sendFailedEvents);
           }
 
@@ -638,17 +593,9 @@ async function sendOrdersOneByOne(
           .eq("order_id", order.id)
           .select("id, order_id, company_id, po_number, retry_count");
 
-        const oversizedEvents: BcSyncEventInsert[] = (oversizedRows ?? []).map((r) => ({
-          sync_order_id: r.id,
-          order_id: r.order_id,
-          company_id: r.company_id,
-          retry_count: r.retry_count,
-          event_type: "send_failed",
-          from_status: "pending",
-          to_status: "failed",
-          batch_id: originalBatchId,
-          detail: { po_number: r.po_number, error_message: oversizedMessage, batch_id: originalBatchId },
-        }));
+        const oversizedEvents = (oversizedRows ?? []).map((r) =>
+          buildSendFailedEvent(r, originalBatchId, oversizedMessage),
+        );
         await logSyncEvent(supabase, oversizedEvents);
 
         summary.ordersFailed++;
@@ -686,37 +633,27 @@ async function sendOrdersOneByOne(
           orderId: order.id, error: sentError.message,
         });
         // D-06 edge (single): `.select()` gaf niets -> val terug op de map.
+        const singleCtx: DispatchContext = {
+          batchId: originalBatchId,
+          messageId: singleMessageId,
+          correlationId: singleCorrelationId,
+        };
         const ident = dispatchedIdByOrderId.get(order.id);
         if (ident) {
           await logSyncEvent(supabase, [
-            {
-              sync_order_id: ident.sync_order_id,
-              order_id: order.id,
-              company_id: order.company_id,
-              event_type: "sent",
-              from_status: "pending",
-              to_status: "sent",
-              message_id: singleMessageId,
-              correlation_id: singleCorrelationId,
-              batch_id: originalBatchId,
-              detail: { po_number: order.po_number, batch_id: originalBatchId, message_id: singleMessageId, db_update_failed: true },
-            },
+            buildSentFallbackEvent(
+              { sync_order_id: ident.sync_order_id, order_id: order.id, company_id: order.company_id, po_number: order.po_number },
+              singleCtx,
+            ),
           ]);
         }
       } else {
-        const sentEvents: BcSyncEventInsert[] = (singleSentRows ?? []).map((r) => ({
-          sync_order_id: r.id,
-          order_id: r.order_id,
-          company_id: r.company_id,
-          retry_count: r.retry_count,
-          event_type: "sent",
-          from_status: "pending",
-          to_status: "sent",
-          message_id: singleMessageId,
-          correlation_id: singleCorrelationId,
-          batch_id: originalBatchId,
-          detail: { po_number: r.po_number, batch_id: originalBatchId, message_id: singleMessageId },
-        }));
+        const singleCtx: DispatchContext = {
+          batchId: originalBatchId,
+          messageId: singleMessageId,
+          correlationId: singleCorrelationId,
+        };
+        const sentEvents = (singleSentRows ?? []).map((r) => buildSentEvent(r, singleCtx));
         await logSyncEvent(supabase, sentEvents);
       }
 
@@ -739,17 +676,9 @@ async function sendOrdersOneByOne(
         .eq("order_id", order.id)
         .select("id, order_id, company_id, po_number, retry_count");
 
-      const singleFailedEvents: BcSyncEventInsert[] = (singleFailedRows ?? []).map((r) => ({
-        sync_order_id: r.id,
-        order_id: r.order_id,
-        company_id: r.company_id,
-        retry_count: r.retry_count,
-        event_type: "send_failed",
-        from_status: "pending",
-        to_status: "failed",
-        batch_id: originalBatchId,
-        detail: { po_number: r.po_number, error_message: singleErrorMessage, batch_id: originalBatchId },
-      }));
+      const singleFailedEvents = (singleFailedRows ?? []).map((r) =>
+        buildSendFailedEvent(r, originalBatchId, singleErrorMessage),
+      );
       await logSyncEvent(supabase, singleFailedEvents);
 
       summary.ordersFailed++;

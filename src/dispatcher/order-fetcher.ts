@@ -1,5 +1,6 @@
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
+import { buildStaleRecoveredEvent } from "./event-builders";
 import type { WarehouseOrder, BcSyncOrderRow, BcSyncEventInsert } from "../shared/types";
 
 const ORDER_SELECT = `
@@ -160,16 +161,17 @@ export async function recoverStalePendingRecords(
         typeof r.queued_at === "string"
           ? Math.round((now - new Date(r.queued_at).getTime()) / 60000)
           : null;
-      return {
-        sync_order_id: r.id,
-        order_id: r.order_id,
-        company_id: r.company_id,
-        retry_count: r.retry_count,
-        event_type: "stale_recovered",
-        from_status: "pending",
-        to_status: "failed",
-        detail: { po_number: r.po_number, reason: staleReason, age_min: ageMin },
-      };
+      return buildStaleRecoveredEvent(
+        {
+          sync_order_id: r.id,
+          order_id: r.order_id,
+          company_id: r.company_id,
+          po_number: r.po_number,
+          retry_count: r.retry_count,
+        },
+        staleReason,
+        ageMin,
+      );
     });
     await logSyncEvent(supabase, events);
   }
