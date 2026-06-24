@@ -1,7 +1,24 @@
 import { getConfig } from "../shared/config";
+import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
 import type { getSupabaseClient } from "../shared/supabase-client";
-import type { DlqSummary, DlqBrokerProperties, DlqMessage } from "../shared/types";
+import type {
+  BcSyncEventInsert,
+  BcSyncEventStatus,
+  DlqSummary,
+  DlqBrokerProperties,
+  DlqMessage,
+} from "../shared/types";
+
+/** Vorm van de verbrede DLQ-match-select-rij (RISK-2). */
+interface DlqMatchedOrder {
+  id: number;
+  order_id: number;
+  company_id: number;
+  po_number: string;
+  retry_count: number;
+  status: string;
+}
 
 // ============================================================================
 // DLQ Checker -- Service Bus Dead Letter Queue monitoring
@@ -142,14 +159,18 @@ export async function checkDlqMessages(
         continue;
       }
 
-      // 2. Match check (D-11): zoek bc_sync_orders op message_id
+      // 2. Match check (D-11): zoek bc_sync_orders op message_id. Select verbreed
+      // (RISK-2) zodat een complete dead_lettered-event-rij gebouwd kan worden.
       const { data: matchedOrders } = await supabase
         .from("bc_sync_orders")
-        .select("id")
+        .select("id, order_id, company_id, po_number, retry_count, status")
         .eq("message_id", messageId)
         .limit(1);
 
-      const matchedOrder = matchedOrders && matchedOrders.length > 0 ? matchedOrders[0] : null;
+      const matchedOrder: DlqMatchedOrder | null =
+        matchedOrders && matchedOrders.length > 0
+          ? (matchedOrders[0] as DlqMatchedOrder)
+          : null;
 
       // 3. Parse envelope body als JSON (T-152.1-05: wrapped in try/catch)
       let envelopeBody: unknown = null;
@@ -202,6 +223,25 @@ export async function checkDlqMessages(
             error: updateError.message,
           });
           // Insert succeeded, continue met complete
+        } else {
+          // dead_lettered-event ALLEEN bij een geslaagde matched-update (de
+          // transitie naar dead_letter vond plaats). event_type "dead_lettered"
+          // (dubbel-t) -> status "dead_letter" (enkel-t), nooit verwisseld.
+          const event: BcSyncEventInsert = {
+            sync_order_id: matchedOrder.id,
+            order_id: matchedOrder.order_id,
+            company_id: matchedOrder.company_id,
+            event_type: "dead_lettered",
+            from_status: (matchedOrder.status as BcSyncEventStatus) ?? "sent",
+            to_status: "dead_letter",
+            retry_count: matchedOrder.retry_count,
+            detail: {
+              po_number: matchedOrder.po_number,
+              dead_letter_reason: msg.deadLetterReason,
+              dead_letter_error_description: msg.deadLetterErrorDescription,
+            },
+          };
+          await logSyncEvent(supabase, [event]);
         }
 
         summary.matched++;
