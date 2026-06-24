@@ -1,5 +1,6 @@
 import { getSupabaseClient } from "../shared/supabase-client";
-import type { WarehouseOrder, BcSyncOrderRow } from "../shared/types";
+import { logSyncEvent } from "../shared/event-logger";
+import type { WarehouseOrder, BcSyncOrderRow, BcSyncEventInsert } from "../shared/types";
 
 const ORDER_SELECT = `
   id, po_number, company_id, carrier_code, carrier,
@@ -130,17 +131,18 @@ export async function recoverStalePendingRecords(
   const supabase = getSupabaseClient();
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
+  const staleReason = "Recovered from stale pending (Lambda crash/timeout)";
   const { data: staleRows, error } = await supabase
     .from("bc_sync_orders")
     .update({
       status: "failed",
-      error_message: "Recovered from stale pending (Lambda crash/timeout)",
+      error_message: staleReason,
       failed_at: new Date().toISOString(),
     })
     .eq("company_id", companyId)
     .eq("status", "pending")
     .lt("queued_at", fiveMinutesAgo)
-    .select("id");
+    .select("id, order_id, company_id, retry_count, po_number, queued_at");
 
   if (error) {
     console.error("Failed to recover stale pending records", { error: error.message });
@@ -150,6 +152,26 @@ export async function recoverStalePendingRecords(
   const count = staleRows?.length ?? 0;
   if (count > 0) {
     console.warn("Recovered stale pending records", { count, companyId });
+
+    // `stale_recovered`-event: pending -> failed (per gerecoverde order).
+    const now = Date.now();
+    const events: BcSyncEventInsert[] = staleRows.map((r) => {
+      const ageMin =
+        typeof r.queued_at === "string"
+          ? Math.round((now - new Date(r.queued_at).getTime()) / 60000)
+          : null;
+      return {
+        sync_order_id: r.id,
+        order_id: r.order_id,
+        company_id: r.company_id,
+        retry_count: r.retry_count,
+        event_type: "stale_recovered",
+        from_status: "pending",
+        to_status: "failed",
+        detail: { po_number: r.po_number, reason: staleReason, age_min: ageMin },
+      };
+    });
+    await logSyncEvent(supabase, events);
   }
   return count;
 }
