@@ -48,6 +48,9 @@ Modes:
             bc_sync_error_messages, zet gematchte orders op bc_rejected en print de
             geschreven rijen + summary. WAARSCHUWING: consumeert/verwijdert berichten
             (anders dan de read-only error-queue peek).
+  events    Dump de laatste bc_sync_events-rijen uit de sandbox (read-only):
+            per rij event_type, from->to-status, order_id en detail. Bewijst dat de
+            door dispatcher/verifier geschreven events de INSERT + RLS + CHECK passeren.
 
 Examples:
   npm run test:local -- status
@@ -82,7 +85,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue", "error-queue-process"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue", "error-queue-process", "events"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -103,6 +106,13 @@ async function main(): Promise<void> {
   // geen sandbox guard -- raakt queue + DB, niet de BC API).
   if (mode === "error-queue-process") {
     await errorQueueProcess();
+    return;
+  }
+
+  // Events mode: read-only dump van de laatste bc_sync_events-rijen (geen sandbox
+  // guard -- raakt geen BC API; bewijst dat de events de INSERT + RLS + CHECK passeren).
+  if (mode === "events") {
+    await eventsDump();
     return;
   }
 
@@ -839,6 +849,53 @@ async function errorQueueProcess(): Promise<void> {
   console.log(`   deleted:   ${summary.deleted}`);
   console.log(`   errors:    ${summary.errors}`);
   console.log();
+}
+
+/**
+ * Events dump (D-09 #2): read-only SELECT op de laatste bc_sync_events-rijen uit
+ * de sandbox-Supabase. Tweede verificatielaag naast de unit-tests: bewijst dat de
+ * door dispatcher/verifier geschreven events de echte INSERT + RLS + de
+ * event_type/from_status/to_status CHECK-constraints passeren (Pitfall 4 -- de
+ * best-effort swallow verbergt een CHECK-violation, een "0 rijen"-discrepantie
+ * maakt 'm zichtbaar). Wijzigt niets.
+ */
+async function eventsDump(): Promise<void> {
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const supabase = getSupabaseClient();
+
+  console.log("\n--- Laatste bc_sync_events (laatste 30, nieuwste eerst) ---\n");
+
+  const { data: rows, error } = await supabase
+    .from("bc_sync_events")
+    .select(
+      "id, sync_order_id, order_id, event_type, from_status, to_status, retry_count, detail, occurred_at",
+    )
+    .order("occurred_at", { ascending: false })
+    .limit(30);
+
+  if (error) {
+    console.error(`   Kon bc_sync_events niet ophalen: ${error.message}`);
+    return;
+  }
+
+  if (!rows || rows.length === 0) {
+    console.log("   Geen rijen in bc_sync_events.");
+    return;
+  }
+
+  for (const row of rows) {
+    const from = row.from_status ?? "-";
+    const to = row.to_status ?? "-";
+    console.log(`event_type:       ${row.event_type}`);
+    console.log(`   from -> to:      ${from} -> ${to}`);
+    console.log(`   orderId:         ${row.order_id ?? "-"} (sync_order_id ${row.sync_order_id ?? "-"})`);
+    console.log(`   retryCount:      ${row.retry_count ?? "-"}`);
+    console.log(`   occurredAt:      ${row.occurred_at ?? "-"}`);
+    console.log(`   detail:          ${JSON.stringify(row.detail)}`);
+    console.log();
+  }
+
+  console.log(`--- ${rows.length} rij(en) getoond ---\n`);
 }
 
 function sleep(ms: number): Promise<void> {
