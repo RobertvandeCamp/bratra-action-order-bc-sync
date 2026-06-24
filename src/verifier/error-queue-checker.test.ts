@@ -84,6 +84,51 @@ function makeUpdateFake(error: { message: string } | null = null): {
   return { client, updates };
 }
 
+/**
+ * Fake voor applyRejection INCL. de event-log-insert. `applyRejection` doet nu
+ * twee chains:
+ *   - `.from("bc_sync_orders").update(payload).eq("id", val)`  (de status-update)
+ *   - `.from("bc_sync_events").insert(events)`                 (via logSyncEvent)
+ * Deze fake routeert op tabelnaam zodat de test BOTH de update-payload én de
+ * gelogde events kan inspecteren.
+ */
+function makeRejectionFake(updateError: { message: string } | null = null): {
+  client: ReturnType<typeof getSupabaseClient>;
+  updates: Array<{ payload: Record<string, unknown>; id: unknown }>;
+  events: Array<Record<string, unknown>>;
+} {
+  const updates: Array<{ payload: Record<string, unknown>; id: unknown }> = [];
+  const events: Array<Record<string, unknown>> = [];
+
+  const client = {
+    from(table: string) {
+      if (table === "bc_sync_events") {
+        return {
+          insert(rows: Record<string, unknown>[]) {
+            events.push(...rows);
+            return Promise.resolve({ error: null });
+          },
+        };
+      }
+      // bc_sync_orders update-chain
+      let payload: Record<string, unknown> = {};
+      const builder = {
+        update(p: Record<string, unknown>) {
+          payload = p;
+          return builder;
+        },
+        eq(_column: string, value: unknown) {
+          updates.push({ payload, id: value });
+          return Promise.resolve({ error: updateError });
+        },
+      };
+      return builder;
+    },
+  } as unknown as ReturnType<typeof getSupabaseClient>;
+
+  return { client, updates, events };
+}
+
 const wellFormedBody = {
   meta: { messageId: "meta-123", correlationId: "corr-1" },
   order: { poNumber: "PO-999", orderType: "X" },
@@ -284,6 +329,79 @@ describe("applyRejection", () => {
     const outcome = await applyRejection(client, { id: 4, status: "sent" }, "err", "msg-1");
     expect(outcome).toBe("failed");
     expect(updates).toHaveLength(1); // update geprobeerd, maar faalde
+  });
+});
+
+// ============================================================================
+// applyRejection -- bc_rejected event-logging (fase 185, TRACE-01)
+// ============================================================================
+
+describe("applyRejection bc_rejected event-logging", () => {
+  const matched = {
+    id: 7,
+    status: "sent",
+    order_id: 1001,
+    company_id: 2,
+    po_number: "PO-555",
+    retry_count: 1,
+  };
+
+  it("logt EEN bc_rejected event bij outcome 'updated' met from_status uit matchedOrder.status", async () => {
+    const { client, events } = makeRejectionFake();
+    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-1");
+    expect(outcome).toBe("updated");
+    expect(events).toHaveLength(1);
+    const ev = events[0];
+    expect(ev.event_type).toBe("bc_rejected");
+    expect(ev.from_status).toBe("sent"); // overgenomen van matchedOrder.status
+    expect(ev.to_status).toBe("bc_rejected");
+    expect(ev.sync_order_id).toBe(7);
+    expect(ev.order_id).toBe(1001);
+    expect(ev.company_id).toBe(2);
+    expect((ev.detail as Record<string, unknown>).po_number).toBe("PO-555");
+    expect((ev.detail as Record<string, unknown>).bc_error_message).toBe("BC zegt nee");
+  });
+
+  it("neemt from_status 'failed' over als de order in status failed staat", async () => {
+    const { client, events } = makeRejectionFake();
+    const outcome = await applyRejection(
+      client,
+      { ...matched, status: "failed" },
+      "err",
+      "msg-2",
+    );
+    expect(outcome).toBe("updated");
+    expect(events).toHaveLength(1);
+    expect(events[0].from_status).toBe("failed");
+  });
+
+  it("logt GEEN event bij outcome 'already' (al bc_rejected)", async () => {
+    const { client, events } = makeRejectionFake();
+    const outcome = await applyRejection(
+      client,
+      { ...matched, status: "bc_rejected" },
+      "err",
+      "msg-3",
+    );
+    expect(outcome).toBe("already");
+    expect(events).toHaveLength(0);
+  });
+
+  it.each(["verified", "dead_letter", "skipped"])(
+    "logt GEEN event bij outcome 'terminal' (%s)",
+    async (status) => {
+      const { client, events } = makeRejectionFake();
+      const outcome = await applyRejection(client, { ...matched, status }, "err", "msg-4");
+      expect(outcome).toBe("terminal");
+      expect(events).toHaveLength(0);
+    },
+  );
+
+  it("logt GEEN event bij outcome 'failed' (UPDATE faalde)", async () => {
+    const { client, events } = makeRejectionFake({ message: "deadlock" });
+    const outcome = await applyRejection(client, matched, "err", "msg-5");
+    expect(outcome).toBe("failed");
+    expect(events).toHaveLength(0);
   });
 });
 

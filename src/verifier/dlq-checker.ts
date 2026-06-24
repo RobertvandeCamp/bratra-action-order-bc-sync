@@ -11,13 +11,43 @@ import type {
 } from "../shared/types";
 
 /** Vorm van de verbrede DLQ-match-select-rij (RISK-2). */
-interface DlqMatchedOrder {
+export interface DlqMatchedOrder {
   id: number;
   order_id: number;
   company_id: number;
   po_number: string;
   retry_count: number;
   status: string;
+}
+
+/**
+ * Pure builder voor het DLQ `dead_lettered`-event (fase 185, TRACE-01).
+ *
+ * KRITISCH (Pitfall 2): event_type `dead_lettered` (dubbel-t) mapt op status
+ * `dead_letter` (enkel-t). `from_status` komt uit `matchedOrder.status`; valt
+ * terug op `"sent"` (D-07) als de status ontbreekt. Puur zodat de
+ * event_type<->status-mapping en de detail-policy (D-03/D-04) deterministisch
+ * te unit-testen zijn -- de aanroep gebeurt ALLEEN binnen `if (matchedOrder)`.
+ */
+export function buildDlqDeadLetteredEvent(
+  matchedOrder: DlqMatchedOrder,
+  deadLetterReason: string,
+  deadLetterErrorDescription: string,
+): BcSyncEventInsert {
+  return {
+    sync_order_id: matchedOrder.id,
+    order_id: matchedOrder.order_id,
+    company_id: matchedOrder.company_id,
+    event_type: "dead_lettered",
+    from_status: (matchedOrder.status as BcSyncEventStatus) ?? "sent",
+    to_status: "dead_letter",
+    retry_count: matchedOrder.retry_count,
+    detail: {
+      po_number: matchedOrder.po_number,
+      dead_letter_reason: deadLetterReason,
+      dead_letter_error_description: deadLetterErrorDescription,
+    },
+  };
 }
 
 // ============================================================================
@@ -225,23 +255,15 @@ export async function checkDlqMessages(
           // Insert succeeded, continue met complete
         } else {
           // dead_lettered-event ALLEEN bij een geslaagde matched-update (de
-          // transitie naar dead_letter vond plaats). event_type "dead_lettered"
-          // (dubbel-t) -> status "dead_letter" (enkel-t), nooit verwisseld.
-          const event: BcSyncEventInsert = {
-            sync_order_id: matchedOrder.id,
-            order_id: matchedOrder.order_id,
-            company_id: matchedOrder.company_id,
-            event_type: "dead_lettered",
-            from_status: (matchedOrder.status as BcSyncEventStatus) ?? "sent",
-            to_status: "dead_letter",
-            retry_count: matchedOrder.retry_count,
-            detail: {
-              po_number: matchedOrder.po_number,
-              dead_letter_reason: msg.deadLetterReason,
-              dead_letter_error_description: msg.deadLetterErrorDescription,
-            },
-          };
-          await logSyncEvent(supabase, [event]);
+          // transitie naar dead_letter vond plaats). Geen match -> deze branch
+          // wordt niet bereikt -> geen event.
+          await logSyncEvent(supabase, [
+            buildDlqDeadLetteredEvent(
+              matchedOrder,
+              msg.deadLetterReason,
+              msg.deadLetterErrorDescription,
+            ),
+          ]);
         }
 
         summary.matched++;

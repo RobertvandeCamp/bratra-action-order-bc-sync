@@ -13,7 +13,7 @@ import type { getSupabaseClient } from "../shared/supabase-client";
  * `BcSyncOrderRow` (de hele rij zit al in `sentOrders`, geen `.select()` nodig).
  * Alle verifier-buffer-transities komen vanaf status `sent` (D-07).
  */
-function buildBufferEvent(
+export function buildBufferEvent(
   order: BcSyncOrderRow,
   event_type: BcSyncEventInsert["event_type"],
   to_status: BcSyncEventInsert["to_status"],
