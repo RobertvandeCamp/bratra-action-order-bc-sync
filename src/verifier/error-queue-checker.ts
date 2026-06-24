@@ -45,7 +45,7 @@ interface ReceivedErrorMessage {
 // bestaande missing-MessageId branch (claude Important, PR#5).
 // ============================================================================
 
-const brokerPropertiesSchema = z
+export const brokerPropertiesSchema = z
   .object({
     MessageId: z.string().min(1),
     SequenceNumber: z.number(),
@@ -195,7 +195,7 @@ const errorQueueErrorSchema = z
   })
   .passthrough();
 
-const errorQueueMessageSchema = z
+export const errorQueueMessageSchema = z
   .object({
     meta: z.object({ messageId: z.string().optional() }).passthrough().optional(),
     order: z.object({ poNumber: z.string().optional() }).passthrough(),
@@ -204,12 +204,21 @@ const errorQueueMessageSchema = z
   .passthrough();
 
 /** Een bericht is goed-gevormd als de body het ErrorQueueMessage-schema haalt. */
-function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
+export function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
   const result = errorQueueMessageSchema.safeParse(parsed);
   return result.success ? (result.data as unknown as ErrorQueueMessage) : null;
 }
 
-type MatchedOrder = { id: number; status: string };
+export type MatchedOrder = { id: number; status: string };
+
+/**
+ * Derive the canonical external_id for an order: `BRA-AC-{metaMessageId}-{poNumber}`.
+ * Pure -- enige bron van waarheid voor de external_id-vorm (gespiegeld in
+ * dispatcher + test-local). Geexporteerd zodat het exact getest kan worden.
+ */
+export function deriveExternalId(metaMessageId: string, poNumber: string): string {
+  return `BRA-AC-${metaMessageId}-${poNumber}`;
+}
 
 /**
  * Terminale statussen: een order in een van deze toestanden is al definitief
@@ -217,10 +226,10 @@ type MatchedOrder = { id: number; status: string };
  * overschreven naar bc_rejected (claude Important, PR#5). `bc_rejected` zit hier
  * ook in maar wordt apart als idempotent-skip behandeld voor een duidelijke log.
  */
-const TERMINAL_STATUSES = new Set(["verified", "dead_letter", "skipped", "bc_rejected"]);
+export const TERMINAL_STATUSES = new Set(["verified", "dead_letter", "skipped", "bc_rejected"]);
 
 /** Resultaat van een match-poging: de order (of null) plus de berekende external_id. */
-interface MatchResult {
+export interface MatchResult {
   matchedOrder: MatchedOrder | null;
   externalId: string | null;
 }
@@ -233,7 +242,7 @@ interface MatchResult {
  * dus de fallback haalt candidates ZONDER limit op: bij meer dan een hit is de
  * match ambigu -> behandel als UNMATCHED (geen wilde order op bc_rejected zetten).
  */
-async function matchOrder(
+export async function matchOrder(
   supabase: ReturnType<typeof getSupabaseClient>,
   parsed: ErrorQueueMessage,
 ): Promise<MatchResult> {
@@ -244,7 +253,7 @@ async function matchOrder(
   let matchedOrder: MatchedOrder | null = null;
 
   if (metaMessageId && poNumber) {
-    externalId = `BRA-AC-${metaMessageId}-${poNumber}`;
+    externalId = deriveExternalId(metaMessageId, poNumber);
     const { data: byExternal } = await supabase
       .from("bc_sync_orders")
       .select("id, status")
@@ -298,7 +307,7 @@ async function matchOrder(
  * Gebruikt door zowel het hoofdpad als het idempotency-skip pad (self-heal van
  * een eerder gefaalde update).
  */
-async function applyRejection(
+export async function applyRejection(
   supabase: ReturnType<typeof getSupabaseClient>,
   matchedOrder: MatchedOrder,
   errorMessage: string,
