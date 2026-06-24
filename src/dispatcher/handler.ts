@@ -9,12 +9,27 @@ import {
 } from "./envelope-mapper";
 import { sendToServiceBus } from "../shared/service-bus-client";
 import { getSupabaseClient } from "../shared/supabase-client";
+import { logSyncEvent } from "../shared/event-logger";
 import type {
+  BcSyncEventInsert,
   BcSyncOrderInsert,
   BcSyncOrderRow,
   SqsTriggerMessage,
   WarehouseOrder,
 } from "../shared/types";
+
+/**
+ * In-memory fallback voor de D-06 edge: bij de `dispatched`-INSERT-loop vangen
+ * we per order de teruggekomen `sync_order_id` (de bc_sync_orders.id). Als
+ * later de status-update naar `sent` faalt (SB is al verstuurd, `.select()`
+ * geeft niets terug), leveren deze entries de identiteit voor het `sent`-event
+ * met `detail.db_update_failed = true`. Key = order_id (action order-id).
+ */
+type DispatchedIdentity = {
+  sync_order_id: number;
+  po_number: string;
+  company_id: number;
+};
 
 /** Dispatcher accepts both SQS (event-driven) and ScheduledEvent (fallback) triggers */
 type DispatcherEvent = SQSEvent | ScheduledEvent;
@@ -102,6 +117,11 @@ export const handler = async (
 
   const supabase = getSupabaseClient();
 
+  // D-06: in-memory map order_id -> {sync_order_id, po_number, company_id},
+  // gevuld bij elke geslaagde `dispatched`-INSERT. Voedt de SB-sent-maar-DB-
+  // faalt-edges (happy-path heeft de identiteit al uit `.select()`).
+  const dispatchedIdByOrderId = new Map<number, DispatchedIdentity>();
+
   // 0. Recover orphaned 'pending' records from Lambda crash/timeout (> 5 min old)
   await recoverStalePendingRecords(companyId);
 
@@ -159,10 +179,12 @@ export const handler = async (
         );
 
         // Insert per order so unique violations only skip the duplicate, not the whole batch
+        const dispatchedEvents: BcSyncEventInsert[] = [];
         for (let i = 0; i < insertRecords.length; i++) {
-          const { error: insertError } = await supabase
+          const { data: insertedRows, error: insertError } = await supabase
             .from("bc_sync_orders")
-            .insert(insertRecords[i]);
+            .insert(insertRecords[i])
+            .select("id");
 
           if (insertError) {
             if (insertError.code === PG_UNIQUE_VIOLATION) {
@@ -173,8 +195,37 @@ export const handler = async (
             }
             throw new Error(`Failed to insert sync record: ${insertError.message}`);
           }
-          claimedOrders.push(batch.orders[i]);
+
+          const order = batch.orders[i];
+          const syncOrderId = (insertedRows ?? [])[0]?.id as number | undefined;
+          claimedOrders.push(order);
+
+          // D-06: bewaar de zojuist gecreëerde sync_order_id voor de fallback.
+          if (typeof syncOrderId === "number") {
+            dispatchedIdByOrderId.set(order.id, {
+              sync_order_id: syncOrderId,
+              po_number: order.po_number,
+              company_id: order.company_id,
+            });
+            // `dispatched`-event: null -> pending (per geslaagde insert).
+            dispatchedEvents.push({
+              sync_order_id: syncOrderId,
+              order_id: order.id,
+              company_id: order.company_id,
+              event_type: "dispatched",
+              from_status: null,
+              to_status: "pending",
+              retry_count: 0,
+              message_id: messageId,
+              correlation_id: correlationId,
+              batch_id: batchId,
+              detail: { po_number: order.po_number, batch_id: batchId, message_id: messageId },
+            });
+          }
         }
+
+        // D-01: bulk-log alle dispatched-events in 1 call ná de loop.
+        await logSyncEvent(supabase, dispatchedEvents);
 
         if (claimedOrders.length === 0) {
           console.log("All orders in batch already claimed", { batchId });
@@ -196,7 +247,7 @@ export const handler = async (
             orderCount: batch.orders.length,
           });
           // Fallback: send each order individually
-          await sendOrdersOneByOne(claimedOrders, batchId, batch.legalEntity, supabase, summary);
+          await sendOrdersOneByOne(claimedOrders, batchId, batch.legalEntity, supabase, summary, dispatchedIdByOrderId);
           summary.batchesProcessed++;
           continue;
         }
@@ -206,10 +257,11 @@ export const handler = async (
 
         // e. Update tracking records -> sent (D-13)
         const sentAt = new Date().toISOString();
-        const { error: updateError } = await supabase
+        const { data: sentRows, error: updateError } = await supabase
           .from("bc_sync_orders")
           .update({ status: "sent", sent_at: sentAt })
-          .eq("batch_id", batchId);
+          .eq("batch_id", batchId)
+          .select("id, order_id, company_id, po_number, retry_count");
 
         if (updateError) {
           // SB message already sent -- do NOT throw (would cause re-dispatch duplicates).
@@ -217,6 +269,40 @@ export const handler = async (
           console.error("SB sent but DB status update failed (orders trackable via externalId)", {
             batchId, error: updateError.message,
           });
+          // D-06 edge: `.select()` gaf niets -> val terug op de in-memory map.
+          const fallbackEvents: BcSyncEventInsert[] = [];
+          for (const o of claimedOrders) {
+            const ident = dispatchedIdByOrderId.get(o.id);
+            if (!ident) continue;
+            fallbackEvents.push({
+              sync_order_id: ident.sync_order_id,
+              order_id: o.id,
+              company_id: o.company_id,
+              event_type: "sent",
+              from_status: "pending",
+              to_status: "sent",
+              message_id: messageId,
+              correlation_id: correlationId,
+              batch_id: batchId,
+              detail: { po_number: o.po_number, batch_id: batchId, message_id: messageId, db_update_failed: true },
+            });
+          }
+          await logSyncEvent(supabase, fallbackEvents);
+        } else {
+          const sentEvents: BcSyncEventInsert[] = (sentRows ?? []).map((r) => ({
+            sync_order_id: r.id,
+            order_id: r.order_id,
+            company_id: r.company_id,
+            retry_count: r.retry_count,
+            event_type: "sent",
+            from_status: "pending",
+            to_status: "sent",
+            message_id: messageId,
+            correlation_id: correlationId,
+            batch_id: batchId,
+            detail: { po_number: r.po_number, batch_id: batchId, message_id: messageId },
+          }));
+          await logSyncEvent(supabase, sentEvents);
         }
 
         summary.ordersSent += claimedOrders.length;
@@ -230,20 +316,34 @@ export const handler = async (
           error: errorMessage,
         });
 
-        const { error: failUpdateError } = await supabase
+        const { data: failedRows, error: failUpdateError } = await supabase
           .from("bc_sync_orders")
           .update({
             status: "failed",
             error_message: errorMessage,
             failed_at: failedAt,
           })
-          .eq("batch_id", batchId);
+          .eq("batch_id", batchId)
+          .select("id, order_id, company_id, po_number, retry_count");
 
         if (failUpdateError) {
           console.error("Failed to update sync records to failed", {
             batchId,
             error: failUpdateError.message,
           });
+        } else {
+          const sendFailedEvents: BcSyncEventInsert[] = (failedRows ?? []).map((r) => ({
+            sync_order_id: r.id,
+            order_id: r.order_id,
+            company_id: r.company_id,
+            retry_count: r.retry_count,
+            event_type: "send_failed",
+            from_status: "pending",
+            to_status: "failed",
+            batch_id: batchId,
+            detail: { po_number: r.po_number, error_message: errorMessage, batch_id: batchId },
+          }));
+          await logSyncEvent(supabase, sendFailedEvents);
         }
 
         summary.ordersFailed += claimedOrders.length;
@@ -299,6 +399,7 @@ export const handler = async (
             const syncRecord = failedOrderMap.get(order.id);
             if (!syncRecord) continue;
 
+            const newRetryCount = syncRecord.retry_count + 1;
             const { data: updatedRows, error: updateError } = await supabase
               .from("bc_sync_orders")
               .update({
@@ -307,13 +408,13 @@ export const handler = async (
                 correlation_id: correlationId,
                 batch_id: batchId,
                 external_id: `BRA-AC-${messageId}-${order.po_number}`,
-                retry_count: syncRecord.retry_count + 1,
+                retry_count: newRetryCount,
                 error_message: null,
                 failed_at: null,
               })
               .eq("id", syncRecord.id)
               .eq("status", "failed") // Optimistic lock: only update if still 'failed'
-              .select("id");
+              .select("id, order_id, company_id, retry_count");
 
             if (updateError) {
               console.error("Failed to reset sync record for re-dispatch", {
@@ -332,6 +433,30 @@ export const handler = async (
               continue;
             }
             resetOrders.push(order);
+
+            // D-06: bewaar de identiteit voor de re-dispatch SB-sent-DB-faalt-edge.
+            dispatchedIdByOrderId.set(order.id, {
+              sync_order_id: syncRecord.id,
+              po_number: order.po_number,
+              company_id: order.company_id,
+            });
+
+            // `redispatched`-event: failed -> pending (per gereset order).
+            await logSyncEvent(supabase, [
+              {
+                sync_order_id: syncRecord.id,
+                order_id: order.id,
+                company_id: order.company_id,
+                event_type: "redispatched",
+                from_status: "failed",
+                to_status: "pending",
+                retry_count: newRetryCount,
+                message_id: messageId,
+                correlation_id: correlationId,
+                batch_id: batchId,
+                detail: { po_number: order.po_number, batch_id: batchId, message_id: messageId },
+              },
+            ]);
           }
 
           if (resetOrders.length === 0) {
@@ -357,6 +482,7 @@ export const handler = async (
               batch.legalEntity,
               supabase,
               summary,
+              dispatchedIdByOrderId,
             );
             summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
@@ -367,15 +493,50 @@ export const handler = async (
 
           // c. Update status -> sent
           const sentAt = new Date().toISOString();
-          const { error: sentError } = await supabase
+          const { data: redispatchSentRows, error: sentError } = await supabase
             .from("bc_sync_orders")
             .update({ status: "sent", sent_at: sentAt })
-            .eq("batch_id", batchId);
+            .eq("batch_id", batchId)
+            .select("id, order_id, company_id, po_number, retry_count");
 
           if (sentError) {
             console.error("SB re-dispatch sent but DB update failed", {
               batchId, error: sentError.message,
             });
+            // D-06 edge (re-dispatch): val terug op de in-memory map.
+            const fallbackEvents: BcSyncEventInsert[] = [];
+            for (const o of resetOrders) {
+              const ident = dispatchedIdByOrderId.get(o.id);
+              if (!ident) continue;
+              fallbackEvents.push({
+                sync_order_id: ident.sync_order_id,
+                order_id: o.id,
+                company_id: o.company_id,
+                event_type: "sent",
+                from_status: "pending",
+                to_status: "sent",
+                message_id: messageId,
+                correlation_id: correlationId,
+                batch_id: batchId,
+                detail: { po_number: o.po_number, batch_id: batchId, message_id: messageId, db_update_failed: true },
+              });
+            }
+            await logSyncEvent(supabase, fallbackEvents);
+          } else {
+            const sentEvents: BcSyncEventInsert[] = (redispatchSentRows ?? []).map((r) => ({
+              sync_order_id: r.id,
+              order_id: r.order_id,
+              company_id: r.company_id,
+              retry_count: r.retry_count,
+              event_type: "sent",
+              from_status: "pending",
+              to_status: "sent",
+              message_id: messageId,
+              correlation_id: correlationId,
+              batch_id: batchId,
+              detail: { po_number: r.po_number, batch_id: batchId, message_id: messageId },
+            }));
+            await logSyncEvent(supabase, sentEvents);
           }
 
           summary.ordersSent += resetOrders.length;
@@ -390,20 +551,34 @@ export const handler = async (
             error: errorMessage,
           });
 
-          const { error: failError } = await supabase
+          const { data: redispatchFailedRows, error: failError } = await supabase
             .from("bc_sync_orders")
             .update({
               status: "failed",
               error_message: errorMessage,
               failed_at: failedAt,
             })
-            .eq("batch_id", batchId);
+            .eq("batch_id", batchId)
+            .select("id, order_id, company_id, po_number, retry_count");
 
           if (failError) {
             console.error("Failed to update re-dispatched records to failed", {
               batchId,
               error: failError.message,
             });
+          } else {
+            const sendFailedEvents: BcSyncEventInsert[] = (redispatchFailedRows ?? []).map((r) => ({
+              sync_order_id: r.id,
+              order_id: r.order_id,
+              company_id: r.company_id,
+              retry_count: r.retry_count,
+              event_type: "send_failed",
+              from_status: "pending",
+              to_status: "failed",
+              batch_id: batchId,
+              detail: { po_number: r.po_number, error_message: errorMessage, batch_id: batchId },
+            }));
+            await logSyncEvent(supabase, sendFailedEvents);
           }
 
           summary.ordersFailed += resetOrders.length;
@@ -432,6 +607,7 @@ async function sendOrdersOneByOne(
   legalEntity: string,
   supabase: ReturnType<typeof getSupabaseClient>,
   summary: { ordersSent: number; ordersFailed: number },
+  dispatchedIdByOrderId: Map<number, DispatchedIdentity>,
 ): Promise<void> {
   for (const order of orders) {
     const singleMessageId = randomUUID();
@@ -450,15 +626,30 @@ async function sendOrdersOneByOne(
           poNumber: order.po_number,
         });
         // Mark as failed -- a single order that exceeds 200 KiB is a data issue
-        await supabase
+        const oversizedMessage = "Single order exceeds 200 KiB envelope size limit";
+        const { data: oversizedRows } = await supabase
           .from("bc_sync_orders")
           .update({
             status: "failed",
-            error_message: "Single order exceeds 200 KiB envelope size limit",
+            error_message: oversizedMessage,
             failed_at: new Date().toISOString(),
           })
           .eq("batch_id", originalBatchId)
-          .eq("order_id", order.id);
+          .eq("order_id", order.id)
+          .select("id, order_id, company_id, po_number, retry_count");
+
+        const oversizedEvents: BcSyncEventInsert[] = (oversizedRows ?? []).map((r) => ({
+          sync_order_id: r.id,
+          order_id: r.order_id,
+          company_id: r.company_id,
+          retry_count: r.retry_count,
+          event_type: "send_failed",
+          from_status: "pending",
+          to_status: "failed",
+          batch_id: originalBatchId,
+          detail: { po_number: r.po_number, error_message: oversizedMessage, batch_id: originalBatchId },
+        }));
+        await logSyncEvent(supabase, oversizedEvents);
 
         summary.ordersFailed++;
         continue;
@@ -481,11 +672,12 @@ async function sendOrdersOneByOne(
 
       await sendToServiceBus(envelope);
 
-      const { error: sentError } = await supabase
+      const { data: singleSentRows, error: sentError } = await supabase
         .from("bc_sync_orders")
         .update({ status: "sent", sent_at: new Date().toISOString() })
         .eq("batch_id", originalBatchId)
-        .eq("order_id", order.id);
+        .eq("order_id", order.id)
+        .select("id, order_id, company_id, po_number, retry_count");
 
       if (sentError) {
         // SB message already sent -- log but mark as sent anyway to prevent
@@ -493,6 +685,39 @@ async function sendOrdersOneByOne(
         console.error("SB sent but DB update failed (order still trackable via externalId)", {
           orderId: order.id, error: sentError.message,
         });
+        // D-06 edge (single): `.select()` gaf niets -> val terug op de map.
+        const ident = dispatchedIdByOrderId.get(order.id);
+        if (ident) {
+          await logSyncEvent(supabase, [
+            {
+              sync_order_id: ident.sync_order_id,
+              order_id: order.id,
+              company_id: order.company_id,
+              event_type: "sent",
+              from_status: "pending",
+              to_status: "sent",
+              message_id: singleMessageId,
+              correlation_id: singleCorrelationId,
+              batch_id: originalBatchId,
+              detail: { po_number: order.po_number, batch_id: originalBatchId, message_id: singleMessageId, db_update_failed: true },
+            },
+          ]);
+        }
+      } else {
+        const sentEvents: BcSyncEventInsert[] = (singleSentRows ?? []).map((r) => ({
+          sync_order_id: r.id,
+          order_id: r.order_id,
+          company_id: r.company_id,
+          retry_count: r.retry_count,
+          event_type: "sent",
+          from_status: "pending",
+          to_status: "sent",
+          message_id: singleMessageId,
+          correlation_id: singleCorrelationId,
+          batch_id: originalBatchId,
+          detail: { po_number: r.po_number, batch_id: originalBatchId, message_id: singleMessageId },
+        }));
+        await logSyncEvent(supabase, sentEvents);
       }
 
       summary.ordersSent++;
@@ -502,15 +727,30 @@ async function sendOrdersOneByOne(
         error: (err as Error).message,
       });
 
-      await supabase
+      const singleErrorMessage = (err as Error).message;
+      const { data: singleFailedRows } = await supabase
         .from("bc_sync_orders")
         .update({
           status: "failed",
-          error_message: (err as Error).message,
+          error_message: singleErrorMessage,
           failed_at: new Date().toISOString(),
         })
         .eq("batch_id", originalBatchId)
-        .eq("order_id", order.id);
+        .eq("order_id", order.id)
+        .select("id, order_id, company_id, po_number, retry_count");
+
+      const singleFailedEvents: BcSyncEventInsert[] = (singleFailedRows ?? []).map((r) => ({
+        sync_order_id: r.id,
+        order_id: r.order_id,
+        company_id: r.company_id,
+        retry_count: r.retry_count,
+        event_type: "send_failed",
+        from_status: "pending",
+        to_status: "failed",
+        batch_id: originalBatchId,
+        detail: { po_number: r.po_number, error_message: singleErrorMessage, batch_id: originalBatchId },
+      }));
+      await logSyncEvent(supabase, singleFailedEvents);
 
       summary.ordersFailed++;
     }
