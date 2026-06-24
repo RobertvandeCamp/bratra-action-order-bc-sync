@@ -1,10 +1,13 @@
 import { z } from "zod";
 
 import { getConfig } from "../shared/config";
+import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
 import type { getSupabaseClient } from "../shared/supabase-client";
 import type {
   BcSyncErrorMessageInsert,
+  BcSyncEventInsert,
+  BcSyncEventStatus,
   DlqBrokerProperties,
   ErrorQueueMessage,
   ErrorQueueSummary,
@@ -209,7 +212,24 @@ export function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
   return result.success ? (result.data as unknown as ErrorQueueMessage) : null;
 }
 
-export type MatchedOrder = { id: number; status: string };
+/**
+ * Een gematchte bc_sync_orders-rij. Verbreed (RISK-2) met de gedenormaliseerde
+ * identiteit-velden zodat `applyRejection` een COMPLETE `BcSyncEventInsert` kan
+ * bouwen (order_id/company_id zijn NOT NULL op bc_sync_events). De extra velden
+ * zijn optioneel-getypeerd: oudere call-sites/tests die alleen {id,status}
+ * leveren blijven compileren.
+ */
+export type MatchedOrder = {
+  id: number;
+  status: string;
+  order_id?: number;
+  company_id?: number;
+  po_number?: string;
+  retry_count?: number;
+  message_id?: string | null;
+  correlation_id?: string | null;
+  batch_id?: string | null;
+};
 
 /**
  * Derive the canonical external_id for an order: `BRA-AC-{metaMessageId}-{poNumber}`.
@@ -256,7 +276,7 @@ export async function matchOrder(
     externalId = deriveExternalId(metaMessageId, poNumber);
     const { data: byExternal } = await supabase
       .from("bc_sync_orders")
-      .select("id, status")
+      .select("id, status, order_id, company_id, po_number, retry_count, message_id, correlation_id, batch_id")
       .eq("external_id", externalId)
       .limit(1);
     if (byExternal && byExternal.length > 0) {
@@ -270,7 +290,7 @@ export async function matchOrder(
   if (!matchedOrder && metaMessageId) {
     const { data: byMessageId } = await supabase
       .from("bc_sync_orders")
-      .select("id, status")
+      .select("id, status, order_id, company_id, po_number, retry_count, message_id, correlation_id, batch_id")
       .eq("message_id", metaMessageId)
       .limit(2);
     if (byMessageId && byMessageId.length === 1) {
@@ -351,6 +371,23 @@ export async function applyRejection(
     return "failed";
   }
 
+  // Event ALLEEN op het "updated"-pad (niet bij already/terminal/failed).
+  // from_status = matchedOrder.status (sent of failed) -- exact, geen D-07-aanname.
+  const event: BcSyncEventInsert = {
+    sync_order_id: matchedOrder.id,
+    order_id: matchedOrder.order_id!,
+    company_id: matchedOrder.company_id!,
+    event_type: "bc_rejected",
+    from_status: matchedOrder.status as BcSyncEventStatus,
+    to_status: "bc_rejected",
+    retry_count: matchedOrder.retry_count ?? null,
+    message_id: matchedOrder.message_id ?? messageId,
+    correlation_id: matchedOrder.correlation_id ?? null,
+    batch_id: matchedOrder.batch_id ?? null,
+    detail: { po_number: matchedOrder.po_number, bc_error_message: errorMessage },
+  };
+  await logSyncEvent(supabase, [event]);
+
   return "updated";
 }
 
@@ -366,7 +403,8 @@ export async function applyRejection(
  * 6. On match: SET bc_sync_orders.status = 'bc_rejected' (skip if already, D-04)
  * 7. Complete: DELETE from queue ONLY after a successful insert (D-02)
  *
- * Writes no sync-event audit rows -- event-logging is out of scope this phase (D-11, phase 185).
+ * On a successful bc_rejected transition, applyRejection appends one
+ * `bc_rejected` event to bc_sync_events (best-effort, non-fatal -- phase 185, TRACE-01).
  * Non-fatal: per-message errors are counted, not thrown. Sequential (no Promise.all).
  */
 export async function checkErrorQueue(
