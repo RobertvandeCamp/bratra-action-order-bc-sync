@@ -1,0 +1,47 @@
+name: Claude Code Review
+
+# Automated code review by Claude on every PR.
+# Auth via Claude Pro/Max subscription (OAuth token), not via an API key.
+# Secret CLAUDE_CODE_OAUTH_TOKEN must be set as a repository secret (Actions).
+# Review behavior is tuned by REVIEW.md in the repo root (see this folder).
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+# Avoid duplicate/parallel reviews on rapid successive pushes.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Keep the other PR bot's comments out of Claude's context.
+          exclude_comments_by_actor: "cursor[bot]"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. The PR branch is already checked out in the
+            working directory. Follow REVIEW.md in the repo root and honor any
+            CLAUDE.md conventions. Add inline comments on specific lines and use a
+            top-level comment for the summary.
+          # Cost control (--max-turns) + tools needed to post comments.
+          claude_args: |
+            --max-turns 15
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
