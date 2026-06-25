@@ -82,9 +82,11 @@ const CHUNK_SIZE = 500;
  * Paginate a PostgREST select past the 1000-row cap.
  *
  * `buildPage(from, to)` must return a PostgREST builder for the inclusive [from, to]
- * range (e.g. `supabase.from(t).select(c).range(from, to)`). Pages are fetched
- * sequentially until a short page (< PAGE_SIZE) signals the end. `context` prefixes
- * any error thrown.
+ * range, and MUST carry a stable `.order()` on a unique column -- PostgREST does not
+ * guarantee row order across separate range requests, so without it pages can skip or
+ * duplicate rows (which would re-introduce the very leak this fixes). Pages are fetched
+ * sequentially until a short page (< PAGE_SIZE) signals the end. `context` prefixes any
+ * error thrown.
  */
 async function fetchAllPages<T>(
   buildPage: (
@@ -140,6 +142,7 @@ export async function fetchUnsyncedOrders(
         .from("bc_sync_orders")
         .select("order_id")
         .eq("company_id", companyId)
+        .order("id", { ascending: true }) // stable paging key (PK)
         .range(from, to),
     `Failed to query synced order_ids for company ${companyId}`,
   );
@@ -153,6 +156,7 @@ export async function fetchUnsyncedOrders(
         .select("id")
         .eq("company_id", companyId)
         .eq("approval_status", "approved")
+        .order("id", { ascending: true }) // stable paging key (PK)
         .range(from, to),
     `Failed to query approved order ids for company ${companyId}`,
   );
@@ -170,12 +174,17 @@ export async function fetchUnsyncedOrders(
   // Step 2d: fetch full order rows for the unsynced ids, chunked so the `in(...)`
   // URL stays bounded. Each chunk returns at most CHUNK_SIZE rows (id is unique),
   // well under the 1000-row cap. In steady-state unsyncedIds is small.
+  // Re-apply company_id + approval_status here (not just on the Step 2a id query):
+  // approval can change between Step 2a and this fetch, so the filter must hold at
+  // the warehouse I/O boundary too (SYNC-01).
   const orders: WarehouseOrder[] = [];
   for (let i = 0; i < unsyncedIds.length; i += CHUNK_SIZE) {
     const chunk = unsyncedIds.slice(i, i + CHUNK_SIZE);
     const { data, error } = await supabase
       .from("orders")
       .select(ORDER_SELECT)
+      .eq("company_id", companyId)
+      .eq("approval_status", "approved")
       .in("id", chunk);
 
     if (error) {
@@ -212,6 +221,7 @@ export async function fetchFailedSyncRecords(
         .select("*")
         .eq("company_id", companyId)
         .eq("status", "failed")
+        .order("id", { ascending: true }) // stable paging key (PK)
         .range(from, to),
     `Failed to query failed sync records for company ${companyId}`,
   );

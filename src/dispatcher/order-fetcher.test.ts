@@ -9,6 +9,7 @@ type BuilderState = {
   table: string;
   columns: string | null;
   eqs: Array<[string, unknown]>;
+  orders: string[];
   range: [number, number] | null;
   inIds: number[] | null;
 };
@@ -24,6 +25,7 @@ function makeBuilder(
     table,
     columns: null,
     eqs: [],
+    orders: [],
     range: null,
     inIds: null,
   };
@@ -35,6 +37,10 @@ function makeBuilder(
     },
     eq(col: string, val: unknown) {
       state.eqs.push([col, val]);
+      return builder;
+    },
+    order(col: string) {
+      state.orders.push(col);
       return builder;
     },
     in(_col: string, vals: number[]) {
@@ -160,6 +166,13 @@ describe("fetchUnsyncedOrders", () => {
     expect(syncPages.length).toBe(2);
     expect(syncPages[0].range).toEqual([0, 999]);
     expect(syncPages[1].range).toEqual([1000, 1999]);
+    // Stabiele paging-key vereist: elke gepagineerde query ordert op een unieke kolom
+    // (zonder .order() kan PostgREST rijen tussen pagina's overslaan/dupliceren).
+    expect(syncPages.every((b) => b.orders.includes("id"))).toBe(true);
+    const idsPages = builders.filter(
+      (b) => b.table === "orders" && b.columns === "id",
+    );
+    expect(idsPages.every((b) => b.orders.includes("id"))).toBe(true);
 
     // Geen full-row fetch (.in) omdat unsyncedIds leeg is.
     const fullFetch = builders.find(
@@ -184,5 +197,9 @@ describe("fetchUnsyncedOrders", () => {
       (b) => b.table === "orders" && b.inIds !== null,
     );
     expect(fullFetch?.inIds).toEqual([8]);
+    // SYNC-01 boundary-guard: chunk-fetch herhaalt company_id + approval_status
+    // (approval kan wijzigen tussen de ids-query en deze full-row fetch).
+    expect(fullFetch?.eqs).toContainEqual(["company_id", 2]);
+    expect(fullFetch?.eqs).toContainEqual(["approval_status", "approved"]);
   });
 });
