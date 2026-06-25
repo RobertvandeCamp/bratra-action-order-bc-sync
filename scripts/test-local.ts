@@ -42,6 +42,15 @@ Modes:
   live      Stuur 2 orders naar Service Bus sandbox, wacht 30s, verifieer via BC buffer API
   cleanup   Verwijder alle test bc_sync_orders records (batch_id begint met TEST-)
   dlq       Toon huidige DLQ diepte en berichten (peek-only, verwijdert niets)
+  error-queue  Peek de bratra-error queue: BC-afgekeurde orders + foutsectie
+            (stage/httpStatus/retryable/message). Read-only, verwijdert niets.
+  error-queue-process  Draai checkErrorQueue tegen de sandbox-queue: archiveert in
+            bc_sync_error_messages, zet gematchte orders op bc_rejected en print de
+            geschreven rijen + summary. WAARSCHUWING: consumeert/verwijdert berichten
+            (anders dan de read-only error-queue peek).
+  events    Dump de laatste bc_sync_events-rijen uit de sandbox (read-only):
+            per rij event_type, from->to-status, order_id en detail. Bewijst dat de
+            door dispatcher/verifier geschreven events de INSERT + RLS + CHECK passeren.
 
 Examples:
   npm run test:local -- status
@@ -76,7 +85,7 @@ function assertSandbox(): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
-  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq"].includes(mode)) {
+  if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue", "error-queue-process", "events"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
   }
@@ -84,6 +93,26 @@ async function main(): Promise<void> {
   // DLQ mode: geen sandbox guard nodig (leest geen BC data)
   if (mode === "dlq") {
     await dlqPeek();
+    return;
+  }
+
+  // Error-queue mode: read-only peek op bratra-error (geen sandbox guard)
+  if (mode === "error-queue") {
+    await errorQueuePeek();
+    return;
+  }
+
+  // Error-queue-process mode: draai checkErrorQueue (consumeert/verwijdert berichten,
+  // geen sandbox guard -- raakt queue + DB, niet de BC API).
+  if (mode === "error-queue-process") {
+    await errorQueueProcess();
+    return;
+  }
+
+  // Events mode: read-only dump van de laatste bc_sync_events-rijen (geen sandbox
+  // guard -- raakt geen BC API; bewijst dat de events de INSERT + RLS + CHECK passeren).
+  if (mode === "events") {
+    await eventsDump();
     return;
   }
 
@@ -670,6 +699,203 @@ async function dlqPeek(): Promise<void> {
   console.log(`DLQ diepte: minimaal ${count} berichten`);
   if (count === 0) console.log("DLQ is leeg.");
   console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
+}
+
+/**
+ * Read-only peek op de bratra-error queue (Leo, 15-06-2026).
+ *
+ * Anders dan de DLQ:
+ *  - gewone queue (geen $DeadLetterQueue-subqueue);
+ *  - foutinformatie zit in de BODY (error-sectie), niet in response-headers;
+ *  - SAS-token scoped op de error-queue. Gebruikt SB_ERROR_KEY_* indien gezet,
+ *    valt anders terug op SB_KEY_* (om empirisch te testen of de inbound-key
+ *    al toegang heeft -- verwachting: niet, dan komt hier een 401).
+ *
+ * Peek-lock zonder DELETE: berichten blijven in de queue (lock ~30s).
+ */
+async function errorQueuePeek(): Promise<void> {
+  const { getConfig } = await import("../src/shared/config");
+  const { generateSasToken } = await import("../src/shared/service-bus-client");
+  const config = getConfig();
+
+  const keyName = config.SB_ERROR_KEY_NAME ?? config.SB_KEY_NAME;
+  const keyValue = config.SB_ERROR_KEY_VALUE ?? config.SB_KEY_VALUE;
+  const usingFallbackKey = !config.SB_ERROR_KEY_NAME;
+
+  console.log(`\n--- Error-queue Peek: berichten in ${config.SB_ERROR_QUEUE} ---\n`);
+  console.log(`   queue:    ${config.SB_ERROR_QUEUE}`);
+  console.log(`   SAS-key:  ${keyName}${usingFallbackKey ? " (fallback: inbound-key -- 401 = geen rechten op error-queue)" : ""}\n`);
+
+  const token = generateSasToken(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, keyName, keyValue);
+
+  let count = 0;
+  const MAX_PEEK = 20;
+
+  for (let i = 0; i < MAX_PEEK; i++) {
+    const url = `https://${config.SB_NAMESPACE}.servicebus.windows.net/${config.SB_ERROR_QUEUE}/messages/head?timeout=2`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: token },
+    });
+
+    if (response.status === 204) break;
+    if (response.status === 401) {
+      console.error("HTTP 401 -- geen Listen-rechten op de error-queue met deze SAS-key.");
+      console.error("   Vraag ERP Company om een Listen-key op bratra-error (of namespace-level),");
+      console.error("   en zet die in .env.local als SB_ERROR_KEY_NAME / SB_ERROR_KEY_VALUE.");
+      return;
+    }
+    if (response.status !== 201) {
+      console.error(`Error-queue receive failed: HTTP ${response.status}`);
+      const body = await response.text();
+      if (body) console.error(`   ${body.slice(0, 300)}`);
+      break;
+    }
+
+    count++;
+    const brokerProps = JSON.parse(response.headers.get("BrokerProperties") ?? "{}");
+    const rawBody = await response.text();
+
+    let parsed: import("../src/shared/types").ErrorQueueMessage | null = null;
+    try {
+      parsed = JSON.parse(rawBody) as import("../src/shared/types").ErrorQueueMessage;
+    } catch {
+      // body niet parseable -- toon raw preview
+    }
+
+    console.log(`Bericht ${count}:`);
+    console.log(`   MessageId:      ${brokerProps.MessageId}`);
+    console.log(`   SequenceNumber: ${brokerProps.SequenceNumber}`);
+    console.log(`   EnqueuedTime:   ${brokerProps.EnqueuedTimeUtc}`);
+    if (parsed?.error) {
+      console.log(`   poNumber:       ${parsed.order?.poNumber ?? "-"}`);
+      console.log(`   correlationId:  ${parsed.meta?.correlationId ?? "-"}`);
+      console.log(`   stage:          ${parsed.error.stage}`);
+      console.log(`   httpStatus:     ${parsed.error.httpStatus ?? "-"}`);
+      console.log(`   retryable:      ${parsed.error.retryable}`);
+      console.log(`   failedAtUtc:    ${parsed.error.failedAtUtc ?? "-"}`);
+      console.log(`   message:        ${parsed.error.message}`);
+    } else {
+      console.log(`   Body preview:   ${rawBody.slice(0, 200)}`);
+    }
+    console.log();
+
+    // Peek-only: geen DELETE -- bericht blijft in de queue (lock ~30s)
+  }
+
+  console.log(`Error-queue diepte: minimaal ${count} berichten`);
+  if (count === 0) console.log("Error-queue is leeg (of geen toegang -- zie meldingen hierboven).");
+  console.log("\nLet op: gepeekte berichten zijn tijdelijk gelocked (~30s). Ze worden automatisch weer beschikbaar.\n");
+}
+
+/**
+ * Processing-mode tegen de bratra-error queue (D-07).
+ *
+ * Anders dan errorQueuePeek() (read-only): dit draait de echte checkErrorQueue,
+ * die berichten archiveert in bc_sync_error_messages, gematchte orders op
+ * 'bc_rejected' zet en de berichten daarna VERWIJDERT uit de queue.
+ *
+ * Print de meest recente geschreven archief-rijen + de ErrorQueueSummary, zodat
+ * een sandbox-run end-to-end te verifieren is. Geen sandbox guard: raakt de queue
+ * + DB, niet de BC API (mirror dlq/error-queue).
+ */
+async function errorQueueProcess(): Promise<void> {
+  const { getConfig } = await import("../src/shared/config");
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const { checkErrorQueue } = await import("../src/verifier/error-queue-checker");
+  const config = getConfig();
+  const supabase = getSupabaseClient();
+
+  console.log(`\n--- Error-queue PROCESS: checkErrorQueue tegen ${config.SB_ERROR_QUEUE} ---\n`);
+  console.log("   WAARSCHUWING: deze mode CONSUMEERT/VERWIJDERT berichten uit de queue");
+  console.log("   (archiveert ze eerst in bc_sync_error_messages). Anders dan de read-only");
+  console.log("   'error-queue' peek. Draai alleen tegen de sandbox.\n");
+
+  const summary = await checkErrorQueue(supabase);
+
+  // Meest recente geschreven archief-rijen tonen
+  console.log("\n--- Geschreven bc_sync_error_messages (laatste 10) ---\n");
+  const { data: rows, error } = await supabase
+    .from("bc_sync_error_messages")
+    .select(
+      "message_id, po_number, external_id, error_stage, error_message, error_retryable, matched_sync_order_id, received_at",
+    )
+    .order("received_at", { ascending: false })
+    .limit(10);
+
+  if (error) {
+    console.error(`   Kon archief-rijen niet ophalen: ${error.message}`);
+  } else if (!rows || rows.length === 0) {
+    console.log("   Geen rijen in bc_sync_error_messages.");
+  } else {
+    for (const row of rows) {
+      console.log(`messageId:        ${row.message_id}`);
+      console.log(`   poNumber:        ${row.po_number ?? "-"}`);
+      console.log(`   externalId:      ${row.external_id ?? "-"}`);
+      console.log(`   stage:           ${row.error_stage ?? "-"}`);
+      console.log(`   retryable:       ${row.error_retryable ?? "-"}`);
+      console.log(`   matchedOrderId:  ${row.matched_sync_order_id ?? "-"}`);
+      console.log(`   receivedAt:      ${row.received_at ?? "-"}`);
+      console.log(`   message:         ${row.error_message ?? "-"}`);
+      console.log();
+    }
+  }
+
+  console.log("--- ErrorQueueSummary ---");
+  console.log(`   archived:  ${summary.archived}`);
+  console.log(`   matched:   ${summary.matched}`);
+  console.log(`   unmatched: ${summary.unmatched}`);
+  console.log(`   skipped:   ${summary.skipped}`);
+  console.log(`   deleted:   ${summary.deleted}`);
+  console.log(`   errors:    ${summary.errors}`);
+  console.log();
+}
+
+/**
+ * Events dump (D-09 #2): read-only SELECT op de laatste bc_sync_events-rijen uit
+ * de sandbox-Supabase. Tweede verificatielaag naast de unit-tests: bewijst dat de
+ * door dispatcher/verifier geschreven events de echte INSERT + RLS + de
+ * event_type/from_status/to_status CHECK-constraints passeren (Pitfall 4 -- de
+ * best-effort swallow verbergt een CHECK-violation, een "0 rijen"-discrepantie
+ * maakt 'm zichtbaar). Wijzigt niets.
+ */
+async function eventsDump(): Promise<void> {
+  const { getSupabaseClient } = await import("../src/shared/supabase-client");
+  const supabase = getSupabaseClient();
+
+  console.log("\n--- Laatste bc_sync_events (laatste 30, nieuwste eerst) ---\n");
+
+  const { data: rows, error } = await supabase
+    .from("bc_sync_events")
+    .select(
+      "id, sync_order_id, order_id, event_type, from_status, to_status, retry_count, detail, occurred_at",
+    )
+    .order("occurred_at", { ascending: false })
+    .limit(30);
+
+  if (error) {
+    console.error(`   Kon bc_sync_events niet ophalen: ${error.message}`);
+    return;
+  }
+
+  if (!rows || rows.length === 0) {
+    console.log("   Geen rijen in bc_sync_events.");
+    return;
+  }
+
+  for (const row of rows) {
+    const from = row.from_status ?? "-";
+    const to = row.to_status ?? "-";
+    console.log(`event_type:       ${row.event_type}`);
+    console.log(`   from -> to:      ${from} -> ${to}`);
+    console.log(`   orderId:         ${row.order_id ?? "-"} (sync_order_id ${row.sync_order_id ?? "-"})`);
+    console.log(`   retryCount:      ${row.retry_count ?? "-"}`);
+    console.log(`   occurredAt:      ${row.occurred_at ?? "-"}`);
+    console.log(`   detail:          ${JSON.stringify(row.detail)}`);
+    console.log();
+  }
+
+  console.log(`--- ${rows.length} rij(en) getoond ---\n`);
 }
 
 function sleep(ms: number): Promise<void> {

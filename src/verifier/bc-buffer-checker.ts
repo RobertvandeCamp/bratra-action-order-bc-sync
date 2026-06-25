@@ -1,10 +1,38 @@
 import { bcGet } from "../shared/bc-client";
+import { logSyncEvent } from "../shared/event-logger";
 import type {
   BCConfig,
   BcBufferRecord,
+  BcSyncEventInsert,
   BcSyncOrderRow,
 } from "../shared/types";
 import type { getSupabaseClient } from "../shared/supabase-client";
+
+/**
+ * Bouw de identiteit-velden van een `BcSyncEventInsert` uit een in-scope
+ * `BcSyncOrderRow` (de hele rij zit al in `sentOrders`, geen `.select()` nodig).
+ * Alle verifier-buffer-transities komen vanaf status `sent` (D-07).
+ */
+export function buildBufferEvent(
+  order: BcSyncOrderRow,
+  event_type: BcSyncEventInsert["event_type"],
+  to_status: BcSyncEventInsert["to_status"],
+  detail: Record<string, unknown>,
+): BcSyncEventInsert {
+  return {
+    sync_order_id: order.id,
+    order_id: order.order_id,
+    company_id: order.company_id,
+    event_type,
+    from_status: "sent",
+    to_status,
+    retry_count: order.retry_count,
+    message_id: order.message_id,
+    correlation_id: order.correlation_id,
+    batch_id: order.batch_id,
+    detail,
+  };
+}
 
 // ============================================================================
 // Verify Summary
@@ -46,6 +74,11 @@ export async function checkBufferStatuses(
     errors: 0,
   };
 
+  // D-01: verzamel per-order events en doe ÉÉN bulk-insert aan het einde. Een
+  // event wordt alleen toegevoegd op de success-branch van de bijbehorende
+  // status-update (een gefaalde update = transitie vond niet plaats -> geen event).
+  const events: BcSyncEventInsert[] = [];
+
   for (const order of sentOrders) {
     try {
       // Dead-letter orders without external_id (unverifiable)
@@ -58,8 +91,16 @@ export async function checkBufferStatuses(
             failed_at: new Date().toISOString(),
           })
           .eq("id", order.id);
-        if (!noExtError) summary.deadLetter++;
-        else summary.errors++;
+        if (!noExtError) {
+          summary.deadLetter++;
+          // event_type "dead_lettered" (dubbel-t) -> status "dead_letter" (enkel-t)
+          events.push(
+            buildBufferEvent(order, "dead_lettered", "dead_letter", {
+              po_number: order.po_number,
+              reason: "Missing external_id",
+            }),
+          );
+        } else summary.errors++;
         console.warn("Order dead-lettered: no external_id", { orderId: order.id });
         continue;
       }
@@ -95,6 +136,13 @@ export async function checkBufferStatuses(
             summary.errors++;
           } else {
             summary.deadLetter++;
+            events.push(
+              buildBufferEvent(order, "dead_lettered", "dead_letter", {
+                po_number: order.po_number,
+                bc_buffer_status: "NotFound",
+                age_min: Math.round(sentAge / 60000),
+              }),
+            );
             console.warn("Order dead-lettered (not found in BC after 1h)", {
               orderId: order.id, externalId: order.external_id,
               sentAgeMin: Math.round(sentAge / 60000), action: "dead_letter",
@@ -137,6 +185,12 @@ export async function checkBufferStatuses(
             break;
           }
           summary.verified++;
+          events.push(
+            buildBufferEvent(order, "verified", "verified", {
+              po_number: order.po_number,
+              bc_buffer_status: buffer.status,
+            }),
+          );
           console.log("Order verified", {
             orderId: order.id,
             externalId: order.external_id,
@@ -170,6 +224,14 @@ export async function checkBufferStatuses(
               break;
             }
             summary.retried++;
+            // buffer_error: Error/Fatal in BC, status -> failed (retry nog mogelijk)
+            events.push(
+              buildBufferEvent(order, "buffer_error", "failed", {
+                po_number: order.po_number,
+                error_message: buffer.errorMessage,
+                bc_buffer_status: buffer.status,
+              }),
+            );
             console.log("Order retried", {
               orderId: order.id,
               externalId: order.external_id,
@@ -196,6 +258,13 @@ export async function checkBufferStatuses(
               break;
             }
             summary.deadLetter++;
+            events.push(
+              buildBufferEvent(order, "dead_lettered", "dead_letter", {
+                po_number: order.po_number,
+                bc_buffer_status: buffer.status,
+                error_message: buffer.errorMessage,
+              }),
+            );
             console.log("Order dead-lettered", {
               orderId: order.id,
               externalId: order.external_id,
@@ -247,6 +316,12 @@ export async function checkBufferStatuses(
             break;
           }
           summary.deadLetter++;
+          events.push(
+            buildBufferEvent(order, "dead_lettered", "dead_letter", {
+              po_number: order.po_number,
+              bc_buffer_status: "Cancelled",
+            }),
+          );
           console.log("Order cancelled in BC", {
             orderId: order.id,
             externalId: order.external_id,
@@ -274,6 +349,10 @@ export async function checkBufferStatuses(
       summary.errors++;
     }
   }
+
+  // Best-effort bulk-log na alle per-order checks (D-01). logSyncEvent swallowt
+  // zelf elke fout -- mag de verifier-flow nooit breken (T-185-11).
+  await logSyncEvent(supabase, events);
 
   return summary;
 }

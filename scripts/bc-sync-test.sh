@@ -37,6 +37,13 @@
 #                                        verwijdert niets). Toont afgekeurde berichten
 #                                        en de reden van afkeuring.
 #
+#   ./scripts/bc-sync-test.sh error-queue  Peek de bratra-error queue (Leo, 15-06):
+#                                        BC-afgekeurde orders verrijkt met een
+#                                        foutsectie (stage/httpStatus/retryable/
+#                                        message). Read-only, verwijdert niets.
+#                                        Vereist Listen-rechten op bratra-error
+#                                        (SB_ERROR_KEY_NAME/VALUE in .env.local).
+#
 #   ./scripts/bc-sync-test.sh cleanup    Ruim test-tracking-records op (batch_id met
 #                                        TEST-prefix) zodat de test herhaalbaar is.
 #
@@ -69,8 +76,9 @@ usage() {
   echo "  happy     Stuur canonieke happy-path order (Leo's payload, vers PO) + check buffer"
   echo "  dry-run   Bouw het BC-bericht voor 2 orders, verstuur niets"
   echo "  live      Verstuur 2 orders naar Service Bus sandbox + verifieer in BC"
-  echo "  dlq       Bekijk Dead Letter Queue (peek-only)"
-  echo "  cleanup   Verwijder test-tracking-records (TEST- prefix)"
+  echo "  dlq         Bekijk Dead Letter Queue (peek-only)"
+  echo "  error-queue Bekijk bratra-error queue: BC-afgekeurde orders + foutsectie (peek-only)"
+  echo "  cleanup     Verwijder test-tracking-records (TEST- prefix)"
   echo ""
   echo "Lees de header van dit script voor uitleg per mode."
   echo ""
@@ -82,7 +90,7 @@ if [[ -z "$MODE" ]]; then
 fi
 
 case "$MODE" in
-  status|happy|dry-run|live|dlq|cleanup) ;;
+  status|happy|dry-run|live|dlq|error-queue|cleanup) ;;
   -h|--help|help) usage; exit 0 ;;
   *)
     echo "Onbekende mode: $MODE"

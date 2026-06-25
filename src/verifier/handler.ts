@@ -5,7 +5,8 @@ import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { checkBufferStatuses } from "./bc-buffer-checker";
 import { checkDlqMessages } from "./dlq-checker";
-import type { BCConfig, DlqSummary } from "../shared/types";
+import { checkErrorQueue } from "./error-queue-checker";
+import type { BCConfig, DlqSummary, ErrorQueueSummary } from "../shared/types";
 
 /** Non-food company (consistent with dispatcher) */
 const COMPANY_ID = 2;
@@ -41,7 +42,17 @@ export const handler = async (
     );
   }
 
-  // 4. D-03: Query sent orders older than 2 minutes
+  // 4. Error-queue check FIRST (non-fatal, D-05/ERR-03). Runs BEFORE the sent-orders
+  // query so a BC-rejected order is moved to 'bc_rejected' and leaves the 'sent' set
+  // before the buffer-check's "NotFound > 1h -> dead_letter" path can mislabel it.
+  let errorQueueSummary: ErrorQueueSummary | null = null;
+  try {
+    errorQueueSummary = await checkErrorQueue(supabase);
+  } catch (err) {
+    console.error("Error-queue check failed (non-fatal)", { error: (err as Error).message });
+  }
+
+  // 5. D-03: Query sent orders older than 2 minutes
   const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
 
   const { data: sentOrders, error } = await supabase
@@ -55,10 +66,24 @@ export const handler = async (
     throw new Error(`Failed to query sent orders: ${error.message}`);
   }
 
-  // 5-7. Buffer check (only when sent orders exist)
+  // 5-7. Buffer check. Defer ALLEEN wanneer de error-queue-check WEL draaide maar
+  // berichten ONVERWERKT liet (errors > 0): dan kan er nog een pending bc_rejected-
+  // transitie openstaan en zou de buffer-check een 'sent'-order onterecht naar
+  // 'dead_letter' kunnen verouderen. Bij een volledige exception (summary null) NIET
+  // meer oneindig deferren -- anders blijven orders bij een persistente fout (verkeerde
+  // queue-naam, ongeldige SAS) eeuwig in 'sent' hangen zonder verificatie (PR#5 #2).
+  const deferBuffer =
+    errorQueueSummary !== null && errorQueueSummary.errors > 0;
   let bufferSummary = null;
+  let bufferNote = "no sent orders";
 
-  if (!sentOrders || sentOrders.length === 0) {
+  if (deferBuffer) {
+    bufferNote = "deferred (error-queue errors > 0)";
+    console.warn(
+      "Buffer check deferred: error-queue left unprocessed messages this run (errors > 0) -- skipping to avoid mislabeling a pending bc_rejected order as dead_letter",
+      { errorQueueErrors: errorQueueSummary?.errors },
+    );
+  } else if (!sentOrders || sentOrders.length === 0) {
     console.log("No sent orders to verify");
   } else {
     console.log("Sent orders to verify", { count: sentOrders.length });
@@ -87,7 +112,8 @@ export const handler = async (
 
   // 9. Log gecombineerde summary (D-10)
   console.log("Verification complete", {
-    buffer: bufferSummary ?? "no sent orders",
+    errorQueue: errorQueueSummary ?? "skipped (error)",
+    buffer: bufferSummary ?? bufferNote,
     dlq: dlqSummary ?? "skipped (error)",
   });
 };

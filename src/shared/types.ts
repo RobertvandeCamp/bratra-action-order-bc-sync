@@ -78,7 +78,84 @@ export type SyncStatus =
   | "verified"
   | "failed"
   | "dead_letter"
-  | "skipped";
+  | "skipped"
+  // Terminal BC-content-rejection status (order verworpen door BC op inhoud),
+  // onderscheiden van `dead_letter` (transport/not-found).
+  | "bc_rejected";
+
+// ============================================================================
+// bc_sync_events (append-only audit-log) -- fase 185, TRACE-01
+// ============================================================================
+
+/**
+ * De 9 toegestane `event_type`-waarden uit de DB-CHECK op
+ * `action_orders.bc_sync_events` (migratie 20260623151957). Eén type per
+ * statusovergang; meerdere types kunnen op dezelfde `status` mappen (1:N), bv.
+ * `send_failed`/`stale_recovered`/`buffer_error` schrijven allemaal status
+ * `failed` -- daarom is `event_type` per call-site hardcoded (D-02), niet uit
+ * de status afgeleid.
+ *
+ * Let op: event_type `dead_lettered` (dubbele t) is NIET de status
+ * `dead_letter` (enkele t) -- zie `BcSyncEventStatus`.
+ */
+export type BcSyncEventType =
+  | "dispatched"
+  | "sent"
+  | "send_failed"
+  | "redispatched"
+  | "verified"
+  | "buffer_error"
+  | "dead_lettered"
+  | "bc_rejected"
+  | "stale_recovered";
+
+/**
+ * Toegestane waarden voor `from_status`/`to_status` op `bc_sync_events`. De
+ * DB-CHECK op die kolommen is exact gelijk aan de bestaande `SyncStatus`-set
+ * (7 waarden), dus hergebruiken we `SyncStatus` i.p.v. dupliceren.
+ *
+ * NB: status `dead_letter` (enkele t) hoort bij event_type `dead_lettered`
+ * (dubbele t) -- een veelgemaakte verwarring (Pitfall 2).
+ */
+export type BcSyncEventStatus = SyncStatus;
+
+/**
+ * Insert-vorm voor `action_orders.bc_sync_events` (migratie 20260623151957,
+ * fase 183). Velden spiegelen de kolommen een-op-een. `id`, `occurred_at` en
+ * `created_at` zijn DB-defaulted en daarom weggelaten.
+ *
+ * Verplicht (NOT NULL, geen default): `sync_order_id` (FK -> bc_sync_orders),
+ * de gedenormaliseerde `order_id`/`company_id`, en `event_type`. De rest is
+ * optioneel-nullable.
+ *
+ * Omdat de Supabase-client `<any>`-getypeerd is, is dit type de ENIGE
+ * compile-time guard op de event-payload (Pitfall 5): `logSyncEvent` typt zijn
+ * `events`-parameter hierop zodat `tsc` de call-sites controleert.
+ */
+export interface BcSyncEventInsert {
+  /** FK -> bc_sync_orders(id) -- verplicht */
+  sync_order_id: number;
+  /** Gedenormaliseerd action order-id -- verplicht */
+  order_id: number;
+  /** Gedenormaliseerd company_id (RLS-scope) -- verplicht */
+  company_id: number;
+  /** Type statusovergang -- verplicht, per call-site hardcoded (D-02) */
+  event_type: BcSyncEventType;
+  /** Status vóór de overgang (afgeleid uit call-site context, D-07) */
+  from_status?: BcSyncEventStatus | null;
+  /** Status ná de overgang */
+  to_status?: BcSyncEventStatus | null;
+  /** Aantal pogingen op het event-moment */
+  retry_count?: number | null;
+  /** Ons dispatch-id (UUID-string), matcht bc_sync_orders.message_id */
+  message_id?: string | null;
+  /** Service Bus CorrelationId */
+  correlation_id?: string | null;
+  /** Dispatch-batch-id */
+  batch_id?: string | null;
+  /** Vrije event-specifieke context als JSONB (altijd po_number, D-04) */
+  detail?: Record<string, unknown> | null;
+}
 
 // ============================================================================
 // bc_sync_orders database types (copied from bratra-data-warehouse)
@@ -381,4 +458,102 @@ export interface SqsTriggerMessage {
   companyId: number;
   /** ISO timestamp of when the import completed (optional, for logging) */
   timestamp?: string;
+}
+
+// ============================================================================
+// Error queue types (Leo, 15-06-2026) -- bratra-error
+// ============================================================================
+
+/**
+ * Foutsectie die ERP Company aan het bericht toevoegt voordat het naar de
+ * `bratra-error` queue gaat. Contract afgeleid uit Leo's voorbeeldbericht
+ * (docs/BC sync error queue.md). Verifieer tegen echte berichten.
+ */
+export interface ErrorQueueErrorSection {
+  /** Waar het misging, bv. "BcBufferWrite" of "FunctionError" */
+  stage: string;
+  /** BC HTTP-status (bv. 400, 422, 5xx) */
+  httpStatus?: number;
+  /** Foutmelding van Business Central */
+  message: string;
+  /** Aantal pogingen voor het naar de error queue ging */
+  attempts?: number;
+  /** true = transient, veilig te replayen; false = permanente data/validatiefout.
+   * Optioneel: het Zod-schema staat afwezigheid toe (z.boolean().optional()), dus de
+   * interface mag geen aanwezigheid beloven die de wire niet garandeert (PR#5 #3). */
+  retryable?: boolean;
+  /** ISO-timestamp van de definitieve fout */
+  failedAtUtc?: string;
+  /** Correlatie-ID voor App Insights-tracing */
+  correlationId?: string;
+}
+
+/**
+ * Berichtstructuur op de `bratra-error` queue: oorspronkelijke meta + de
+ * afgekeurde order + de toegevoegde error-sectie. Let op: anders dan de DLQ
+ * zit de foutinformatie in de BODY, niet in response-headers. Eén order per
+ * bericht (`order`, niet `payload.orders[]`).
+ */
+export interface ErrorQueueMessage {
+  meta: ActionOrderBatchV1Envelope["meta"];
+  order: EnvelopeOrder;
+  error: ErrorQueueErrorSection;
+}
+
+/**
+ * Samenvatting van error-queue-verwerking per verifier run. Gemodelleerd naar
+ * `DlqSummary`, met per-run tellers voor de `bratra-error` queue.
+ */
+export interface ErrorQueueSummary {
+  /** Aantal berichten succesvol weggeschreven naar bc_sync_error_messages */
+  archived: number;
+  /** Aantal gearchiveerd EN gematcht (bc_sync_orders gevonden, op bc_rejected gezet) */
+  matched: number;
+  /** Aantal gearchiveerd zonder match (matched_sync_order_id NULL) */
+  unmatched: number;
+  /** Aantal idempotent overgeslagen (message_id al gearchiveerd) */
+  skipped: number;
+  /** Aantal berichten voltooid/verwijderd uit de queue */
+  deleted: number;
+  /** Aantal verwerkingsfouten */
+  errors: number;
+}
+
+/**
+ * Insert-vorm voor `action_orders.bc_sync_error_messages`. Velden spiegelen de
+ * kolommen uit migratie 20260623151847 een-op-een. `id` en `created_at` zijn
+ * DB-defaulted en daarom weggelaten; `message_id` is verplicht (UNIQUE,
+ * idempotentie-sleutel). `message_body` en `broker_properties` zijn JSONB.
+ */
+export interface BcSyncErrorMessageInsert {
+  /** Service Bus BrokerProperties.MessageId -- verplicht, idempotentie-sleutel */
+  message_id: string;
+  /** Ons dispatch-id (uuid) uit de meta-sectie */
+  meta_message_id?: string | null;
+  /** Purchase order nummer uit de payload */
+  po_number?: string | null;
+  /** Externe order-identifier */
+  external_id?: string | null;
+  /** Service Bus BrokerProperties.SequenceNumber */
+  sequence_number?: number | null;
+  /** Fase in het sync-proces waar de fout optrad */
+  error_stage?: string | null;
+  /** HTTP-status van de BC-respons bij de fout */
+  error_http_status?: number | null;
+  /** Foutomschrijving zoals teruggegeven door BC */
+  error_message?: string | null;
+  /** Aantal pogingen voordat het bericht in de error-queue belandde */
+  error_attempts?: number | null;
+  /** Of de fout (volgens BC/dispatcher) herhaalbaar is */
+  error_retryable?: boolean | null;
+  /** Tijdstip (UTC) waarop de fout optrad */
+  failed_at_utc?: string | null;
+  /** Volledige originele ErrorQueueMessage als JSONB */
+  message_body?: unknown;
+  /** Volledige BrokerProperties header als JSONB */
+  broker_properties?: unknown;
+  /** FK naar bc_sync_orders -- NULL als bericht niet gematcht kon worden */
+  matched_sync_order_id?: number | null;
+  /** Tijdstip waarop het bericht is gearchiveerd */
+  received_at?: string | null;
 }
