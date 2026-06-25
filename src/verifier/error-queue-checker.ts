@@ -353,6 +353,10 @@ export async function applyRejection(
   matchedOrder: MatchedOrder,
   errorMessage: string,
   messageId: string,
+  // De echte BC-rejectietijd (error.failedAtUtc uit de body). Valt terug op de
+  // verwerkingstijd als hij ontbreekt. Voorkomt dat SLA/latency-metingen op
+  // bc_sync_orders.failed_at de rejectie-latency overschatten (PR#5 claude #3).
+  failedAtUtc: string | null = null,
 ): Promise<"updated" | "already" | "terminal" | "failed"> {
   if (matchedOrder.status === "bc_rejected") {
     console.log("Order already bc_rejected (idempotent skip)", {
@@ -379,7 +383,7 @@ export async function applyRejection(
     .update({
       status: "bc_rejected",
       bc_error_message: errorMessage,
-      failed_at: new Date().toISOString(),
+      failed_at: failedAtUtc ?? new Date().toISOString(),
     })
     .eq("id", matchedOrder.id);
 
@@ -538,7 +542,13 @@ export async function checkErrorQueue(
           const { matchedOrder } = reMatch;
           if (matchedOrder) {
             const errorMessage = parsed.error?.message ?? "(no error message)";
-            const outcome = await applyRejection(supabase, matchedOrder, errorMessage, messageId);
+            const outcome = await applyRejection(
+              supabase,
+              matchedOrder,
+              errorMessage,
+              messageId,
+              parsed.error?.failedAtUtc ?? null,
+            );
             if (outcome === "failed") {
               summary.errors++;
               // NIET completen -- update moet alsnog slagen in een volgende run
@@ -631,6 +641,7 @@ export async function checkErrorQueue(
           matchedOrder,
           error?.message ?? "(no error message)",
           messageId,
+          error?.failedAtUtc ?? null,
         );
 
         if (outcome === "failed") {

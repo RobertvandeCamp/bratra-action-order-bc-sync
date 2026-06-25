@@ -390,6 +390,22 @@ describe("applyRejection bc_rejected event-logging", () => {
     expect((ev.detail as Record<string, unknown>).bc_error_message).toBe("BC zegt nee");
   });
 
+  it("schrijft de echte BC-rejectietijd (failedAtUtc) naar failed_at (PR#5 #3)", async () => {
+    const { client, updates } = makeRejectionFake();
+    const bcTime = "2026-06-20T08:30:00Z";
+    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-ts", bcTime);
+    expect(outcome).toBe("updated");
+    expect(updates).toHaveLength(1);
+    expect(updates[0].payload.failed_at).toBe(bcTime); // niet de verwerkingstijd
+  });
+
+  it("valt terug op de verwerkingstijd voor failed_at als failedAtUtc ontbreekt", async () => {
+    const { client, updates } = makeRejectionFake();
+    const outcome = await applyRejection(client, matched, "err", "msg-noTs");
+    expect(outcome).toBe("updated");
+    expect(typeof updates[0].payload.failed_at).toBe("string"); // fallback ISO-timestamp
+  });
+
   it("neemt from_status 'failed' over als de order in status failed staat", async () => {
     const { client, events } = makeRejectionFake();
     const outcome = await applyRejection(
