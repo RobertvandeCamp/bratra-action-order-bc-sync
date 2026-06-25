@@ -222,8 +222,11 @@ export function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
 export type MatchedOrder = {
   id: number;
   status: string;
-  order_id?: number;
-  company_id?: number;
+  // order_id/company_id zijn VERPLICHT: de matchOrder-select haalt ze altijd op en
+  // applyRejection schrijft ze als NOT NULL-kolommen in het bc_rejected-event. Zonder
+  // deze garantie zou een ! een event stil laten falen in logSyncEvent (PR#5 #1).
+  order_id: number;
+  company_id: number;
   po_number?: string;
   retry_count?: number;
   message_id?: string | null;
@@ -400,8 +403,8 @@ export async function applyRejection(
   // from_status = matchedOrder.status (sent of failed) -- exact, geen D-07-aanname.
   const event: BcSyncEventInsert = {
     sync_order_id: matchedOrder.id,
-    order_id: matchedOrder.order_id!,
-    company_id: matchedOrder.company_id!,
+    order_id: matchedOrder.order_id,
+    company_id: matchedOrder.company_id,
     event_type: "bc_rejected",
     from_status: matchedOrder.status as BcSyncEventStatus,
     to_status: "bc_rejected",

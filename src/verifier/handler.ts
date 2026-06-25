@@ -66,17 +66,22 @@ export const handler = async (
     throw new Error(`Failed to query sent orders: ${error.message}`);
   }
 
-  // 5-7. Buffer check (only when sent orders exist AND the error-queue check
-  // succeeded this run). When the error-queue check FAILED (threw -> summary
-  // null), a BC-rejected order may still be in the 'sent' set; running the
-  // buffer check then risks aging it to 'dead_letter' (NotFound > 1h) before
-  // it can be moved to 'bc_rejected'. Defer the buffer check to the next
-  // successful cycle -- both checks will run together then.
+  // 5-7. Buffer check. Defer ALLEEN wanneer de error-queue-check WEL draaide maar
+  // berichten ONVERWERKT liet (errors > 0): dan kan er nog een pending bc_rejected-
+  // transitie openstaan en zou de buffer-check een 'sent'-order onterecht naar
+  // 'dead_letter' kunnen verouderen. Bij een volledige exception (summary null) NIET
+  // meer oneindig deferren -- anders blijven orders bij een persistente fout (verkeerde
+  // queue-naam, ongeldige SAS) eeuwig in 'sent' hangen zonder verificatie (PR#5 #2).
+  const deferBuffer =
+    errorQueueSummary !== null && errorQueueSummary.errors > 0;
   let bufferSummary = null;
+  let bufferNote = "no sent orders";
 
-  if (errorQueueSummary === null) {
+  if (deferBuffer) {
+    bufferNote = "deferred (error-queue errors > 0)";
     console.warn(
-      "Buffer check deferred: error-queue check failed this run -- skipping to avoid mislabeling bc_rejected orders as dead_letter",
+      "Buffer check deferred: error-queue left unprocessed messages this run (errors > 0) -- skipping to avoid mislabeling a pending bc_rejected order as dead_letter",
+      { errorQueueErrors: errorQueueSummary?.errors },
     );
   } else if (!sentOrders || sentOrders.length === 0) {
     console.log("No sent orders to verify");
@@ -108,7 +113,7 @@ export const handler = async (
   // 9. Log gecombineerde summary (D-10)
   console.log("Verification complete", {
     errorQueue: errorQueueSummary ?? "skipped (error)",
-    buffer: bufferSummary ?? "no sent orders",
+    buffer: bufferSummary ?? bufferNote,
     dlq: dlqSummary ?? "skipped (error)",
   });
 };

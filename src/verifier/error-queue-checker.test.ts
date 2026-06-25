@@ -326,7 +326,7 @@ describe("matchOrder", () => {
 describe("applyRejection", () => {
   it("skipt idempotent als de order al bc_rejected is", async () => {
     const { client, updates } = makeUpdateFake();
-    const outcome = await applyRejection(client, { id: 1, status: "bc_rejected" }, "err", "msg-1");
+    const outcome = await applyRejection(client, { id: 1, status: "bc_rejected", order_id: 100, company_id: 2 }, "err", "msg-1");
     expect(outcome).toBe("already");
     expect(updates).toHaveLength(0); // geen UPDATE
   });
@@ -335,7 +335,7 @@ describe("applyRejection", () => {
     "overschrijft een terminale order (%s) NIET naar bc_rejected",
     async (status) => {
       const { client, updates } = makeUpdateFake();
-      const outcome = await applyRejection(client, { id: 2, status }, "err", "msg-1");
+      const outcome = await applyRejection(client, { id: 2, status, order_id: 100, company_id: 2 }, "err", "msg-1");
       expect(outcome).toBe("terminal");
       expect(updates).toHaveLength(0);
     },
@@ -343,7 +343,7 @@ describe("applyRejection", () => {
 
   it("zet een order in status 'sent' op bc_rejected met de juiste payload", async () => {
     const { client, updates } = makeUpdateFake();
-    const outcome = await applyRejection(client, { id: 3, status: "sent" }, "BC zegt nee", "msg-1");
+    const outcome = await applyRejection(client, { id: 3, status: "sent", order_id: 100, company_id: 2 }, "BC zegt nee", "msg-1");
     expect(outcome).toBe("updated");
     expect(updates).toHaveLength(1);
     expect(updates[0].id).toBe(3);
@@ -354,7 +354,7 @@ describe("applyRejection", () => {
 
   it("geeft 'failed' terug als de UPDATE een DB-error oplevert", async () => {
     const { client, updates } = makeUpdateFake({ message: "deadlock" });
-    const outcome = await applyRejection(client, { id: 4, status: "sent" }, "err", "msg-1");
+    const outcome = await applyRejection(client, { id: 4, status: "sent", order_id: 100, company_id: 2 }, "err", "msg-1");
     expect(outcome).toBe("failed");
     expect(updates).toHaveLength(1); // update geprobeerd, maar faalde
   });

@@ -478,8 +478,10 @@ export interface ErrorQueueErrorSection {
   message: string;
   /** Aantal pogingen voor het naar de error queue ging */
   attempts?: number;
-  /** true = transient, veilig te replayen; false = permanente data/validatiefout */
-  retryable: boolean;
+  /** true = transient, veilig te replayen; false = permanente data/validatiefout.
+   * Optioneel: het Zod-schema staat afwezigheid toe (z.boolean().optional()), dus de
+   * interface mag geen aanwezigheid beloven die de wire niet garandeert (PR#5 #3). */
+  retryable?: boolean;
   /** ISO-timestamp van de definitieve fout */
   failedAtUtc?: string;
   /** Correlatie-ID voor App Insights-tracing */
