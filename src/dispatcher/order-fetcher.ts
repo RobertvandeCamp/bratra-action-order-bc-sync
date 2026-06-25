@@ -67,11 +67,60 @@ export function assertWarehouseOrders(
 }
 
 /**
+ * PostgREST caps an unbounded select at 1000 rows (the server `max-rows` setting).
+ * Any anti-join / id-collection that silently truncates at 1000 produces a WRONG
+ * result set. Go-live incident 2026-06-25: a company with >1000 `skipped` rows had
+ * its overflow read out of the synced-set, so those already-handled orders leaked
+ * back into "unsynced" and were re-dispatched to BC.
+ */
+const PAGE_SIZE = 1000;
+
+/** Chunk size for the id-restricted full-row fetch (keeps the `in(...)` URL bounded). */
+const CHUNK_SIZE = 500;
+
+/**
+ * Paginate a PostgREST select past the 1000-row cap.
+ *
+ * `buildPage(from, to)` must return a PostgREST builder for the inclusive [from, to]
+ * range, and MUST carry a stable `.order()` on a unique column -- PostgREST does not
+ * guarantee row order across separate range requests, so without it pages can skip or
+ * duplicate rows (which would re-introduce the very leak this fixes). Pages are fetched
+ * sequentially until a short page (< PAGE_SIZE) signals the end. `context` prefixes any
+ * error thrown.
+ */
+async function fetchAllPages<T>(
+  buildPage: (
+    from: number,
+    to: number,
+  ) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+  context: string,
+): Promise<T[]> {
+  const rows: T[] = [];
+  let from = 0;
+  for (;;) {
+    const { data, error } = await buildPage(from, from + PAGE_SIZE - 1);
+    if (error) {
+      throw new Error(`${context}: ${error.message}`);
+    }
+    const page = data ?? [];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) {
+      break;
+    }
+    from += PAGE_SIZE;
+  }
+  return rows;
+}
+
+/**
  * Fetch orders that have not been synced to BC yet (no bc_sync_orders record in any status).
  *
- * Uses a two-step anti-join pattern because Supabase JS does not support NOT EXISTS:
- *   1. Get order_ids with ANY sync record (all statuses)
- *   2. Get orders WHERE id NOT IN those ids
+ * Uses an in-memory anti-join because Supabase JS does not support NOT EXISTS, and
+ * the previous `NOT IN (<all synced ids>)` URL did not scale to thousands of ids:
+ *   1. Collect ALL synced order_ids (any status), paginated past the 1000-row cap.
+ *   2a. Collect ALL approved order ids (ids only -- cheap), paginated.
+ *   2b. Anti-join in memory: approved ids minus synced ids.
+ *   2c. Fetch full order rows for the unsynced ids, chunked.
  *
  * Failed orders eligible for re-dispatch are handled separately by the handler
  * via fetchFailedSyncRecords() + dedicated warehouse data fetch.
@@ -81,60 +130,76 @@ export async function fetchUnsyncedOrders(
 ): Promise<WarehouseOrder[]> {
   const supabase = getSupabaseClient();
 
-  // Step 1: Get order_ids that should NOT be fetched as new:
-  // - active sync records (pending/sent/verified)
-  // - failed records (retry-eligible ones are re-fetched in step 3 via fetchFailedSyncRecords)
-  // - dead_letter records (permanently failed)
-  // - skipped records
-  // - bc_rejected records (BC content-rejection, terminal -- permanently excluded from
-  //   re-dispatch, like dead_letter/skipped). REQUIRED here because the phase-183 unique
-  //   partial index excludes bc_rejected from its uniqueness scope, so a new pending row
-  //   for the same order_id would NOT conflict -- the fetcher must anti-join it out (ERR-04).
-  const { data: syncedOrders, error: syncError } = await supabase
-    .from("bc_sync_orders")
-    .select("order_id")
-    .eq("company_id", companyId)
-    .in("status", ["pending", "sent", "verified", "failed", "dead_letter", "skipped", "bc_rejected"]);
+  // Step 1: collect order_ids that already have ANY bc_sync_orders record.
+  // The status filter is intentionally dropped: the contract is "no bc_sync_orders
+  // record in ANY status", so every record counts -- a superset is exactly what the
+  // anti-join needs. This also keeps terminal statuses (skipped/dead_letter/
+  // bc_rejected) excluded from re-dispatch, including bc_rejected which the phase-183
+  // partial unique index does not constrain (ERR-04).
+  const syncedRows = await fetchAllPages<{ order_id: number }>(
+    (from, to) =>
+      supabase
+        .from("bc_sync_orders")
+        .select("order_id")
+        .eq("company_id", companyId)
+        .order("id", { ascending: true }) // stable paging key (PK)
+        .range(from, to),
+    `Failed to query synced order_ids for company ${companyId}`,
+  );
+  const syncedOrderIds = new Set<number>(syncedRows.map((r) => r.order_id));
 
-  if (syncError) {
-    throw new Error(
-      `Failed to query synced order_ids for company ${companyId}: ${syncError.message}`,
-    );
-  }
-
-  const syncedOrderIds = (syncedOrders ?? []).map(
-    (r: { order_id: number }) => r.order_id,
+  // Step 2a: collect ALL approved order ids (ids only -- cheap), paginated.
+  const approvedRows = await fetchAllPages<{ id: number }>(
+    (from, to) =>
+      supabase
+        .from("orders")
+        .select("id")
+        .eq("company_id", companyId)
+        .eq("approval_status", "approved")
+        .order("id", { ascending: true }) // stable paging key (PK)
+        .range(from, to),
+    `Failed to query approved order ids for company ${companyId}`,
   );
 
-  // Step 2: Get orders NOT in synced list, with nested relations
-  let query = supabase
-    .from("orders")
-    .select(ORDER_SELECT)
-    .eq("company_id", companyId)
-    .eq("approval_status", "approved");
+  // Step 2b: anti-join in memory.
+  const unsyncedIds = approvedRows
+    .map((r) => r.id)
+    .filter((id) => !syncedOrderIds.has(id));
 
-  if (syncedOrderIds.length > 0) {
-    query = query.not(
-      "id",
-      "in",
-      `(${syncedOrderIds.join(",")})`,
-    );
+  // Step 2c: nothing new -> done (avoids an empty `in()` query).
+  if (unsyncedIds.length === 0) {
+    return [];
   }
 
-  const { data: newOrders, error: orderError } = await query;
+  // Step 2d: fetch full order rows for the unsynced ids, chunked so the `in(...)`
+  // URL stays bounded. Each chunk returns at most CHUNK_SIZE rows (id is unique),
+  // well under the 1000-row cap. In steady-state unsyncedIds is small.
+  // Re-apply company_id + approval_status here (not just on the Step 2a id query):
+  // approval can change between Step 2a and this fetch, so the filter must hold at
+  // the warehouse I/O boundary too (SYNC-01).
+  const orders: WarehouseOrder[] = [];
+  for (let i = 0; i < unsyncedIds.length; i += CHUNK_SIZE) {
+    const chunk = unsyncedIds.slice(i, i + CHUNK_SIZE);
+    const { data, error } = await supabase
+      .from("orders")
+      .select(ORDER_SELECT)
+      .eq("company_id", companyId)
+      .eq("approval_status", "approved")
+      .in("id", chunk);
 
-  if (orderError) {
-    throw new Error(
-      `Failed to query orders for company ${companyId}: ${orderError.message}`,
-    );
+    if (error) {
+      throw new Error(
+        `Failed to query orders for company ${companyId}: ${error.message}`,
+      );
+    }
+
+    // Cast via unknown: Supabase untyped client infers distribution_centers as array,
+    // but the FK on distribution_center_id makes it a single object at runtime.
+    // WR-05: guard the load-bearing shape at the boundary before casting.
+    orders.push(...assertWarehouseOrders(data ?? [], "fetchUnsyncedOrders"));
   }
 
-  // Cast via unknown: Supabase untyped client infers distribution_centers as array,
-  // but the FK on distribution_center_id makes it a single object at runtime.
-  // WR-05: guard the load-bearing shape at the boundary before casting.
-  // Note: failed orders are handled separately by the handler (fetchFailedSyncRecords +
-  // dedicated warehouse data fetch) to avoid redundant DB calls.
-  return assertWarehouseOrders(newOrders ?? [], "fetchUnsyncedOrders");
+  return orders;
 }
 
 /**
@@ -146,23 +211,22 @@ export async function fetchFailedSyncRecords(
 ): Promise<BcSyncOrderRow[]> {
   const supabase = getSupabaseClient();
 
-  // Fetch all failed records, then filter retry_count < max_retries in JS
-  // (PostgREST cannot compare two columns directly)
-  const { data: allFailed, error } = await supabase
-    .from("bc_sync_orders")
-    .select("*")
-    .eq("company_id", companyId)
-    .eq("status", "failed");
+  // Fetch all failed records (paginated past the 1000-row cap -- same latent bug
+  // as fetchUnsyncedOrders), then filter retry_count < max_retries in JS
+  // (PostgREST cannot compare two columns directly).
+  const allFailed = await fetchAllPages<BcSyncOrderRow>(
+    (from, to) =>
+      supabase
+        .from("bc_sync_orders")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("status", "failed")
+        .order("id", { ascending: true }) // stable paging key (PK)
+        .range(from, to),
+    `Failed to query failed sync records for company ${companyId}`,
+  );
 
-  if (error) {
-    throw new Error(
-      `Failed to query failed sync records for company ${companyId}: ${error.message}`,
-    );
-  }
-
-  return (allFailed ?? []).filter(
-    (r: BcSyncOrderRow) => r.retry_count < r.max_retries,
-  ) as BcSyncOrderRow[];
+  return allFailed.filter((r) => r.retry_count < r.max_retries);
 }
 
 /**
