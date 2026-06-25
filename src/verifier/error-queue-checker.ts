@@ -252,6 +252,11 @@ export const TERMINAL_STATUSES = new Set(["verified", "dead_letter", "skipped", 
 export interface MatchResult {
   matchedOrder: MatchedOrder | null;
   externalId: string | null;
+  // true wanneer een Supabase-select een DB-fout teruggaf (transient: netwerk/RLS/
+  // timeout). Cruciaal onderscheid van "geen match": de caller mag bij dbError NIET
+  // archiveren-als-unmatched en NIET completen, anders gaat een BC-rejection die wel
+  // een matchende order had permanent verloren. errors++ + laten voor retry (PR#5 cursor High).
+  dbError: boolean;
 }
 
 /**
@@ -274,11 +279,20 @@ export async function matchOrder(
 
   if (metaMessageId && poNumber) {
     externalId = deriveExternalId(metaMessageId, poNumber);
-    const { data: byExternal } = await supabase
+    const { data: byExternal, error: byExternalError } = await supabase
       .from("bc_sync_orders")
       .select("id, status, order_id, company_id, po_number, retry_count, message_id, correlation_id, batch_id")
       .eq("external_id", externalId)
       .limit(1);
+    // Een DB-fout is GEEN "geen match": treat als transient, laat de caller het
+    // bericht voor een volgende run laten staan (cursor High, PR#5).
+    if (byExternalError) {
+      console.error(
+        "Error-queue match: external_id-lookup faalde (DB-fout) -- transient, NIET als unmatched behandelen",
+        { externalId, error: byExternalError.message },
+      );
+      return { matchedOrder: null, externalId, dbError: true };
+    }
     if (byExternal && byExternal.length > 0) {
       matchedOrder = byExternal[0] as MatchedOrder;
     }
@@ -288,11 +302,18 @@ export async function matchOrder(
   // bij meerdere hits is de match ambigu en mag GEEN willekeurige order
   // gemislabeld worden (cursor/claude: batch deelt een message_id).
   if (!matchedOrder && metaMessageId) {
-    const { data: byMessageId } = await supabase
+    const { data: byMessageId, error: byMessageIdError } = await supabase
       .from("bc_sync_orders")
       .select("id, status, order_id, company_id, po_number, retry_count, message_id, correlation_id, batch_id")
       .eq("message_id", metaMessageId)
       .limit(2);
+    if (byMessageIdError) {
+      console.error(
+        "Error-queue match: message_id-fallback faalde (DB-fout) -- transient, NIET als unmatched behandelen",
+        { metaMessageId, error: byMessageIdError.message },
+      );
+      return { matchedOrder: null, externalId, dbError: true };
+    }
     if (byMessageId && byMessageId.length === 1) {
       matchedOrder = byMessageId[0] as MatchedOrder;
     } else if (byMessageId && byMessageId.length > 1) {
@@ -304,7 +325,7 @@ export async function matchOrder(
     }
   }
 
-  return { matchedOrder, externalId };
+  return { matchedOrder, externalId, dbError: false };
 }
 
 /**
@@ -504,7 +525,17 @@ export async function checkErrorQueue(
         summary.skipped++;
 
         if (parsed) {
-          const { matchedOrder } = await matchOrder(supabase, parsed);
+          const reMatch = await matchOrder(supabase, parsed);
+          if (reMatch.dbError) {
+            console.error("Error-queue self-heal match faalde (DB-fout) -- bericht laten staan voor retry", {
+              messageId,
+              sequenceNumber: msg.brokerProperties.SequenceNumber,
+            });
+            summary.errors++;
+            // NIET completen -- een volgende run probeert de self-heal opnieuw
+            continue;
+          }
+          const { matchedOrder } = reMatch;
           if (matchedOrder) {
             const errorMessage = parsed.error?.message ?? "(no error message)";
             const outcome = await applyRejection(supabase, matchedOrder, errorMessage, messageId);
@@ -535,9 +566,22 @@ export async function checkErrorQueue(
       }
 
       // 4. Match (D-03), ALLEEN als goed-gevormd
-      const { matchedOrder, externalId } = parsed
+      const matchResult: MatchResult = parsed
         ? await matchOrder(supabase, parsed)
-        : { matchedOrder: null, externalId: null };
+        : { matchedOrder: null, externalId: null, dbError: false };
+
+      // Een transient DB-fout tijdens de match mag het bericht NIET als unmatched
+      // archiveren+completen (anders verdwijnt een rejection die wel een matchende
+      // order had). Tel als error, laat in de queue voor een volgende run (cursor High, PR#5).
+      if (matchResult.dbError) {
+        console.error("Error-queue match-lookup faalde (DB-fout) -- bericht overgeslagen deze run", {
+          messageId,
+          sequenceNumber: msg.brokerProperties.SequenceNumber,
+        });
+        summary.errors++;
+        continue;
+      }
+      const { matchedOrder, externalId } = matchResult;
 
       // 5. Bouw de archief-rij. Body altijd volledig bewaren: parsed object bij
       // goed-gevormd, anders de raw string (D-09: niets verliezen).

@@ -289,6 +289,34 @@ describe("matchOrder", () => {
     // geen external_id-query uitgevoerd
     expect(calls.some((c) => c.column === "external_id")).toBe(false);
   });
+
+  it("zet dbError bij een DB-fout op de external_id-query (NIET als unmatched)", async () => {
+    const { client } = makeSelectFake({
+      [`external_id=${externalId}`]: { data: null, error: { message: "timeout" } },
+    });
+    const result = await matchOrder(client, parsed);
+    expect(result.dbError).toBe(true);
+    expect(result.matchedOrder).toBeNull();
+    expect(result.externalId).toBe(externalId); // externalId blijft beschikbaar voor logging
+  });
+
+  it("zet dbError bij een DB-fout op de message_id-fallback (NIET als unmatched)", async () => {
+    const { client } = makeSelectFake({
+      [`external_id=${externalId}`]: { data: [], error: null }, // geen primaire match
+      "message_id=meta-123": { data: null, error: { message: "connection reset" } },
+    });
+    const result = await matchOrder(client, parsed);
+    expect(result.dbError).toBe(true);
+    expect(result.matchedOrder).toBeNull();
+  });
+
+  it("dbError is false op een normale (geslaagde) match", async () => {
+    const { client } = makeSelectFake({
+      [`external_id=${externalId}`]: { data: [{ id: 7, status: "sent" }], error: null },
+    });
+    const result = await matchOrder(client, parsed);
+    expect(result.dbError).toBe(false);
+  });
 });
 
 // ============================================================================
