@@ -1,6 +1,7 @@
 import { getConfig } from "../shared/config";
 import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
+import { TERMINAL_STATUSES } from "./error-queue-checker";
 import type { getSupabaseClient } from "../shared/supabase-client";
 import type {
   BcSyncEventInsert,
@@ -238,32 +239,42 @@ export async function checkDlqMessages(
 
       // 5. Bij match: update bc_sync_orders (D-11)
       if (matchedOrder) {
-        const { error: updateError } = await supabase
-          .from("bc_sync_orders")
-          .update({
-            status: "dead_letter",
-            bc_error_message: `${msg.deadLetterReason}: ${msg.deadLetterErrorDescription}`.trim(),
-          })
-          .eq("id", matchedOrder.id);
-
-        if (updateError) {
-          console.error("Failed to update bc_sync_orders for DLQ match", {
-            orderId: matchedOrder.id,
-            messageId,
-            error: updateError.message,
-          });
-          // Insert succeeded, continue met complete
+        // Terminal-guard (PR#5 claude High #1): een order die al in een terminale
+        // status zit (verified/dead_letter/skipped/bc_rejected) NIET overschrijven
+        // naar dead_letter. De error-queue-checker (stap 4) draait eerder in dezelfde
+        // verifier-run; zonder deze guard wint een DLQ-bericht van een net gezette
+        // bc_rejected en gaat die terminale uitkomst verloren. Spiegelt applyRejection.
+        if (TERMINAL_STATUSES.has(matchedOrder.status)) {
+          console.warn(
+            "DLQ match already in terminal status -- NOT overwriting to dead_letter",
+            { orderId: matchedOrder.id, currentStatus: matchedOrder.status, messageId },
+          );
         } else {
-          // dead_lettered-event ALLEEN bij een geslaagde matched-update (de
-          // transitie naar dead_letter vond plaats). Geen match -> deze branch
-          // wordt niet bereikt -> geen event.
-          await logSyncEvent(supabase, [
-            buildDlqDeadLetteredEvent(
-              matchedOrder,
-              msg.deadLetterReason,
-              msg.deadLetterErrorDescription,
-            ),
-          ]);
+          const { error: updateError } = await supabase
+            .from("bc_sync_orders")
+            .update({
+              status: "dead_letter",
+              bc_error_message: `${msg.deadLetterReason}: ${msg.deadLetterErrorDescription}`.trim(),
+            })
+            .eq("id", matchedOrder.id);
+
+          if (updateError) {
+            console.error("Failed to update bc_sync_orders for DLQ match", {
+              orderId: matchedOrder.id,
+              messageId,
+              error: updateError.message,
+            });
+            // Insert succeeded, continue met complete
+          } else {
+            // dead_lettered-event ALLEEN bij een geslaagde transitie naar dead_letter.
+            await logSyncEvent(supabase, [
+              buildDlqDeadLetteredEvent(
+                matchedOrder,
+                msg.deadLetterReason,
+                msg.deadLetterErrorDescription,
+              ),
+            ]);
+          }
         }
 
         summary.matched++;

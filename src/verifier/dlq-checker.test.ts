@@ -241,4 +241,19 @@ describe("checkDlqMessages event-logging", () => {
     expect(events[0].sync_order_id).toBe(42);
     expect(summary.matched).toBe(1);
   });
+
+  it("overschrijft een al-terminale match NIET naar dead_letter en logt geen event (PR#5 High #1)", async () => {
+    stubDlqFetchSingleMessage();
+    // Order zit al in een terminale status (bc_rejected, gezet door de
+    // error-queue-checker eerder in dezelfde verifier-run). De DLQ-checker mag die
+    // uitkomst niet overschrijven -> geen dead_lettered-event.
+    const { client, eventInserts } = makeDlqSupabase([
+      { id: 77, order_id: 1002, company_id: 2, po_number: "PO-X", retry_count: 0, status: "bc_rejected" },
+    ]);
+
+    const summary = await checkDlqMessages(client);
+
+    expect(eventInserts.flat()).toHaveLength(0); // niet overschreven -> geen event
+    expect(summary.matched).toBe(1); // matchte wel een order
+  });
 });
