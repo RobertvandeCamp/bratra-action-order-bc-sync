@@ -254,6 +254,9 @@ describe("checkDlqMessages event-logging", () => {
     const summary = await checkDlqMessages(client);
 
     expect(eventInserts.flat()).toHaveLength(0); // niet overschreven -> geen event
-    expect(summary.matched).toBe(1); // matchte wel een order
+    // Terminal-suppressie telt NIET als matched (geen dead_letter-transitie door ons),
+    // maar als unmatched -- consistent met error-queue-checker (PR#5 claude #3).
+    expect(summary.matched).toBe(0);
+    expect(summary.unmatched).toBe(1);
   });
 });
