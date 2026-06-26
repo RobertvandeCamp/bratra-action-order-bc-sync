@@ -3,10 +3,11 @@ import type { ScheduledEvent, Context } from "aws-lambda";
 import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
+import { fetchAllPages } from "../shared/paginate";
 import { checkBufferStatuses } from "./bc-buffer-checker";
 import { checkDlqMessages } from "./dlq-checker";
 import { checkErrorQueue } from "./error-queue-checker";
-import type { BCConfig, DlqSummary, ErrorQueueSummary } from "../shared/types";
+import type { BCConfig, BcSyncOrderRow, DlqSummary, ErrorQueueSummary } from "../shared/types";
 
 /** Non-food company (consistent with dispatcher) */
 const COMPANY_ID = 2;
@@ -52,19 +53,25 @@ export const handler = async (
     console.error("Error-queue check failed (non-fatal)", { error: (err as Error).message });
   }
 
-  // 5. D-03: Query sent orders older than 2 minutes
+  // 5. D-03: Query sent orders older than 2 minutes. Paginated past the PostgREST
+  // 1000-row cap (same latent bug as the dispatcher's anti-join): a mass-dispatch
+  // can leave >1000 orders simultaneously 'sent', and an unbounded select would
+  // silently drop the overflow from verification. `.order("id")` gives the stable
+  // paging key the pagination requires.
   const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
 
-  const { data: sentOrders, error } = await supabase
-    .from("bc_sync_orders")
-    .select("*")
-    .eq("company_id", COMPANY_ID)
-    .eq("status", "sent")
-    .lt("sent_at", twoMinutesAgo);
-
-  if (error) {
-    throw new Error(`Failed to query sent orders: ${error.message}`);
-  }
+  const sentOrders = await fetchAllPages<BcSyncOrderRow>(
+    (from, to) =>
+      supabase
+        .from("bc_sync_orders")
+        .select("*")
+        .eq("company_id", COMPANY_ID)
+        .eq("status", "sent")
+        .lt("sent_at", twoMinutesAgo)
+        .order("id", { ascending: true })
+        .range(from, to),
+    "Failed to query sent orders",
+  );
 
   // 5-7. Buffer check. Defer ALLEEN wanneer de error-queue-check WEL draaide maar
   // berichten ONVERWERKT liet (errors > 0): dan kan er nog een pending bc_rejected-

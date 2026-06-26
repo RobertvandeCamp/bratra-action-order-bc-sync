@@ -1,5 +1,6 @@
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
+import { fetchAllPages } from "../shared/paginate";
 import { buildStaleRecoveredEvent } from "./event-builders";
 import type { WarehouseOrder, BcSyncOrderRow, BcSyncEventInsert } from "../shared/types";
 
@@ -66,51 +67,8 @@ export function assertWarehouseOrders(
   return rows as WarehouseOrder[];
 }
 
-/**
- * PostgREST caps an unbounded select at 1000 rows (the server `max-rows` setting).
- * Any anti-join / id-collection that silently truncates at 1000 produces a WRONG
- * result set. Go-live incident 2026-06-25: a company with >1000 `skipped` rows had
- * its overflow read out of the synced-set, so those already-handled orders leaked
- * back into "unsynced" and were re-dispatched to BC.
- */
-const PAGE_SIZE = 1000;
-
 /** Chunk size for the id-restricted full-row fetch (keeps the `in(...)` URL bounded). */
 const CHUNK_SIZE = 500;
-
-/**
- * Paginate a PostgREST select past the 1000-row cap.
- *
- * `buildPage(from, to)` must return a PostgREST builder for the inclusive [from, to]
- * range, and MUST carry a stable `.order()` on a unique column -- PostgREST does not
- * guarantee row order across separate range requests, so without it pages can skip or
- * duplicate rows (which would re-introduce the very leak this fixes). Pages are fetched
- * sequentially until a short page (< PAGE_SIZE) signals the end. `context` prefixes any
- * error thrown.
- */
-async function fetchAllPages<T>(
-  buildPage: (
-    from: number,
-    to: number,
-  ) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
-  context: string,
-): Promise<T[]> {
-  const rows: T[] = [];
-  let from = 0;
-  for (;;) {
-    const { data, error } = await buildPage(from, from + PAGE_SIZE - 1);
-    if (error) {
-      throw new Error(`${context}: ${error.message}`);
-    }
-    const page = data ?? [];
-    rows.push(...page);
-    if (page.length < PAGE_SIZE) {
-      break;
-    }
-    from += PAGE_SIZE;
-  }
-  return rows;
-}
 
 /**
  * Fetch orders that have not been synced to BC yet (no bc_sync_orders record in any status).
