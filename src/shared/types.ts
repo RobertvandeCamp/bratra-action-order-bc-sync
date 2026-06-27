@@ -384,9 +384,10 @@ export type BcBufferStatus =
  *
  * BC OData v2.0 API retourneert camelCase property namen.
  *
- * NOTE: Exacte OData property namen (met name salesDocumentNo) moeten
- * geverifieerd worden bij de eerste test-local run (Assumption A2 uit
- * RESEARCH.md). Als de werkelijke response afwijkt, pas dit interface aan.
+ * Veldnamen geverifieerd tegen een echte buffer-respons (2026-06-27, sandbox):
+ * het salesordernummer heet `createdDocumentNo` (was eerder aangenomen als
+ * `salesDocumentNo`, wat altijd undefined teruggaf). Subset van de respons; BC
+ * stuurt méér velden (externalReference/customerNo/carrier/timestamps).
  */
 export interface BcBufferRecord {
   /** BC system UUID */
@@ -395,8 +396,8 @@ export interface BcBufferRecord {
   externalId: string;
   /** Verwerkingsstatus in BC */
   status: BcBufferStatus;
-  /** Sales Order nummer, gevuld bij status Done */
-  salesDocumentNo: string;
+  /** Sales Order nummer ("Created Document No."), gevuld bij status Done (bv. VO26-00162) */
+  createdDocumentNo: string;
   /** Error details bij status Error/Fatal */
   errorMessage: string;
   /** BC entry nummer */

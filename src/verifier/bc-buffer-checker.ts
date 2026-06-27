@@ -171,7 +171,7 @@ export async function checkBufferStatuses(
             .update({
               status: "verified",
               bc_buffer_status: buffer.status,
-              bc_document_no: buffer.salesDocumentNo,
+              bc_document_no: buffer.createdDocumentNo,
               bc_system_id: buffer.systemId,
               bc_entry_no: buffer.entryNo,
               verified_at: new Date().toISOString(),
@@ -195,7 +195,7 @@ export async function checkBufferStatuses(
             orderId: order.id,
             externalId: order.external_id,
             bcBufferStatus: buffer.status,
-            bcDocumentNo: buffer.salesDocumentNo,
+            bcDocumentNo: buffer.createdDocumentNo,
             action: "verified",
           });
           break;
