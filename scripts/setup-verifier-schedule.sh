@@ -121,10 +121,18 @@ apply() {
 
   # 3. Target: koppel de verifier aan de rule met Input {"source":"scheduled"} puur
   #    voor log-attributie (put-targets overschrijft op target-id → idempotent).
+  #    Input moet een JSON-STRING zijn; de --targets shorthand-parser kan die geneste
+  #    JSON niet aan, dus we leveren het target als JSON via een tijdelijk file://-bestand.
+  local targets_json
+  targets_json="$(mktemp "${TMPDIR:-/tmp}/verifier-targets-XXXXXX.json")"
+  cat >"$targets_json" <<JSON
+[{"Id":"${TARGET_ID}","Arn":"${FUNCTION_ARN}","Input":"{\"source\":\"scheduled\"}"}]
+JSON
   aws events put-targets \
     --rule "$RULE_NAME" \
-    --targets "Id=${TARGET_ID},Arn=${FUNCTION_ARN},Input={\"source\":\"scheduled\"}" \
+    --targets "file://${targets_json}" \
     --region "$REGION" >/dev/null
+  rm -f "$targets_json"
   echo "[3/5] put-targets OK — verifier gekoppeld met Input {\"source\":\"scheduled\"}."
 
   # 4. Reserved concurrency = 1 (T-193-02; voorkomt overlappende runs).
