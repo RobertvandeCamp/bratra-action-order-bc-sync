@@ -91,6 +91,20 @@ if ! command -v aws >/dev/null 2>&1; then
   exit 1
 fi
 
+# Account-guard: de identifiers (ARNs) zijn hard-coded op account 683001725253.
+# Draaien met credentials voor een ander account zou ARNs naar het verkeerde account
+# laten wijzen en stille faal veroorzaken. Faal hier expliciet bij mismatch.
+CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text --region "$REGION" 2>/dev/null || true)"
+if [ -z "$CALLER_ACCOUNT" ] || [ "$CALLER_ACCOUNT" = "None" ]; then
+  echo "FOUT: kon AWS-account niet bepalen (aws sts get-caller-identity faalde). Check je credentials." >&2
+  exit 1
+fi
+if [ "$CALLER_ACCOUNT" != "$ACCOUNT_ID" ]; then
+  echo "FOUT: actieve AWS-account ($CALLER_ACCOUNT) != verwacht ($ACCOUNT_ID)." >&2
+  echo "      Verkeerde credentials/omgeving — afgebroken om mutaties op het verkeerde account te voorkomen." >&2
+  exit 1
+fi
+
 # --- Subcommands -------------------------------------------------------------
 
 apply() {
@@ -99,17 +113,30 @@ apply() {
   echo "------------------------------------------------------------"
 
   # 1. EventBridge cron-rule (create-or-update; idempotent).
+  #    Behoud de bestaande State: een operator die bewust 'disable' draaide tijdens een
+  #    incident mag niet stil her-enabled worden door een re-apply (alleen timeout/
+  #    concurrency bijwerken). Nieuwe rule (nog niet bestaand) start ENABLED.
+  local desired_state
+  desired_state="$(aws events describe-rule --name "$RULE_NAME" --region "$REGION" --query State --output text 2>/dev/null || echo ENABLED)"
+  case "$desired_state" in ENABLED|DISABLED) ;; *) desired_state="ENABLED" ;; esac
   aws events put-rule \
     --name "$RULE_NAME" \
     --schedule-expression "$CRON" \
-    --state ENABLED \
+    --state "$desired_state" \
     --description "Cron-trigger voor bratra-bc-sync-verifier: elke 15 min, ma-vr, ~NL kantooruren (UTC)" \
     --region "$REGION" >/dev/null
-  echo "[1/5] put-rule OK — cron '$CRON' (ENABLED)."
+  echo "[1/5] put-rule OK — cron '$CRON' (${desired_state})."
 
-  # 2. Lambda-permission idempotent: eerst verwijderen (negeer ResourceNotFound op
-  #    de eerste run), daarna toevoegen scoped op de rule-ARN (T-193-01, geen wildcard).
-  aws lambda remove-permission --function-name "$FUNCTION_NAME" --statement-id "$STATEMENT_ID" --region "$REGION" >/dev/null 2>&1 || true
+  # 2. Lambda-permission idempotent: eerst verwijderen (negeer ALLEEN ResourceNotFound op
+  #    de eerste run; echte fouten — IAM/throttle/netwerk — moeten zichtbaar zijn),
+  #    daarna toevoegen scoped op de rule-ARN (T-193-01, geen wildcard).
+  local rm_err
+  if ! rm_err="$(aws lambda remove-permission --function-name "$FUNCTION_NAME" --statement-id "$STATEMENT_ID" --region "$REGION" 2>&1)"; then
+    if ! printf '%s' "$rm_err" | grep -q "ResourceNotFoundException"; then
+      echo "FOUT bij remove-permission (geen ResourceNotFound): $rm_err" >&2
+      exit 1
+    fi
+  fi
   aws lambda add-permission \
     --function-name "$FUNCTION_NAME" \
     --statement-id "$STATEMENT_ID" \
@@ -125,15 +152,26 @@ apply() {
   #    JSON niet aan, dus we leveren het target als JSON via een tijdelijk file://-bestand.
   local targets_json
   targets_json="$(mktemp "${TMPDIR:-/tmp}/verifier-targets-XXXXXX.json")"
+  trap 'rm -f "${targets_json:-}"' EXIT   # ruim temp op, ook bij set -e abort
   cat >"$targets_json" <<JSON
 [{"Id":"${TARGET_ID}","Arn":"${FUNCTION_ARN}","Input":"{\"source\":\"scheduled\"}"}]
 JSON
-  aws events put-targets \
+  # put-targets geeft exit 0 ZELFS als targets niet registreren; de echte uitkomst zit
+  # in FailedEntryCount. Lees die expliciet en faal hard bij >0 (anders draait de cron
+  # door zonder target en blijven orders stil op `sent` hangen).
+  local failed
+  failed="$(aws events put-targets \
     --rule "$RULE_NAME" \
     --targets "file://${targets_json}" \
-    --region "$REGION" >/dev/null
-  rm -f "$targets_json"
-  echo "[3/5] put-targets OK — verifier gekoppeld met Input {\"source\":\"scheduled\"}."
+    --region "$REGION" \
+    --query FailedEntryCount --output text)"
+  rm -f "$targets_json"; trap - EXIT
+  if [ "$failed" != "0" ]; then
+    echo "FOUT: put-targets registreerde $failed target(s) NIET (FailedEntryCount=$failed)." >&2
+    echo "      Controleer FUNCTION_ARN/IAM; de cron is mogelijk niet aan de verifier gekoppeld." >&2
+    exit 1
+  fi
+  echo "[3/5] put-targets OK — verifier gekoppeld met Input {\"source\":\"scheduled\"} (FailedEntryCount=0)."
 
   # 4. Reserved concurrency = 1 (T-193-02; voorkomt overlappende runs).
   aws lambda put-function-concurrency \

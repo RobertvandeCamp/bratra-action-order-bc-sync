@@ -257,6 +257,24 @@ aws lambda get-function-configuration --function-name bratra-bc-sync-verifier --
 aws events describe-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
 ```
 
+### Rollback / emergency stop
+
+Reversible by default. Pausing the schedule (`disable`) only stops the cron — it leaves the
+reserved-concurrency cap and the raised timeout in place. To fully roll back the robustness
+settings (e.g. during an incident where a manual invoke must not be throttled to 1):
+
+```bash
+# Remove the reserved-concurrency cap (return the verifier to the account-wide pool)
+aws lambda delete-function-concurrency --function-name bratra-bc-sync-verifier --region eu-central-1
+
+# Restore the original timeout (60s)
+aws lambda update-function-configuration --function-name bratra-bc-sync-verifier --timeout 60 --region eu-central-1
+
+# Remove the cron rule entirely (first detach the target, then delete the rule)
+aws events remove-targets --rule bratra-bc-sync-verifier-schedule --ids verifier --region eu-central-1
+aws events delete-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
+```
+
 ## Related services
 
 | Service | Purpose |
