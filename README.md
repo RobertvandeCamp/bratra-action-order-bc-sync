@@ -161,6 +161,7 @@ CI/CD via GitHub Actions (`.github/workflows/build-test-deploy.yml`) — builds,
 | Lambda (dispatcher) | `bratra-bc-sync-dispatcher` |
 | Lambda (verifier) | `bratra-bc-sync-verifier` |
 | SQS trigger queue | `bc-sync-trigger` (+ `bc-sync-trigger-dlq`), event source mapping UUID `74760256-d580-4a6a-8de4-2d3d9c21ab8d` |
+| EventBridge rule (verifier cron) | `bratra-bc-sync-verifier-schedule` |
 | Execution role | `codaeva-lambda-execution-role` |
 | Region | `eu-central-1` |
 
@@ -208,6 +209,71 @@ aws lambda invoke --function-name bratra-bc-sync-dispatcher \
 ```
 
 (Any payload without an SQS `Records` array takes the ScheduledEvent path = full dispatch run.)
+
+## Verifier schedule (cron + reserved concurrency)
+
+The verifier (`bratra-bc-sync-verifier`) previously had **no active trigger** — orders sent to BC stayed stuck on `sent` because nothing checked the buffer. It now runs on an EventBridge rule `bratra-bc-sync-verifier-schedule` with cron `cron(0/15 6-16 ? * MON-FRI *)` (UTC): every 15 minutes, Mon–Fri, 06:00–16:45 UTC ≈ NL office hours (CET 07:00–17:45 / CEST 08:00–18:45). A classic UTC rule is sufficient; NL-timezone awareness (DST edges) is intentionally out of scope.
+
+Two robustness settings on the verifier Lambda:
+
+- **`reserved concurrency = 1`** — guarantees the cron run and any manual / `/verify` invocation never overlap on the destructive Service Bus error/DLQ reads (a second concurrent invoke is throttled).
+- **`timeout = 300s`** — a large batch of sequential BC GETs is not cut off halfway through.
+
+### Apply (idempotent recipe)
+
+The script `scripts/setup-verifier-schedule.sh` is the **single source of truth** for the AWS config (rule, permission, target, concurrency, timeout). It is idempotent and safe to re-run:
+
+```bash
+./scripts/setup-verifier-schedule.sh apply
+```
+
+The lambda permission uses statement-id `bratra-bc-sync-verifier-schedule-invoke` and is scoped **strictly to the rule ARN** (`arn:aws:events:eu-central-1:683001725253:rule/bratra-bc-sync-verifier-schedule`) — never a wildcard. The target passes Input `{"source":"scheduled"}` purely for log attribution (the handler ignores the event).
+
+### Enable / disable
+
+```bash
+# Pause the schedule (no ticks until re-enabled)
+aws events disable-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
+
+# Resume the schedule
+aws events enable-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
+```
+
+Or via the script: `./scripts/setup-verifier-schedule.sh disable` / `./scripts/setup-verifier-schedule.sh enable`.
+
+### Verify
+
+```bash
+# Recent verifier invocations (look for "Verifier handler invoked")
+aws logs tail /aws/lambda/bratra-bc-sync-verifier --region eu-central-1
+
+# Reserved concurrency (expect 1)
+aws lambda get-function-concurrency --function-name bratra-bc-sync-verifier --region eu-central-1
+
+# Timeout (expect 300)
+aws lambda get-function-configuration --function-name bratra-bc-sync-verifier --query Timeout --region eu-central-1
+
+# Rule state + schedule (expect ENABLED)
+aws events describe-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
+```
+
+### Rollback / emergency stop
+
+Reversible by default. Pausing the schedule (`disable`) only stops the cron — it leaves the
+reserved-concurrency cap and the raised timeout in place. To fully roll back the robustness
+settings (e.g. during an incident where a manual invoke must not be throttled to 1):
+
+```bash
+# Remove the reserved-concurrency cap (return the verifier to the account-wide pool)
+aws lambda delete-function-concurrency --function-name bratra-bc-sync-verifier --region eu-central-1
+
+# Restore the original timeout (60s)
+aws lambda update-function-configuration --function-name bratra-bc-sync-verifier --timeout 60 --region eu-central-1
+
+# Remove the cron rule entirely (first detach the target, then delete the rule)
+aws events remove-targets --rule bratra-bc-sync-verifier-schedule --ids verifier --region eu-central-1
+aws events delete-rule --name bratra-bc-sync-verifier-schedule --region eu-central-1
+```
 
 ## Related services
 
