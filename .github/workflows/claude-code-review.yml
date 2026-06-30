@@ -41,9 +41,12 @@ jobs:
             working directory. Follow REVIEW.md in the repo root and honor any
             CLAUDE.md conventions. Add inline comments on specific lines and use a
             top-level comment for the summary.
-          # Cost control (--max-turns) + tools needed to post comments.
-          # 15 was te laag: review liep dood op "Reached maximum number of turns (15)"
-          # (PR #10, 27 permission-denials). 40 geeft ruimte om de review af te ronden.
+          # Cost control (--max-turns) + tools needed to read code and post comments.
+          # Root cause van de turn-uitputting (PR #10 op 15 turns, PR #11 op 40 turns):
+          # de allowlist gaf GEEN leestoegang, dus de reviewer verbrandde turns op
+          # permission-denials (27 resp. 11) zonder de gewijzigde bestanden te kunnen
+          # lezen. Read-only lees-tools toegevoegd (Read/Grep/Glob/git diff) zodat de
+          # review de code kan inzien en ruim binnen de turn-limiet afrondt.
           claude_args: |
             --max-turns 40
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
