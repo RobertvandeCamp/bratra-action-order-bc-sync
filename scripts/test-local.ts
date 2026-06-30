@@ -18,6 +18,8 @@
 import * as dotenv from "dotenv";
 import { randomUUID } from "node:crypto";
 
+import { getConfig } from "../src/shared/config";
+
 dotenv.config({ path: ".env.local" });
 
 // ============================================================================
@@ -67,7 +69,13 @@ Examples:
 // ============================================================================
 
 function assertSandbox(): void {
-  const env = process.env.BC_ENVIRONMENT ?? "";
+  // Lees de GERESOLVETE BC-omgeving via getConfig() (na dotenv.config +
+  // APP_TARGET-resolver), niet langer rauw process.env.BC_ENVIRONMENT. Zo stopt
+  // de guard ook hard wanneer een prod-resolved env (bv. APP_TARGET=production)
+  // actief is -- de rauwe process.env.BC_ENVIRONMENT kan dan nog sandbox tonen
+  // terwijl de echte target production is. Default/sandbox resolvet naar
+  // "Sandbox*" en passeert.
+  const env = getConfig().BC_ENVIRONMENT;
   if (!env.startsWith("Sandbox")) {
     console.error("\n!!! SANDBOX GUARD: BC_ENVIRONMENT is niet sandbox !!!");
     console.error(`   BC_ENVIRONMENT = "${env}"`);
