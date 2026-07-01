@@ -823,8 +823,9 @@ async function errorQueuePeek(): Promise<void> {
  * 'bc_rejected' zet en de berichten daarna VERWIJDERT uit de queue.
  *
  * Print de meest recente geschreven archief-rijen + de ErrorQueueSummary, zodat
- * een sandbox-run end-to-end te verifieren is. Geen sandbox guard: raakt de queue
- * + DB, niet de BC API (mirror dlq/error-queue).
+ * een sandbox-run end-to-end te verifieren is. Harde assertSandbox()-guard omdat
+ * deze mode destructief is (archiveert + VERWIJDERT queue-berichten): sinds de
+ * APP_TARGET-resolver zou APP_TARGET=production anders de PROD-error-queue legen.
  */
 async function errorQueueProcess(): Promise<void> {
   // DESTRUCTIEF (consumeert/verwijdert queue-berichten): harde sandbox-guard.
