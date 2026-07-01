@@ -13,6 +13,7 @@ import {
   checkEnvelopeSize,
 } from "./envelope-mapper";
 import { sendToServiceBus } from "../shared/service-bus-client";
+import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import {
@@ -119,12 +120,15 @@ export const handler = async (
     companyId = COMPANY_ID;
   }
 
-  // D-01: Warn if BC_ENVIRONMENT is not sandbox
-  const bcEnv = process.env.BC_ENVIRONMENT ?? "";
-  if (!bcEnv.startsWith("Sandbox")) {
+  // D-01: Warn if the RESOLVED BC_ENVIRONMENT is not sandbox. Read it from
+  // getConfig() (APP_TARGET-resolver) instead of raw process.env.BC_ENVIRONMENT,
+  // so the warning reflects the real target after resolution -- mirrors
+  // verifier/handler.ts.
+  const config = getConfig();
+  if (!config.BC_ENVIRONMENT.startsWith("Sandbox")) {
     console.warn(
       "BC_ENVIRONMENT is not sandbox -- verify this is intentional",
-      { BC_ENVIRONMENT: bcEnv },
+      { BC_ENVIRONMENT: config.BC_ENVIRONMENT },
     );
   }
 

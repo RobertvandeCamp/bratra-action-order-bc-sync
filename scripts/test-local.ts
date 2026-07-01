@@ -18,6 +18,8 @@
 import * as dotenv from "dotenv";
 import { randomUUID } from "node:crypto";
 
+import { getConfig } from "../src/shared/config";
+
 dotenv.config({ path: ".env.local" });
 
 // ============================================================================
@@ -67,7 +69,13 @@ Examples:
 // ============================================================================
 
 function assertSandbox(): void {
-  const env = process.env.BC_ENVIRONMENT ?? "";
+  // Lees de GERESOLVETE BC-omgeving via getConfig() (na dotenv.config +
+  // APP_TARGET-resolver), niet langer rauw process.env.BC_ENVIRONMENT. Zo stopt
+  // de guard ook hard wanneer een prod-resolved env (bv. APP_TARGET=production)
+  // actief is -- de rauwe process.env.BC_ENVIRONMENT kan dan nog sandbox tonen
+  // terwijl de echte target production is. Default/sandbox resolvet naar
+  // "Sandbox*" en passeert.
+  const env = getConfig().BC_ENVIRONMENT;
   if (!env.startsWith("Sandbox")) {
     console.error("\n!!! SANDBOX GUARD: BC_ENVIRONMENT is niet sandbox !!!");
     console.error(`   BC_ENVIRONMENT = "${env}"`);
@@ -76,6 +84,23 @@ function assertSandbox(): void {
     process.exit(1);
   }
   console.log(`BC_ENVIRONMENT: ${env} (sandbox OK)`);
+}
+
+/**
+ * Zachte tegenhanger van assertSandbox() voor de read-only modes (dlq, error-queue,
+ * events): stopt NIET, maar waarschuwt luid wanneer de APP_TARGET-resolver een
+ * niet-sandbox (mogelijk productie) omgeving oplevert. Sinds de APP_TARGET-resolver
+ * (fase 201) schakelt EEN env-flip zowel de BC- als de SB-as naar prod; deze modes
+ * raken de (prod) Service Bus / Supabase read-only, dus een blokkade is te streng
+ * maar stille prod-toegang is ongewenst.
+ */
+function warnIfNotSandbox(mode: string): void {
+  const env = getConfig().BC_ENVIRONMENT;
+  if (!env.startsWith("Sandbox")) {
+    console.warn(`\n!!! WAARSCHUWING: APP_TARGET resolvet naar "${env}" (NIET sandbox) !!!`);
+    console.warn(`   Mode '${mode}' draait read-only tegen de GERESOLVETE omgeving (mogelijk PRODUCTIE).`);
+    console.warn(`   Zet APP_TARGET=sandbox (of laat leeg) als je dit niet bedoelde.\n`);
+  }
 }
 
 // ============================================================================
@@ -90,27 +115,27 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // DLQ mode: geen sandbox guard nodig (leest geen BC data)
+  // DLQ mode: read-only peek; warnIfNotSandbox() waarschuwt bij een prod-resolved env
+  // (de peek raakt de GERESOLVETE Service Bus sinds de APP_TARGET-resolver).
   if (mode === "dlq") {
     await dlqPeek();
     return;
   }
 
-  // Error-queue mode: read-only peek op bratra-error (geen sandbox guard)
+  // Error-queue mode: read-only peek; warnIfNotSandbox() waarschuwt bij prod-resolved env.
   if (mode === "error-queue") {
     await errorQueuePeek();
     return;
   }
 
-  // Error-queue-process mode: draai checkErrorQueue (consumeert/verwijdert berichten,
-  // geen sandbox guard -- raakt queue + DB, niet de BC API).
+  // Error-queue-process mode: DESTRUCTIEF (consumeert/verwijdert berichten + schrijft DB).
+  // Harde assertSandbox()-guard binnenin -- mag NOOIT tegen een prod-resolved queue draaien.
   if (mode === "error-queue-process") {
     await errorQueueProcess();
     return;
   }
 
-  // Events mode: read-only dump van de laatste bc_sync_events-rijen (geen sandbox
-  // guard -- raakt geen BC API; bewijst dat de events de INSERT + RLS + CHECK passeren).
+  // Events mode: read-only Supabase-dump; warnIfNotSandbox() waarschuwt bij prod-resolved env.
   if (mode === "events") {
     await eventsDump();
     return;
@@ -655,6 +680,7 @@ async function statusOverview(): Promise<void> {
 }
 
 async function dlqPeek(): Promise<void> {
+  warnIfNotSandbox("dlq");
   console.log("\n--- DLQ Peek: berichten in bratra-inbound/$DeadLetterQueue ---\n");
 
   const { getConfig } = await import("../src/shared/config");
@@ -714,6 +740,7 @@ async function dlqPeek(): Promise<void> {
  * Peek-lock zonder DELETE: berichten blijven in de queue (lock ~30s).
  */
 async function errorQueuePeek(): Promise<void> {
+  warnIfNotSandbox("error-queue");
   const { getConfig } = await import("../src/shared/config");
   const { generateSasToken } = await import("../src/shared/service-bus-client");
   const config = getConfig();
@@ -796,10 +823,15 @@ async function errorQueuePeek(): Promise<void> {
  * 'bc_rejected' zet en de berichten daarna VERWIJDERT uit de queue.
  *
  * Print de meest recente geschreven archief-rijen + de ErrorQueueSummary, zodat
- * een sandbox-run end-to-end te verifieren is. Geen sandbox guard: raakt de queue
- * + DB, niet de BC API (mirror dlq/error-queue).
+ * een sandbox-run end-to-end te verifieren is. Harde assertSandbox()-guard omdat
+ * deze mode destructief is (archiveert + VERWIJDERT queue-berichten): sinds de
+ * APP_TARGET-resolver zou APP_TARGET=production anders de PROD-error-queue legen.
  */
 async function errorQueueProcess(): Promise<void> {
+  // DESTRUCTIEF (consumeert/verwijdert queue-berichten): harde sandbox-guard.
+  // Sinds de APP_TARGET-resolver zou APP_TARGET=production hier de PROD-error-queue
+  // legen -- assertSandbox() stopt dat vóór enige queue/DB-mutatie.
+  assertSandbox();
   const { getConfig } = await import("../src/shared/config");
   const { getSupabaseClient } = await import("../src/shared/supabase-client");
   const { checkErrorQueue } = await import("../src/verifier/error-queue-checker");
@@ -860,6 +892,7 @@ async function errorQueueProcess(): Promise<void> {
  * maakt 'm zichtbaar). Wijzigt niets.
  */
 async function eventsDump(): Promise<void> {
+  warnIfNotSandbox("events");
   const { getSupabaseClient } = await import("../src/shared/supabase-client");
   const supabase = getSupabaseClient();
 

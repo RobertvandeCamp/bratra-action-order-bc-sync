@@ -153,6 +153,33 @@ CI/CD via GitHub Actions (`.github/workflows/build-test-deploy.yml`) — builds,
 | `BC_ENVIRONMENT` | BC environment name | `Sandbox_POC_20251229` |
 | `BC_COMPANY_ID` | BC company UUID | `4465...` |
 
+### Dual config-set & APP_TARGET
+
+One Docker image carries **both** Lambda functions — the **dispatcher** and the
+**verifier** — and `HANDLER` selects which one runs. Both functions therefore
+carry **both** config-sets: `SANDBOX_*` and `PROD_*`. The `APP_TARGET` variable
+(resolved in `src/shared/config.ts`, phase 201) switches across **two axes at
+once**:
+
+- **BC-API axis** — `BC_ENVIRONMENT`, `BC_COMPANY_ID`
+- **Service Bus axis** — `SB_NAMESPACE`, `SB_QUEUE`, `SB_KEY_*`, `SB_ERROR_*`
+
+| `APP_TARGET` | Resolves from | Notes |
+|--------------|---------------|-------|
+| `sandbox` | `SANDBOX_*` pairs | **Default. No flip.** |
+| `production` | `PROD_*` pairs | Only from phase 202 (verifier first) |
+| empty / unset | unprefixed legacy keys | Backward-compat path |
+
+The shared, environment-independent keys (`BC_TENANT_ID`, `BC_CLIENT_ID`,
+`BC_CLIENT_SECRET`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`) are **always**
+read unprefixed.
+
+The default stays **sandbox** — the production flip is deliberately deferred to
+phase 202 and applies to the verifier first. Secrets come from AWS Secrets
+Manager / the runtime environment and are **never committed**;
+`.env.local.example` holds placeholders only. See `.env.local.example` for the
+full SANDBOX/PROD contract.
+
 ## AWS resources
 
 | Resource | Name |
