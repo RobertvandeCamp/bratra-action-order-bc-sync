@@ -176,11 +176,3 @@ export function getConfig(): Config {
   }
   return cachedConfig;
 }
-
-/**
- * Reset de gecachte config. Uitsluitend voor test-teardown geexporteerd, zodat
- * elke testcase opnieuw resolvet onder een aangepaste process.env.
- */
-export function resetConfig(): void {
-  cachedConfig = undefined;
-}
