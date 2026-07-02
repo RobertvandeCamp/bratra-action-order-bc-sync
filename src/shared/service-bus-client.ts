@@ -42,6 +42,16 @@ export async function sendToServiceBus(
 
   const url = `https://${config.SB_NAMESPACE}.servicebus.windows.net/${config.SB_QUEUE}/messages`;
 
+  const body = JSON.stringify(envelope);
+
+  // TEMP DIAGNOSTIC (VERWIJDEREN na verificatie): log de exacte JSON-body die we
+  // naar BC/Service Bus POST'en. WARN-niveau zodat het gegarandeerd in CloudWatch
+  // verschijnt, ongeacht de ingestelde application-log-level. Bevat GEEN secrets:
+  // het SAS-token/de keys zitten in de Authorization-header, niet in deze body.
+  console.warn(
+    `[TEMP-BC-PAYLOAD] queue=${config.SB_QUEUE} messageId=${envelope.meta.messageId} legalEntity=${envelope.meta.legalEntity} body=${body}`,
+  );
+
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -53,7 +63,7 @@ export async function sendToServiceBus(
         Label: envelope.meta.name,
       }),
     },
-    body: JSON.stringify(envelope),
+    body,
   });
 
   if (response.status !== 201) {
