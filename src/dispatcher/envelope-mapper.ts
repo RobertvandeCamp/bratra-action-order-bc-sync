@@ -83,7 +83,6 @@ function mapOrder(o: WarehouseOrder): EnvelopeOrder {
   return {
     poNumber: o.po_number,
     orderType: o.order_type || "Regular order",
-    contractNumber: o.order_lines[0]?.contract_number || "",
     carrier: {
       code: o.carrier_code || "",
       name: o.carrier || "",
@@ -121,6 +120,9 @@ function mapOrderLine(
   return {
     // BC rejects lineNumber=0. Generate 10, 20, 30... if not set in DB.
     lineNumber: l.line_number ?? (index + 1) * 10,
+    // Contractnummer staat per order-regel in de bron en hoort op line-niveau in
+    // de envelope (ERP Company's buffer verwacht het hier, niet op de header).
+    contractNumber: l.contract_number || "",
     articleNumberAction: l.action_articles.article_number ?? "",
     articleNumberSupplier: l.bratra_articles?.article_number ?? "",
     articleDescription: l.action_articles.description ?? "",

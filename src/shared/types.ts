@@ -20,7 +20,6 @@ export interface ActionOrderBatchV1Envelope {
 export interface EnvelopeOrder {
   poNumber: string;
   orderType: string;
-  contractNumber: string;
   carrier: { code: string; name: string };
   distributionCenter: { code: string; name: string; unloadingLocation: string };
   dates: {
@@ -45,6 +44,7 @@ export interface EnvelopeOrder {
 
 export interface EnvelopeOrderLine {
   lineNumber: number;
+  contractNumber: string;
   articleNumberAction: string | null;
   articleNumberSupplier: string | null;
   articleDescription: string | null;
