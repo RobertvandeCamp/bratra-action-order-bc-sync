@@ -2,8 +2,33 @@ import { describe, it, expect } from "vitest";
 import {
   determineLegalEntity,
   groupOrdersIntoBatches,
+  mapOrdersToEnvelope,
 } from "./envelope-mapper";
-import type { WarehouseOrder } from "../shared/types";
+import type { WarehouseOrder, WarehouseOrderLine } from "../shared/types";
+
+/** Minimale geldige WarehouseOrderLine-stub; override per test via `over`. */
+function makeLine(over: Partial<WarehouseOrderLine>): WarehouseOrderLine {
+  return {
+    id: 1,
+    line_number: 10,
+    contract_number: null,
+    req_quantity: 1,
+    exp_quantity: null,
+    price: 0,
+    pallet_pattern: null,
+    pallets: null,
+    category: null,
+    unit_price_currency: null,
+    allocation: null,
+    hazardous_goods: null,
+    adr: null,
+    icpe: null,
+    logistic_group: null,
+    action_articles: { article_number: "A1", description: null },
+    bratra_articles: null,
+    ...over,
+  } as WarehouseOrderLine;
+}
 
 /** Minimale geldige WarehouseOrder-stub; override per test via `over`. */
 function makeOrder(over: Partial<WarehouseOrder>): WarehouseOrder {
@@ -59,6 +84,42 @@ describe("determineLegalEntity (SEG-03 / D-02 / D-04)", () => {
     expect(() =>
       determineLegalEntity(makeOrder({ business_unit: "xxx" as never })),
     ).toThrow();
+  });
+});
+
+describe("mapOrdersToEnvelope — contractNumber op line-niveau", () => {
+  const opts = {
+    messageId: "m1",
+    correlationId: "c1",
+    legalEntity: "BRATRA-NL",
+  };
+
+  it("zet elk regel-contractnummer op de betreffende line (behoudt verschillen)", () => {
+    const order = makeOrder({
+      order_lines: [
+        makeLine({ id: 1, line_number: 10, contract_number: "C-100" }),
+        makeLine({ id: 2, line_number: 20, contract_number: "C-200" }),
+      ],
+    });
+    const lines = mapOrdersToEnvelope([order], opts).payload.orders[0].lines;
+    expect(lines[0].contractNumber).toBe("C-100");
+    expect(lines[1].contractNumber).toBe("C-200");
+  });
+
+  it("valt terug op lege string bij ontbrekend contractnummer", () => {
+    const order = makeOrder({
+      order_lines: [makeLine({ contract_number: null })],
+    });
+    const env = mapOrdersToEnvelope([order], opts);
+    expect(env.payload.orders[0].lines[0].contractNumber).toBe("");
+  });
+
+  it("stuurt GEEN contractNumber meer op header/order-niveau", () => {
+    const order = makeOrder({
+      order_lines: [makeLine({ contract_number: "C-1" })],
+    });
+    const env = mapOrdersToEnvelope([order], opts);
+    expect(env.payload.orders[0]).not.toHaveProperty("contractNumber");
   });
 });
 
