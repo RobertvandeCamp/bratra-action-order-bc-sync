@@ -1,5 +1,6 @@
 import type { SQSEvent, SQSRecord, ScheduledEvent, Context } from "aws-lambda";
 import { randomUUID } from "node:crypto";
+import type { Logger } from "pino";
 
 import {
   fetchUnsyncedOrders,
@@ -16,6 +17,7 @@ import { sendToServiceBus } from "../shared/service-bus-client";
 import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
+import { logger, createRunLogger } from "../shared/logger";
 import {
   buildDispatchedEvent,
   buildSentEvent,
@@ -53,21 +55,28 @@ function isSqsEvent(event: DispatcherEvent): event is SQSEvent {
   return "Records" in event && Array.isArray((event as SQSEvent).Records);
 }
 
-/** Extract and validate companyId from SQS message body (T-152.2-02) */
-function extractCompanyId(record: SQSRecord): number | null {
+/**
+ * Extract and validate companyId + traceId from SQS message body (T-152.2-02 / TRACE-04).
+ *
+ * Returns `null` on parse error or invalid companyId (caller deletes from queue).
+ * traceId is returned as-is if present and non-empty; empty string otherwise (caller
+ * falls back to context.awsRequestId at the call-site).
+ */
+export function extractSqsContext(record: SQSRecord): { companyId: number; traceId: string } | null {
   try {
     const body = JSON.parse(record.body) as Partial<SqsTriggerMessage>;
-    const { companyId } = body;
+    const { companyId, traceId } = body;
     if (typeof companyId !== "number" || !Number.isFinite(companyId)) {
-      console.error("Invalid companyId in SQS body", { body: record.body });
+      logger.error({ body: record.body }, "Invalid companyId in SQS body");
       return null;
     }
-    return companyId;
+    return {
+      companyId,
+      // Fallback: awsRequestId (ingevuld door caller voor zowel SQS als scheduled)
+      traceId: typeof traceId === "string" && traceId.length > 0 ? traceId : "",
+    };
   } catch (err) {
-    console.error("Failed to parse SQS body", {
-      body: record.body,
-      error: (err as Error).message,
-    });
+    logger.error({ body: record.body, error: (err as Error).message }, "Failed to parse SQS body");
     return null;
   }
 }
@@ -96,29 +105,33 @@ export const handler = async (
 ): Promise<void> => {
   // Dual-trigger: detect SQS vs ScheduledEvent (D-10)
   let companyId: number;
+  let traceId: string;
 
   if (isSqsEvent(event)) {
-    // SQS trigger path: extract companyId from message body (D-11)
+    // SQS trigger path: extract companyId + traceId from message body (D-11 / TRACE-04)
     const record = event.Records[0]; // batch_size=1 per D-12
-    console.log("Dispatcher handler invoked (SQS trigger)", {
-      requestId: context.awsRequestId,
-      sqsMessageId: record.messageId,
-    });
-
-    const extractedId = extractCompanyId(record);
-    if (extractedId === null) {
+    const extracted = extractSqsContext(record);
+    if (extracted === null) {
       // Invalid message -- return success to delete from queue (avoid DLQ pollution)
-      console.error("Skipping invalid SQS message");
+      logger.error("Skipping invalid SQS message");
       return;
     }
-    companyId = extractedId;
+    companyId = extracted.companyId;
+    traceId = extracted.traceId || context.awsRequestId; // fallback to awsRequestId (TRACE-04)
   } else {
     // ScheduledEvent / manual invoke path (existing behavior)
-    console.log("Dispatcher handler invoked (scheduled trigger)", {
-      requestId: context.awsRequestId,
-    });
     companyId = COMPANY_ID;
+    traceId = context.awsRequestId; // altijd awsRequestId op scheduled/manual pad (TRACE-04)
   }
+
+  // Run-logger: gebonden aan deze invocatie (traceId, requestId, trigger, companyId)
+  const runLogger = createRunLogger({
+    traceId,
+    requestId: context.awsRequestId,
+    trigger: isSqsEvent(event) ? "sqs" : "scheduled",
+    companyId,
+  });
+  runLogger.info("Dispatcher handler invoked");
 
   // D-01: Warn if the RESOLVED BC_ENVIRONMENT is not sandbox. Read it from
   // getConfig() (APP_TARGET-resolver) instead of raw process.env.BC_ENVIRONMENT,
@@ -140,7 +153,7 @@ export const handler = async (
   const dispatchedIdByOrderId = new Map<number, DispatchedIdentity>();
 
   // 0. Recover orphaned 'pending' records from Lambda crash/timeout (> 5 min old)
-  await recoverStalePendingRecords(companyId);
+  await recoverStalePendingRecords(companyId, traceId, runLogger);
 
   // 1. Fetch new unsync'd orders
   const newOrders = await fetchUnsyncedOrders(companyId);
@@ -276,7 +289,7 @@ export const handler = async (
                   company_id: order.company_id,
                   po_number: order.po_number,
                 },
-                { batchId, messageId, correlationId },
+                { batchId, messageId, correlationId, traceId },
               ),
             );
           }
@@ -305,7 +318,7 @@ export const handler = async (
             orderCount: batch.orders.length,
           });
           // Fallback: send each order individually
-          await sendOrdersOneByOne(claimedOrders, batchId, batch.legalEntity, supabase, summary, dispatchedIdByOrderId);
+          await sendOrdersOneByOne(claimedOrders, batchId, batch.legalEntity, supabase, summary, dispatchedIdByOrderId, false, traceId, runLogger);
           summary.batchesProcessed++;
           continue;
         }
@@ -328,7 +341,7 @@ export const handler = async (
             batchId, error: updateError.message,
           });
           // D-06 edge: `.select()` gaf niets -> val terug op de in-memory map.
-          const ctx: DispatchContext = { batchId, messageId, correlationId };
+          const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
           const fallbackEvents: BcSyncEventInsert[] = [];
           for (const o of claimedOrders) {
             const ident = dispatchedIdByOrderId.get(o.id);
@@ -342,7 +355,7 @@ export const handler = async (
           }
           await logSyncEvent(supabase, fallbackEvents);
         } else {
-          const ctx: DispatchContext = { batchId, messageId, correlationId };
+          const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
           const sentEvents = (sentRows ?? []).map((r) => buildSentEvent(r, ctx));
           await logSyncEvent(supabase, sentEvents);
         }
@@ -375,7 +388,7 @@ export const handler = async (
           });
         } else {
           const sendFailedEvents = (failedRows ?? []).map((r) =>
-            buildSendFailedEvent(r, batchId, errorMessage),
+            buildSendFailedEvent(r, batchId, errorMessage, traceId),
           );
           await logSyncEvent(supabase, sendFailedEvents);
         }
@@ -608,7 +621,7 @@ export const handler = async (
                   po_number: order.po_number,
                   retry_count: newRetryCount,
                 },
-                { batchId, messageId, correlationId },
+                { batchId, messageId, correlationId, traceId },
               ),
             ]);
           }
@@ -638,6 +651,8 @@ export const handler = async (
               summary,
               dispatchedIdByOrderId,
               true, // re-dispatch: keep stable external_id, unique per-send messageId
+              traceId,
+              runLogger,
             );
             summary.retriedOrders += resetOrders.length;
             summary.batchesProcessed++;
@@ -659,7 +674,7 @@ export const handler = async (
               batchId, error: sentError.message,
             });
             // D-06 edge (re-dispatch): val terug op de in-memory map.
-            const ctx: DispatchContext = { batchId, messageId, correlationId };
+            const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
             const fallbackEvents: BcSyncEventInsert[] = [];
             for (const o of resetOrders) {
               const ident = dispatchedIdByOrderId.get(o.id);
@@ -673,7 +688,7 @@ export const handler = async (
             }
             await logSyncEvent(supabase, fallbackEvents);
           } else {
-            const ctx: DispatchContext = { batchId, messageId, correlationId };
+            const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
             const sentEvents = (redispatchSentRows ?? []).map((r) => buildSentEvent(r, ctx));
             await logSyncEvent(supabase, sentEvents);
           }
@@ -707,7 +722,7 @@ export const handler = async (
             });
           } else {
             const sendFailedEvents = (redispatchFailedRows ?? []).map((r) =>
-              buildSendFailedEvent(r, batchId, errorMessage),
+              buildSendFailedEvent(r, batchId, errorMessage, traceId),
             );
             await logSyncEvent(supabase, sendFailedEvents);
           }
@@ -746,6 +761,8 @@ async function sendOrdersOneByOne(
   // row's external_id must be left untouched. The NEW path omits it and gets a
   // fresh single-send external_id as before.
   isRedispatch = false,
+  traceId: string,
+  runLogger: Logger,
 ): Promise<void> {
   for (const order of orders) {
     // BUGFIX (Duplicate Service Bus message IDs): every individual send MUST get
@@ -785,7 +802,7 @@ async function sendOrdersOneByOne(
           .select("id, order_id, company_id, po_number, retry_count");
 
         const oversizedEvents = (oversizedRows ?? []).map((r) =>
-          buildSendFailedEvent(r, originalBatchId, oversizedMessage),
+          buildSendFailedEvent(r, originalBatchId, oversizedMessage, traceId),
         );
         await logSyncEvent(supabase, oversizedEvents);
 
@@ -835,6 +852,7 @@ async function sendOrdersOneByOne(
           batchId: originalBatchId,
           messageId: singleMessageId,
           correlationId: singleCorrelationId,
+          traceId,
         };
         const ident = dispatchedIdByOrderId.get(order.id);
         if (ident) {
@@ -850,6 +868,7 @@ async function sendOrdersOneByOne(
           batchId: originalBatchId,
           messageId: singleMessageId,
           correlationId: singleCorrelationId,
+          traceId,
         };
         const sentEvents = (singleSentRows ?? []).map((r) => buildSentEvent(r, singleCtx));
         await logSyncEvent(supabase, sentEvents);
@@ -875,7 +894,7 @@ async function sendOrdersOneByOne(
         .select("id, order_id, company_id, po_number, retry_count");
 
       const singleFailedEvents = (singleFailedRows ?? []).map((r) =>
-        buildSendFailedEvent(r, originalBatchId, singleErrorMessage),
+        buildSendFailedEvent(r, originalBatchId, singleErrorMessage, traceId),
       );
       await logSyncEvent(supabase, singleFailedEvents);
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { SQSRecord } from "aws-lambda";
 
 import type { BcSyncEventInsert, BcSyncEventType } from "../shared/types";
 import {
@@ -12,6 +13,7 @@ import {
   type DispatchedRow,
   type SyncOrderRow,
 } from "./event-builders";
+import { extractSqsContext } from "./handler";
 
 // ============================================================================
 // Per-transition event-builder tests (fase 185, TRACE-01).
@@ -234,5 +236,50 @@ describe("buildStaleRecoveredEvent", () => {
       "trace-abc",
     );
     expect((event.detail as Record<string, unknown>).age_min).toBeNull();
+  });
+});
+
+// ============================================================================
+// extractSqsContext — traceId extractie + fallback (fase 207-02, TRACE-04)
+// ============================================================================
+
+describe("extractSqsContext", () => {
+  it("extraheert traceId uit de SQS body als het aanwezig is", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2, traceId: "abc-123" }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result).not.toBeNull();
+    expect(result?.companyId).toBe(2);
+    expect(result?.traceId).toBe("abc-123");
+  });
+
+  it("valt terug op lege string als traceId ontbreekt in de body", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2 }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result).not.toBeNull();
+    expect(result?.traceId).toBe("");
+  });
+
+  it("valt terug op lege string als traceId een lege string is", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2, traceId: "" }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result?.traceId).toBe("");
+  });
+
+  it("retourneert null bij ontbrekende of ongeldige companyId", () => {
+    const record = {
+      body: JSON.stringify({ companyId: "invalid", traceId: "abc" }),
+    } as SQSRecord;
+    expect(extractSqsContext(record)).toBeNull();
+  });
+
+  it("retourneert null bij een ongeldig JSON-body", () => {
+    const record = { body: "not json" } as SQSRecord;
+    expect(extractSqsContext(record)).toBeNull();
   });
 });

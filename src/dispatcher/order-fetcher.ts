@@ -1,3 +1,5 @@
+import type { Logger } from "pino";
+
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import { fetchAllPages } from "../shared/paginate";
@@ -194,6 +196,8 @@ export async function fetchFailedSyncRecords(
  */
 export async function recoverStalePendingRecords(
   companyId: number,
+  traceId: string,
+  runLogger: Logger,
 ): Promise<number> {
   const supabase = getSupabaseClient();
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
@@ -237,6 +241,7 @@ export async function recoverStalePendingRecords(
         },
         staleReason,
         ageMin,
+        traceId,
       );
     });
     await logSyncEvent(supabase, events);
