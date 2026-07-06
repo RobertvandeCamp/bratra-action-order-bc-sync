@@ -18,6 +18,9 @@ import { z } from "zod";
  */
 const configSchema = z
   .object({
+    LOG_LEVEL: z
+      .enum(["trace", "debug", "info", "warn", "error", "fatal"])
+      .default("info"),
     SUPABASE_URL: z.string().url(),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
     SB_NAMESPACE: z.string().min(1),
@@ -57,6 +60,13 @@ const configSchema = z
   });
 
 export type Config = z.infer<typeof configSchema>;
+
+/**
+ * Shared fetch-timeout voor BC- en Service Bus-fetches (D-01 / RES-01).
+ * 30 seconden — ruim onder de 60s dispatcher-timeout en 300s verifier-timeout.
+ * AbortSignal.timeout(FETCH_TIMEOUT_MS) is native Node 18+; geen polyfill nodig.
+ */
+export const FETCH_TIMEOUT_MS = 30_000;
 
 /**
  * APP_TARGET selecteert welke omgeving wordt geresolved over BEIDE assen:
@@ -167,6 +177,7 @@ export function getConfig(): Config {
     cachedConfig = configSchema.parse({
       ...resolved,
       // Gedeelde keys ALTIJD ongeprefixt (omgeving-onafhankelijk).
+      LOG_LEVEL: process.env.LOG_LEVEL,
       BC_TENANT_ID: process.env.BC_TENANT_ID,
       BC_CLIENT_ID: process.env.BC_CLIENT_ID,
       BC_CLIENT_SECRET: process.env.BC_CLIENT_SECRET,
