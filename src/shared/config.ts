@@ -16,11 +16,13 @@ import { z } from "zod";
  * enkele consumer (service-bus-client, supabase-client, dispatcher/verifier)
  * breekt.
  */
+// LOG_LEVEL staat hier BEWUST NIET in: de logger moet ook bestaan wanneer
+// config-validatie faalt (kip-ei bij startup-fouten), dus logger.ts leest en
+// valideert LOG_LEVEL zelf met fallback "info" (round 2 F3). Een tweede
+// schema-entry hier zou dode validatie zijn -- niemand consumeert
+// config.LOG_LEVEL.
 const configSchema = z
   .object({
-    LOG_LEVEL: z
-      .enum(["trace", "debug", "info", "warn", "error", "fatal"])
-      .default("info"),
     SUPABASE_URL: z.string().url(),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
     SB_NAMESPACE: z.string().min(1),
@@ -177,7 +179,7 @@ export function getConfig(): Config {
     cachedConfig = configSchema.parse({
       ...resolved,
       // Gedeelde keys ALTIJD ongeprefixt (omgeving-onafhankelijk).
-      LOG_LEVEL: process.env.LOG_LEVEL,
+      // LOG_LEVEL bewust afwezig: die valideert logger.ts zelf (zie schema-comment).
       BC_TENANT_ID: process.env.BC_TENANT_ID,
       BC_CLIENT_ID: process.env.BC_CLIENT_ID,
       BC_CLIENT_SECRET: process.env.BC_CLIENT_SECRET,

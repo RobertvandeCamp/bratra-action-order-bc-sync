@@ -13,8 +13,19 @@ const SERVICE = process.env.HANDLER ?? "bc-sync";
 // env afgeleid van APP_TARGET (production/sandbox/legacy)
 const ENV = process.env.APP_TARGET?.trim() || "legacy";
 
+// LOG_LEVEL wordt hier BEWUST raw uit process.env gelezen en lokaal
+// gevalideerd, NIET via getConfig(): de logger moet ook bestaan wanneer
+// config-validatie faalt (kip-ei bij startup-fouten). Round 2 F3: een
+// ongeldige waarde valt terug op "info" i.p.v. pino te laten crashen bij
+// module-import. Dit is de ENIGE plek die LOG_LEVEL valideert (config.ts
+// bevat er bewust géén tweede, dode schema-entry voor).
+const PINO_LEVELS = new Set(["trace", "debug", "info", "warn", "error", "fatal"]);
+const rawLogLevel = process.env.LOG_LEVEL;
+const LOG_LEVEL =
+  rawLogLevel !== undefined && PINO_LEVELS.has(rawLogLevel) ? rawLogLevel : "info";
+
 export const logger = pino({
-  level: process.env.LOG_LEVEL ?? "info",
+  level: LOG_LEVEL,
   base: {
     service: SERVICE,
     env: ENV,
