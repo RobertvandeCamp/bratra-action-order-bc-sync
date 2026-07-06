@@ -43,7 +43,10 @@ export const handler = async (
   // één keer emitted (ook bij een crash) — D-07/D-09.
   let errorQueueSummary: ErrorQueueSummary | null = null;
   let bufferSummary: VerifySummary | null = null;
-  let bufferNote = "no sent orders";
+  // "not reached" tot het expliciete no-sent-orders-pad (WR-02): bij een crash
+  // vóór de sent-orders-query mag de summary niet suggereren dat er geen
+  // sent orders waren.
+  let bufferNote = "not reached";
   let dlqSummary: DlqSummary | null = null;
   let verifyStatus: "ok" | "failed" = "ok";
 
@@ -68,6 +71,10 @@ export const handler = async (
     try {
       errorQueueSummary = await checkErrorQueue(supabase, runLogger);
     } catch (err) {
+      // Non-fatal voor de run, maar WEL een failed-signaal in verify.summary:
+      // een checker die volledig faalt (verkeerde queue-naam, ongeldige SAS)
+      // mag niet eeuwig status "ok" rapporteren (WR-02, spiegelt dispatch.summary).
+      verifyStatus = "failed";
       runLogger.error({ error: (err as Error).message }, "Error-queue check failed (non-fatal)");
     }
 
@@ -107,6 +114,7 @@ export const handler = async (
         "Buffer check deferred: error-queue left unprocessed messages this run (errors > 0) -- skipping to avoid mislabeling a pending bc_rejected order as dead_letter",
       );
     } else if (!sentOrders || sentOrders.length === 0) {
+      bufferNote = "no sent orders";
       runLogger.info("No sent orders to verify");
     } else {
       runLogger.info({ count: sentOrders.length }, "Sent orders to verify");
@@ -129,6 +137,8 @@ export const handler = async (
     try {
       dlqSummary = await checkDlqMessages(supabase, runLogger);
     } catch (err) {
+      // Zelfde WR-02-semantiek als de error-queue-check hierboven.
+      verifyStatus = "failed";
       runLogger.error({ error: (err as Error).message }, "DLQ check failed (non-fatal)");
     }
   } catch (err) {
@@ -138,9 +148,17 @@ export const handler = async (
     // 9. Eén gegarandeerd verify.summary-event per run (D-07/D-08/D-09).
     // Nestels per checker (buffer/dlq/errorQueue) + durationMs + status.
     // Wordt ALLEEN als CloudWatch-logregel geschreven (niet naar bc_sync_events).
+    // WR-02: status ook "failed" bij per-item errors in de checker-summaries
+    // (spiegelt dispatch.summary, waar één failed order al status "failed" geeft)
+    // — anders missen alarmen op verify.summary.status elke persistente
+    // partiële failure.
+    const checkerErrors =
+      (bufferSummary?.errors ?? 0) +
+      (dlqSummary?.errors ?? 0) +
+      (errorQueueSummary?.errors ?? 0);
     runLogger.info({
       event: "verify.summary",
-      status: verifyStatus,
+      status: verifyStatus === "failed" || checkerErrors > 0 ? "failed" : "ok",
       durationMs: Date.now() - startMs,
       buffer: bufferSummary ?? bufferNote,
       dlq: dlqSummary ?? "skipped (error)",
