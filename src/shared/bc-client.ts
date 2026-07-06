@@ -1,3 +1,5 @@
+import type { Logger } from "pino";
+import { FETCH_TIMEOUT_MS } from "./config";
 import type { BCListResponse, BcGetOptions, BCConfig } from "./types";
 
 export interface Company {
@@ -12,14 +14,17 @@ function getBaseUrl(config: BCConfig, apiRoute = "api/v2.0"): string {
 /**
  * Internal: fetch with retry on HTTP 429 (rate limit).
  * Respects Retry-After header if present, falls back to exponential backoff.
+ * Aborts after FETCH_TIMEOUT_MS (30s) via AbortSignal.timeout — RES-01/D-01.
  */
 async function fetchWithRetry(
   url: string,
   token: string,
   maxRetries = 3,
+  logger?: Logger,
 ): Promise<Response> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(url, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: "application/json",
@@ -68,13 +73,14 @@ export async function bcGet<T = Record<string, unknown>>(
   config: BCConfig,
   endpoint: string,
   options?: BcGetOptions,
+  logger?: Logger,
 ): Promise<BCListResponse<T>> {
   const { paginate = true, maxPages = 10, apiRoute } = options ?? {};
   const baseUrl = getBaseUrl(config, apiRoute);
   const isFullUrl = endpoint.startsWith("https://");
   const url = isFullUrl ? endpoint : `${baseUrl}/${endpoint}`;
 
-  const response = await fetchWithRetry(url, token);
+  const response = await fetchWithRetry(url, token, 3, logger);
   const data = (await response.json()) as BCListResponse<T>;
 
   if (!paginate || !data["@odata.nextLink"]) {
@@ -87,7 +93,7 @@ export async function bcGet<T = Record<string, unknown>>(
   let pageCount = 1;
 
   while (nextUrl && pageCount < maxPages) {
-    const nextResponse = await fetchWithRetry(nextUrl, token);
+    const nextResponse = await fetchWithRetry(nextUrl, token, 3, logger);
     const nextData = (await nextResponse.json()) as BCListResponse<T>;
     allValues.push(...(nextData.value ?? []));
     nextUrl = nextData["@odata.nextLink"];
