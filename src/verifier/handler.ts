@@ -1,6 +1,7 @@
 import type { ScheduledEvent, Context } from "aws-lambda";
 
 import { getConfig } from "../shared/config";
+import { logger } from "../shared/logger";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { fetchAllPages } from "../shared/paginate";
@@ -106,7 +107,7 @@ export const handler = async (
     };
 
     // 7. Check buffer statuses
-    bufferSummary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase);
+    bufferSummary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase, logger);
   }
 
   // 8. DLQ check (non-fatal, always runs -- D-09)

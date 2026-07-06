@@ -1,3 +1,5 @@
+import type { Logger } from "pino";
+
 import { bcGet } from "../shared/bc-client";
 import { logSyncEvent } from "../shared/event-logger";
 import type {
@@ -64,6 +66,7 @@ export async function checkBufferStatuses(
   token: string,
   bcConfig: BCConfig,
   supabase: ReturnType<typeof getSupabaseClient>,
+  logger: Logger,
 ): Promise<VerifySummary> {
   const summary: VerifySummary = {
     verified: 0,
@@ -101,7 +104,7 @@ export async function checkBufferStatuses(
             }),
           );
         } else summary.errors++;
-        console.warn("Order dead-lettered: no external_id", { orderId: order.id });
+        logger.warn({ orderId: order.id }, "Order dead-lettered: no external_id");
         continue;
       }
 
@@ -111,7 +114,7 @@ export async function checkBufferStatuses(
       const result = await bcGet<BcBufferRecord>(token, bcConfig, endpoint, {
         paginate: false,
         apiRoute: "api/erpcompany/integration/v1.0",
-      });
+      }, logger);
 
       // D-10: Not found -- buffer not yet arrived at BC
       if (!result.value || result.value.length === 0) {
@@ -130,9 +133,7 @@ export async function checkBufferStatuses(
             })
             .eq("id", order.id);
           if (agingError) {
-            console.error("Failed to dead-letter aged not-found order", {
-              orderId: order.id, error: agingError.message,
-            });
+            logger.error({ orderId: order.id, error: agingError.message }, "Failed to dead-letter aged not-found order");
             summary.errors++;
           } else {
             summary.deadLetter++;
@@ -143,15 +144,10 @@ export async function checkBufferStatuses(
                 age_min: Math.round(sentAge / 60000),
               }),
             );
-            console.warn("Order dead-lettered (not found in BC after 1h)", {
-              orderId: order.id, externalId: order.external_id,
-              sentAgeMin: Math.round(sentAge / 60000), action: "dead_letter",
-            });
+            logger.warn({ orderId: order.id, externalId: order.external_id, sentAgeMin: Math.round(sentAge / 60000), action: "dead_letter" }, "Order dead-lettered (not found in BC after 1h)");
           }
         } else {
-          console.log("Buffer not found in BC", {
-            orderId: order.id, externalId: order.external_id, action: "not_found",
-          });
+          logger.debug({ orderId: order.id, externalId: order.external_id, action: "not_found" }, "Buffer not found in BC");
           summary.notFound++;
         }
         continue;
@@ -178,9 +174,7 @@ export async function checkBufferStatuses(
             })
             .eq("id", order.id);
           if (verifyError) {
-            console.error("Failed to update order to verified", {
-              orderId: order.id, error: verifyError.message,
-            });
+            logger.error({ orderId: order.id, error: verifyError.message }, "Failed to update order to verified");
             summary.errors++;
             break;
           }
@@ -191,13 +185,7 @@ export async function checkBufferStatuses(
               bc_buffer_status: buffer.status,
             }),
           );
-          console.log("Order verified", {
-            orderId: order.id,
-            externalId: order.external_id,
-            bcBufferStatus: buffer.status,
-            bcDocumentNo: buffer.createdDocumentNo,
-            action: "verified",
-          });
+          logger.info({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status, bcDocumentNo: buffer.createdDocumentNo, action: "verified" }, "Order verified");
           break;
         }
 
@@ -217,9 +205,7 @@ export async function checkBufferStatuses(
               })
               .eq("id", order.id);
             if (retryError) {
-              console.error("Failed to update order for retry", {
-                orderId: order.id, error: retryError.message,
-              });
+              logger.error({ orderId: order.id, error: retryError.message }, "Failed to update order for retry");
               summary.errors++;
               break;
             }
@@ -232,14 +218,7 @@ export async function checkBufferStatuses(
                 bc_buffer_status: buffer.status,
               }),
             );
-            console.log("Order retried", {
-              orderId: order.id,
-              externalId: order.external_id,
-              bcBufferStatus: buffer.status,
-              retryCount: order.retry_count + 1,
-              maxRetries: order.max_retries,
-              action: "retried",
-            });
+            logger.debug({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status, retryCount: order.retry_count + 1, maxRetries: order.max_retries, action: "retried" }, "Order retried");
           } else {
             const { error: dlError } = await supabase
               .from("bc_sync_orders")
@@ -251,9 +230,7 @@ export async function checkBufferStatuses(
               })
               .eq("id", order.id);
             if (dlError) {
-              console.error("Failed to update order to dead_letter", {
-                orderId: order.id, error: dlError.message,
-              });
+              logger.error({ orderId: order.id, error: dlError.message }, "Failed to update order to dead_letter");
               summary.errors++;
               break;
             }
@@ -265,13 +242,7 @@ export async function checkBufferStatuses(
                 error_message: buffer.errorMessage,
               }),
             );
-            console.log("Order dead-lettered", {
-              orderId: order.id,
-              externalId: order.external_id,
-              bcBufferStatus: buffer.status,
-              bcErrorMessage: buffer.errorMessage,
-              action: "dead_letter",
-            });
+            logger.info({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status, bcErrorMessage: buffer.errorMessage, action: "dead_letter" }, "Order dead-lettered");
           }
           break;
         }
@@ -280,20 +251,10 @@ export async function checkBufferStatuses(
         case "Pending":
         case "Processing": {
           if (sentAge > tenMinutes) {
-            console.warn("BC processing taking long", {
-              orderId: order.id,
-              externalId: order.external_id,
-              sentAgeMin: Math.round(sentAge / 60000),
-              bcStatus: buffer.status,
-            });
+            logger.warn({ orderId: order.id, externalId: order.external_id, sentAgeMin: Math.round(sentAge / 60000), bcStatus: buffer.status }, "BC processing taking long");
           }
           summary.pending++;
-          console.log("Order still processing in BC", {
-            orderId: order.id,
-            externalId: order.external_id,
-            bcBufferStatus: buffer.status,
-            action: "pending",
-          });
+          logger.debug({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status, action: "pending" }, "Order still processing in BC");
           break;
         }
 
@@ -309,9 +270,7 @@ export async function checkBufferStatuses(
             })
             .eq("id", order.id);
           if (cancelError) {
-            console.error("Failed to update cancelled order to dead_letter", {
-              orderId: order.id, error: cancelError.message,
-            });
+            logger.error({ orderId: order.id, error: cancelError.message }, "Failed to update cancelled order to dead_letter");
             summary.errors++;
             break;
           }
@@ -322,30 +281,18 @@ export async function checkBufferStatuses(
               bc_buffer_status: "Cancelled",
             }),
           );
-          console.log("Order cancelled in BC", {
-            orderId: order.id,
-            externalId: order.external_id,
-            bcBufferStatus: buffer.status,
-            action: "dead_letter",
-          });
+          logger.info({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status, action: "dead_letter" }, "Order cancelled in BC");
           break;
         }
 
         default: {
-          console.warn("Unknown BC buffer status", {
-            orderId: order.id,
-            externalId: order.external_id,
-            bcBufferStatus: buffer.status,
-          });
+          logger.warn({ orderId: order.id, externalId: order.external_id, bcBufferStatus: buffer.status }, "Unknown BC buffer status");
           summary.errors++;
           break;
         }
       }
     } catch (err) {
-      console.error("Error checking buffer for order", {
-        orderId: order.id,
-        error: (err as Error).message,
-      });
+      logger.error({ orderId: order.id, error: (err as Error).message }, "Error checking buffer for order");
       summary.errors++;
     }
   }

@@ -302,7 +302,8 @@ async function main(): Promise<void> {
         companyId: config.BC_COMPANY_ID,
       };
 
-      const summary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase);
+      const { logger: baseLogger } = await import("../src/shared/logger");
+      const summary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase, baseLogger);
       console.log("\n   Verifier resultaat:", summary);
     }
   } catch (err) {
