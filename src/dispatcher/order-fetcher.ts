@@ -216,13 +216,13 @@ export async function recoverStalePendingRecords(
     .select("id, order_id, company_id, retry_count, po_number, queued_at");
 
   if (error) {
-    console.error("Failed to recover stale pending records", { error: error.message });
+    runLogger.error({ error: error.message }, "Failed to recover stale pending records");
     return 0;
   }
 
   const count = staleRows?.length ?? 0;
   if (count > 0) {
-    console.warn("Recovered stale pending records", { count, companyId });
+    runLogger.warn({ count, companyId }, "Recovered stale pending records");
 
     // `stale_recovered`-event: pending -> failed (per gerecoverde order).
     const now = Date.now();
