@@ -23,14 +23,25 @@ async function fetchWithRetry(
   logger?: Logger,
 ): Promise<Response> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-        "Data-Access-Intent": "ReadOnly",
-      },
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "Data-Access-Intent": "ReadOnly",
+        },
+      });
+    } catch (err) {
+      // WR-03: maak de 30s-abort observeerbaar in de run-context voordat de
+      // TimeoutError/AbortError als opaque per-order error string opduikt.
+      const name = (err as Error).name;
+      if (name === "TimeoutError" || name === "AbortError") {
+        logger?.warn({ url, attempt, timeoutMs: FETCH_TIMEOUT_MS }, "BC API fetch timed out");
+      }
+      throw err;
+    }
 
     if (response.status === 429) {
       if (attempt === maxRetries) {
@@ -44,6 +55,9 @@ async function fetchWithRetry(
       const retryAfterSeconds = Number.isNaN(parsed) ? 5 : parsed;
       const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
       const delay = Math.max(retryAfterSeconds * 1000, baseDelay);
+      // WR-03: 429-backoff observeerbaar op debug (loop-verbositeit, D-05) —
+      // zonder dit slaapt een 429-storm 1s/2s/4s per order zonder één logregel.
+      logger?.debug({ url, attempt, delayMs: delay, retryAfterSeconds }, "BC API 429 -- backing off");
       // Release connection back to pool before sleeping (Node fetch/Undici requirement)
       await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, delay));
