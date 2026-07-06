@@ -144,6 +144,13 @@ export const handler = async (
   } catch (err) {
     verifyStatus = "failed";
     runLogger.error({ error: (err as Error).message }, "Verifier run failed unexpectedly");
+    // Round 2 F1: rethrow zodat een gecrashte run de Lambda-invocatie laat
+    // FALEN (voedt de AWS `Errors`-metric + de 999.25-alarmen; zonder rethrow
+    // lijkt een gecrashte verifier-run een geslaagde invocatie). Het finally-
+    // blok draait vóór de propagatie, dus verify.summary wordt nog steeds
+    // precies één keer emitted. Rethrow is hier veilig: scheduled, idempotent,
+    // read-mostly, reserved concurrency 1 (spiegelt dispatcher CR-02).
+    throw err;
   } finally {
     // 9. Eén gegarandeerd verify.summary-event per run (D-07/D-08/D-09).
     // Nestels per checker (buffer/dlq/errorQueue) + durationMs + status.
