@@ -49,7 +49,7 @@ export const handler = async (
   // before the buffer-check's "NotFound > 1h -> dead_letter" path can mislabel it.
   let errorQueueSummary: ErrorQueueSummary | null = null;
   try {
-    errorQueueSummary = await checkErrorQueue(supabase);
+    errorQueueSummary = await checkErrorQueue(supabase, logger);
   } catch (err) {
     console.error("Error-queue check failed (non-fatal)", { error: (err as Error).message });
   }
@@ -113,7 +113,7 @@ export const handler = async (
   // 8. DLQ check (non-fatal, always runs -- D-09)
   let dlqSummary: DlqSummary | null = null;
   try {
-    dlqSummary = await checkDlqMessages(supabase);
+    dlqSummary = await checkDlqMessages(supabase, logger);
   } catch (err) {
     console.error("DLQ check failed (non-fatal)", { error: (err as Error).message });
   }

@@ -836,6 +836,7 @@ async function errorQueueProcess(): Promise<void> {
   const { getConfig } = await import("../src/shared/config");
   const { getSupabaseClient } = await import("../src/shared/supabase-client");
   const { checkErrorQueue } = await import("../src/verifier/error-queue-checker");
+  const { logger: baseLogger } = await import("../src/shared/logger");
   const config = getConfig();
   const supabase = getSupabaseClient();
 
@@ -844,7 +845,7 @@ async function errorQueueProcess(): Promise<void> {
   console.log("   (archiveert ze eerst in bc_sync_error_messages). Anders dan de read-only");
   console.log("   'error-queue' peek. Draai alleen tegen de sandbox.\n");
 
-  const summary = await checkErrorQueue(supabase);
+  const summary = await checkErrorQueue(supabase, baseLogger);
 
   // Meest recente geschreven archief-rijen tonen
   console.log("\n--- Geschreven bc_sync_error_messages (laatste 10) ---\n");

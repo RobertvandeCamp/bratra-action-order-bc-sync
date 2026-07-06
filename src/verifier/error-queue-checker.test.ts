@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import pino from "pino";
 
 import type { getSupabaseClient } from "../shared/supabase-client";
 import type { ErrorQueueMessage } from "../shared/types";
+
+const silentLogger = pino({ level: "silent" });
 import {
   applyRejection,
   brokerPropertiesSchema,
@@ -234,7 +237,7 @@ describe("matchOrder", () => {
     const { client } = makeSelectFake({
       [`external_id=${externalId}`]: { data: [{ id: 7, status: "sent" }], error: null },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.externalId).toBe(externalId);
     expect(result.matchedOrder).toEqual({ id: 7, status: "sent" });
   });
@@ -244,7 +247,7 @@ describe("matchOrder", () => {
       [`external_id=${externalId}`]: { data: [], error: null }, // geen primaire match
       "message_id=meta-123": { data: [{ id: 11, status: "sent" }], error: null },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.matchedOrder).toEqual({ id: 11, status: "sent" });
   });
 
@@ -259,7 +262,7 @@ describe("matchOrder", () => {
         error: null,
       },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.matchedOrder).toBeNull();
   });
 
@@ -268,7 +271,7 @@ describe("matchOrder", () => {
       [`external_id=${externalId}`]: { data: [], error: null },
       "message_id=meta-123": { data: [], error: null },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.matchedOrder).toBeNull();
     expect(result.externalId).toBe(externalId);
   });
@@ -282,7 +285,7 @@ describe("matchOrder", () => {
     const { client, calls } = makeSelectFake({
       "message_id=meta-123": { data: [{ id: 5, status: "sent" }], error: null },
     });
-    const result = await matchOrder(client, noPo);
+    const result = await matchOrder(client, noPo, silentLogger);
     // externalId blijft null (geen poNumber), maar fallback op message_id matcht wel
     expect(result.externalId).toBeNull();
     expect(result.matchedOrder).toEqual({ id: 5, status: "sent" });
@@ -294,7 +297,7 @@ describe("matchOrder", () => {
     const { client } = makeSelectFake({
       [`external_id=${externalId}`]: { data: null, error: { message: "timeout" } },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.dbError).toBe(true);
     expect(result.matchedOrder).toBeNull();
     expect(result.externalId).toBe(externalId); // externalId blijft beschikbaar voor logging
@@ -305,7 +308,7 @@ describe("matchOrder", () => {
       [`external_id=${externalId}`]: { data: [], error: null }, // geen primaire match
       "message_id=meta-123": { data: null, error: { message: "connection reset" } },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.dbError).toBe(true);
     expect(result.matchedOrder).toBeNull();
   });
@@ -314,7 +317,7 @@ describe("matchOrder", () => {
     const { client } = makeSelectFake({
       [`external_id=${externalId}`]: { data: [{ id: 7, status: "sent" }], error: null },
     });
-    const result = await matchOrder(client, parsed);
+    const result = await matchOrder(client, parsed, silentLogger);
     expect(result.dbError).toBe(false);
   });
 });
@@ -326,7 +329,7 @@ describe("matchOrder", () => {
 describe("applyRejection", () => {
   it("skipt idempotent als de order al bc_rejected is", async () => {
     const { client, updates } = makeUpdateFake();
-    const outcome = await applyRejection(client, { id: 1, status: "bc_rejected", order_id: 100, company_id: 2 }, "err", "msg-1");
+    const outcome = await applyRejection(client, { id: 1, status: "bc_rejected", order_id: 100, company_id: 2 }, "err", "msg-1", null, silentLogger);
     expect(outcome).toBe("already");
     expect(updates).toHaveLength(0); // geen UPDATE
   });
@@ -335,7 +338,7 @@ describe("applyRejection", () => {
     "overschrijft een terminale order (%s) NIET naar bc_rejected",
     async (status) => {
       const { client, updates } = makeUpdateFake();
-      const outcome = await applyRejection(client, { id: 2, status, order_id: 100, company_id: 2 }, "err", "msg-1");
+      const outcome = await applyRejection(client, { id: 2, status, order_id: 100, company_id: 2 }, "err", "msg-1", null, silentLogger);
       expect(outcome).toBe("terminal");
       expect(updates).toHaveLength(0);
     },
@@ -343,7 +346,7 @@ describe("applyRejection", () => {
 
   it("zet een order in status 'sent' op bc_rejected met de juiste payload", async () => {
     const { client, updates } = makeUpdateFake();
-    const outcome = await applyRejection(client, { id: 3, status: "sent", order_id: 100, company_id: 2 }, "BC zegt nee", "msg-1");
+    const outcome = await applyRejection(client, { id: 3, status: "sent", order_id: 100, company_id: 2 }, "BC zegt nee", "msg-1", null, silentLogger);
     expect(outcome).toBe("updated");
     expect(updates).toHaveLength(1);
     expect(updates[0].id).toBe(3);
@@ -354,7 +357,7 @@ describe("applyRejection", () => {
 
   it("geeft 'failed' terug als de UPDATE een DB-error oplevert", async () => {
     const { client, updates } = makeUpdateFake({ message: "deadlock" });
-    const outcome = await applyRejection(client, { id: 4, status: "sent", order_id: 100, company_id: 2 }, "err", "msg-1");
+    const outcome = await applyRejection(client, { id: 4, status: "sent", order_id: 100, company_id: 2 }, "err", "msg-1", null, silentLogger);
     expect(outcome).toBe("failed");
     expect(updates).toHaveLength(1); // update geprobeerd, maar faalde
   });
@@ -376,7 +379,7 @@ describe("applyRejection bc_rejected event-logging", () => {
 
   it("logt EEN bc_rejected event bij outcome 'updated' met from_status uit matchedOrder.status", async () => {
     const { client, events } = makeRejectionFake();
-    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-1");
+    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-1", null, silentLogger);
     expect(outcome).toBe("updated");
     expect(events).toHaveLength(1);
     const ev = events[0];
@@ -393,7 +396,7 @@ describe("applyRejection bc_rejected event-logging", () => {
   it("schrijft de echte BC-rejectietijd (failedAtUtc) naar failed_at (PR#5 #3)", async () => {
     const { client, updates } = makeRejectionFake();
     const bcTime = "2026-06-20T08:30:00Z";
-    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-ts", bcTime);
+    const outcome = await applyRejection(client, matched, "BC zegt nee", "msg-ts", bcTime, silentLogger);
     expect(outcome).toBe("updated");
     expect(updates).toHaveLength(1);
     expect(updates[0].payload.failed_at).toBe(bcTime); // niet de verwerkingstijd
@@ -401,7 +404,7 @@ describe("applyRejection bc_rejected event-logging", () => {
 
   it("valt terug op de verwerkingstijd voor failed_at als failedAtUtc ontbreekt", async () => {
     const { client, updates } = makeRejectionFake();
-    const outcome = await applyRejection(client, matched, "err", "msg-noTs");
+    const outcome = await applyRejection(client, matched, "err", "msg-noTs", null, silentLogger);
     expect(outcome).toBe("updated");
     expect(typeof updates[0].payload.failed_at).toBe("string"); // fallback ISO-timestamp
   });
@@ -413,6 +416,8 @@ describe("applyRejection bc_rejected event-logging", () => {
       { ...matched, status: "failed" },
       "err",
       "msg-2",
+      null,
+      silentLogger,
     );
     expect(outcome).toBe("updated");
     expect(events).toHaveLength(1);
@@ -426,6 +431,8 @@ describe("applyRejection bc_rejected event-logging", () => {
       { ...matched, status: "bc_rejected" },
       "err",
       "msg-3",
+      null,
+      silentLogger,
     );
     expect(outcome).toBe("already");
     expect(events).toHaveLength(0);
@@ -435,7 +442,7 @@ describe("applyRejection bc_rejected event-logging", () => {
     "logt GEEN event bij outcome 'terminal' (%s)",
     async (status) => {
       const { client, events } = makeRejectionFake();
-      const outcome = await applyRejection(client, { ...matched, status }, "err", "msg-4");
+      const outcome = await applyRejection(client, { ...matched, status }, "err", "msg-4", null, silentLogger);
       expect(outcome).toBe("terminal");
       expect(events).toHaveLength(0);
     },
@@ -443,7 +450,7 @@ describe("applyRejection bc_rejected event-logging", () => {
 
   it("logt GEEN event bij outcome 'failed' (UPDATE faalde)", async () => {
     const { client, events } = makeRejectionFake({ message: "deadlock" });
-    const outcome = await applyRejection(client, matched, "err", "msg-5");
+    const outcome = await applyRejection(client, matched, "err", "msg-5", null, silentLogger);
     expect(outcome).toBe("failed");
     expect(events).toHaveLength(0);
   });

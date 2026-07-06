@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import pino from "pino";
 
 import type { getSupabaseClient } from "../shared/supabase-client";
 import {
@@ -6,6 +7,8 @@ import {
   checkDlqMessages,
   type DlqMatchedOrder,
 } from "./dlq-checker";
+
+const silentLogger = pino({ level: "silent" });
 
 // ============================================================================
 // Config + Service Bus worden gemockt zodat checkDlqMessages zonder echte
@@ -219,7 +222,7 @@ describe("checkDlqMessages event-logging", () => {
     stubDlqFetchSingleMessage();
     const { client, eventInserts } = makeDlqSupabase([]); // geen match
 
-    const summary = await checkDlqMessages(client);
+    const summary = await checkDlqMessages(client, silentLogger);
 
     expect(eventInserts.flat()).toHaveLength(0);
     expect(summary.unmatched).toBe(1);
@@ -232,7 +235,7 @@ describe("checkDlqMessages event-logging", () => {
       { id: 42, order_id: 1001, company_id: 2, po_number: "PO-9", retry_count: 0, status: "sent" },
     ]);
 
-    const summary = await checkDlqMessages(client);
+    const summary = await checkDlqMessages(client, silentLogger);
 
     const events = eventInserts.flat() as Array<Record<string, unknown>>;
     expect(events).toHaveLength(1);
@@ -251,7 +254,7 @@ describe("checkDlqMessages event-logging", () => {
       { id: 77, order_id: 1002, company_id: 2, po_number: "PO-X", retry_count: 0, status: "bc_rejected" },
     ]);
 
-    const summary = await checkDlqMessages(client);
+    const summary = await checkDlqMessages(client, silentLogger);
 
     expect(eventInserts.flat()).toHaveLength(0); // niet overschreven -> geen event
     // Terminal-suppressie telt NIET als matched (geen dead_letter-transitie door ons),
