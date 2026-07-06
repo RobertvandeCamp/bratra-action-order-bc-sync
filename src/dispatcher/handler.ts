@@ -141,6 +141,10 @@ export const handler = async (
     retriedOrders: 0,
   };
   const startMs = Date.now();
+  // CR-02: een crash buiten de per-batch catches (config, order-fetch, guard)
+  // moet dispatch.summary status "failed" geven — dit is het emit-punt voor de
+  // 999.25-alarmen; "ok" bij een crash is actief vals bewijs.
+  let crashed = false;
 
   try {
     // D-01: Warn if the RESOLVED BC_ENVIRONMENT is not sandbox. Read it from
@@ -731,13 +735,17 @@ export const handler = async (
         }
       }
     }
+  } catch (err) {
+    crashed = true;
+    runLogger.error({ error: (err as Error).message }, "Dispatcher run failed unexpectedly");
+    throw err; // rethrow: SQS-retry-semantiek behouden
   } finally {
     // Precies één dispatch.summary per run, ook bij crash of vroege return (D-07/D-08).
     // Emit-punt voor 999.25 EMF-metrics (GEEN rij in bc_sync_events).
     runLogger.info(
       {
         event: "dispatch.summary",
-        status: summary.ordersFailed === 0 ? "ok" : "failed",
+        status: crashed || summary.ordersFailed > 0 ? "failed" : "ok",
         durationMs: Date.now() - startMs,
         ...summary,
       },

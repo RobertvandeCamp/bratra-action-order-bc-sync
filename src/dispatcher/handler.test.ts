@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import type { SQSRecord } from "aws-lambda";
+import { describe, expect, it, vi } from "vitest";
+import type { Context, SQSRecord } from "aws-lambda";
 
 import type { BcSyncEventInsert, BcSyncEventType } from "../shared/types";
 import {
@@ -13,7 +13,40 @@ import {
   type DispatchedRow,
   type SyncOrderRow,
 } from "./event-builders";
-import { extractSqsContext } from "./handler";
+import { extractSqsContext, handler } from "./handler";
+
+// ============================================================================
+// Logger-spy + crashende config voor de CR-02 crash-summary test onderaan.
+// De logger-mock registreert alle calls (ook die van extractSqsContext, die de
+// base logger gebruikt); de config-mock laat getConfig gooien zodat de handler
+// crasht vóór de batch-loop (het pad dat vóór CR-02 status "ok" rapporteerde).
+// ============================================================================
+
+const { logCalls } = vi.hoisted(() => ({
+  logCalls: [] as Array<{ level: string; obj: unknown; msg?: string }>,
+}));
+
+vi.mock("../shared/logger", () => {
+  const record =
+    (level: string) =>
+    (obj: unknown, msg?: string): void => {
+      logCalls.push({ level, obj, msg });
+    };
+  const spyLogger = {
+    info: record("info"),
+    warn: record("warn"),
+    error: record("error"),
+    debug: record("debug"),
+  };
+  return { logger: spyLogger, createRunLogger: () => spyLogger };
+});
+
+vi.mock("../shared/config", () => ({
+  FETCH_TIMEOUT_MS: 30_000,
+  getConfig: () => {
+    throw new Error("boom: config invalid (simulated Zod failure)");
+  },
+}));
 
 // ============================================================================
 // Per-transition event-builder tests (fase 185, TRACE-01).
@@ -281,5 +314,40 @@ describe("extractSqsContext", () => {
   it("retourneert null bij een ongeldig JSON-body", () => {
     const record = { body: "not json" } as SQSRecord;
     expect(extractSqsContext(record)).toBeNull();
+  });
+});
+
+// ============================================================================
+// CR-02: een crash buiten de per-batch catches (hier: getConfig gooit) moet
+// precies één dispatch.summary met status "failed" emitten én rethrowen
+// (SQS-retry-semantiek). Vóór de fix rapporteerde dit pad status "ok".
+// ============================================================================
+
+describe("dispatcher crash -> dispatch.summary (CR-02)", () => {
+  it("emit precies één dispatch.summary met status 'failed' en rethrowt de crash", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-crash-1" } as Context;
+
+    // Scheduled/manual pad (geen Records) -> getConfig() gooit in de try.
+    await expect(
+      handler({} as never, context),
+    ).rejects.toThrow("boom: config invalid");
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    const summaryObj = summaries[0].obj as Record<string, unknown>;
+    expect(summaryObj.status).toBe("failed");
+    expect(summaryObj.ordersSent).toBe(0);
+    expect(summaryObj.ordersFailed).toBe(0);
+
+    // De crash zelf is als error gelogd (diagnose-signaal naast de summary).
+    const crashErrors = logCalls.filter(
+      (c) =>
+        c.level === "error" &&
+        c.msg === "Dispatcher run failed unexpectedly",
+    );
+    expect(crashErrors).toHaveLength(1);
   });
 });
