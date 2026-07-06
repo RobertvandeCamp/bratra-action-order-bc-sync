@@ -244,7 +244,7 @@ export async function recoverStalePendingRecords(
         traceId,
       );
     });
-    await logSyncEvent(supabase, events);
+    await logSyncEvent(supabase, events, runLogger);
   }
   return count;
 }

@@ -399,7 +399,7 @@ export async function applyRejection(
     batch_id: matchedOrder.batch_id ?? null,
     detail: { po_number: matchedOrder.po_number, bc_error_message: errorMessage },
   };
-  await logSyncEvent(supabase, [event]);
+  await logSyncEvent(supabase, [event], logger);
 
   return "updated";
 }

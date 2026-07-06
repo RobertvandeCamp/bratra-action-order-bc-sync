@@ -199,7 +199,7 @@ async function applyDlqDeadLetter(
   // dead_lettered-event ALLEEN bij een geslaagde transitie naar dead_letter.
   await logSyncEvent(supabase, [
     buildDlqDeadLetteredEvent(matchedOrder, deadLetterReason, deadLetterErrorDescription),
-  ]);
+  ], logger);
   return "updated";
 }
 

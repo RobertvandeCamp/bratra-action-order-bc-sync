@@ -301,7 +301,7 @@ export const handler = async (
           }
 
           // D-01: bulk-log alle dispatched-events in 1 call ná de loop.
-          await logSyncEvent(supabase, dispatchedEvents);
+          await logSyncEvent(supabase, dispatchedEvents, runLogger);
 
           if (claimedOrders.length === 0) {
             runLogger.debug({ batchId }, "All orders in batch already claimed");
@@ -359,11 +359,11 @@ export const handler = async (
                 ),
               );
             }
-            await logSyncEvent(supabase, fallbackEvents);
+            await logSyncEvent(supabase, fallbackEvents, runLogger);
           } else {
             const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
             const sentEvents = (sentRows ?? []).map((r) => buildSentEvent(r, ctx));
-            await logSyncEvent(supabase, sentEvents);
+            await logSyncEvent(supabase, sentEvents, runLogger);
           }
 
           summary.ordersSent += claimedOrders.length;
@@ -393,7 +393,7 @@ export const handler = async (
             const sendFailedEvents = (failedRows ?? []).map((r) =>
               buildSendFailedEvent(r, batchId, errorMessage, traceId),
             );
-            await logSyncEvent(supabase, sendFailedEvents);
+            await logSyncEvent(supabase, sendFailedEvents, runLogger);
           }
 
           summary.ordersFailed += claimedOrders.length;
@@ -628,7 +628,7 @@ export const handler = async (
                   },
                   { batchId, messageId, correlationId, traceId },
                 ),
-              ]);
+              ], runLogger);
             }
 
             if (resetOrders.length === 0) {
@@ -690,11 +690,11 @@ export const handler = async (
                   ),
                 );
               }
-              await logSyncEvent(supabase, fallbackEvents);
+              await logSyncEvent(supabase, fallbackEvents, runLogger);
             } else {
               const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
               const sentEvents = (redispatchSentRows ?? []).map((r) => buildSentEvent(r, ctx));
-              await logSyncEvent(supabase, sentEvents);
+              await logSyncEvent(supabase, sentEvents, runLogger);
             }
 
             summary.ordersSent += resetOrders.length;
@@ -725,7 +725,7 @@ export const handler = async (
               const sendFailedEvents = (redispatchFailedRows ?? []).map((r) =>
                 buildSendFailedEvent(r, batchId, errorMessage, traceId),
               );
-              await logSyncEvent(supabase, sendFailedEvents);
+              await logSyncEvent(supabase, sendFailedEvents, runLogger);
             }
 
             summary.ordersFailed += resetOrders.length;
@@ -819,7 +819,7 @@ async function sendOrdersOneByOne(
         const oversizedEvents = (oversizedRows ?? []).map((r) =>
           buildSendFailedEvent(r, originalBatchId, oversizedMessage, traceId),
         );
-        await logSyncEvent(supabase, oversizedEvents);
+        await logSyncEvent(supabase, oversizedEvents, runLogger);
 
         summary.ordersFailed++;
         continue;
@@ -877,7 +877,7 @@ async function sendOrdersOneByOne(
               { sync_order_id: ident.sync_order_id, order_id: order.id, company_id: order.company_id, po_number: order.po_number },
               singleCtx,
             ),
-          ]);
+          ], runLogger);
         }
       } else {
         const singleCtx: DispatchContext = {
@@ -887,7 +887,7 @@ async function sendOrdersOneByOne(
           traceId,
         };
         const sentEvents = (singleSentRows ?? []).map((r) => buildSentEvent(r, singleCtx));
-        await logSyncEvent(supabase, sentEvents);
+        await logSyncEvent(supabase, sentEvents, runLogger);
       }
 
       summary.ordersSent++;
@@ -912,7 +912,7 @@ async function sendOrdersOneByOne(
       const singleFailedEvents = (singleFailedRows ?? []).map((r) =>
         buildSendFailedEvent(r, originalBatchId, singleErrorMessage, traceId),
       );
-      await logSyncEvent(supabase, singleFailedEvents);
+      await logSyncEvent(supabase, singleFailedEvents, runLogger);
 
       summary.ordersFailed++;
     }

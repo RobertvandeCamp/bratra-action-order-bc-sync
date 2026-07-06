@@ -299,7 +299,7 @@ export async function checkBufferStatuses(
 
   // Best-effort bulk-log na alle per-order checks (D-01). logSyncEvent swallowt
   // zelf elke fout -- mag de verifier-flow nooit breken (T-185-11).
-  await logSyncEvent(supabase, events);
+  await logSyncEvent(supabase, events, logger);
 
   return summary;
 }
