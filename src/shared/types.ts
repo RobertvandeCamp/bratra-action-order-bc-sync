@@ -463,6 +463,12 @@ export interface SqsTriggerMessage {
   companyId: number;
   /** ISO timestamp of when the import completed (optional, for logging) */
   timestamp?: string;
+  /**
+   * End-to-end trace-id. Optioneel: backward-compatible met bestaande producers.
+   * Fase 208 vult dit veld in de SQS-body; dispatcher valt terug op awsRequestId
+   * als het ontbreekt (D-00c / TRACE-04 contract).
+   */
+  traceId?: string;
 }
 
 // ============================================================================

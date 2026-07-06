@@ -1,3 +1,5 @@
+import type { Logger } from "pino";
+import { logger as baseLogger } from "./logger";
 import type { getSupabaseClient } from "./supabase-client";
 import type { BcSyncEventInsert } from "./types";
 
@@ -15,11 +17,15 @@ import type { BcSyncEventInsert } from "./types";
  *
  * @param supabase - de gedeelde service_role action_orders-client (geïnjecteerd)
  * @param events - de event-rijen om append-only weg te schrijven
+ * @param logger - optionele run-logger (dispatcher/verifier child); valt terug op base logger (D-04/D-06)
  */
 export async function logSyncEvent(
   supabase: ReturnType<typeof getSupabaseClient>,
   events: BcSyncEventInsert[],
+  logger?: Logger,
 ): Promise<void> {
+  const log = logger ?? baseLogger;
+
   if (events.length === 0) return;
 
   try {
@@ -29,15 +35,19 @@ export async function logSyncEvent(
       // verbergt schema-/CHECK-fouten; de message moet zichtbaar zijn in
       // CloudWatch). Count + unieke event_types geven context zonder de hele
       // payload te dumpen.
-      console.error("logSyncEvent insert failed (non-fatal)", {
-        count: events.length,
-        eventTypes: [...new Set(events.map((e) => e.event_type))],
-        error: error.message,
-      });
+      log.error(
+        {
+          count: events.length,
+          eventTypes: [...new Set(events.map((e) => e.event_type))],
+          error: error.message,
+        },
+        "logSyncEvent insert failed (non-fatal)",
+      );
     }
   } catch (err) {
-    console.error("logSyncEvent threw (non-fatal)", {
-      error: (err as Error).message,
-    });
+    log.error(
+      { error: (err as Error).message },
+      "logSyncEvent threw (non-fatal)",
+    );
   }
 }
