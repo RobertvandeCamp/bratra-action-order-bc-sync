@@ -1,3 +1,5 @@
+import type { Logger } from "pino";
+
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import { fetchAllPages } from "../shared/paginate";
@@ -194,6 +196,8 @@ export async function fetchFailedSyncRecords(
  */
 export async function recoverStalePendingRecords(
   companyId: number,
+  traceId: string,
+  runLogger: Logger,
 ): Promise<number> {
   const supabase = getSupabaseClient();
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
@@ -212,13 +216,13 @@ export async function recoverStalePendingRecords(
     .select("id, order_id, company_id, retry_count, po_number, queued_at");
 
   if (error) {
-    console.error("Failed to recover stale pending records", { error: error.message });
+    runLogger.error({ error: error.message }, "Failed to recover stale pending records");
     return 0;
   }
 
   const count = staleRows?.length ?? 0;
   if (count > 0) {
-    console.warn("Recovered stale pending records", { count, companyId });
+    runLogger.warn({ count, companyId }, "Recovered stale pending records");
 
     // `stale_recovered`-event: pending -> failed (per gerecoverde order).
     const now = Date.now();
@@ -237,9 +241,10 @@ export async function recoverStalePendingRecords(
         },
         staleReason,
         ageMin,
+        traceId,
       );
     });
-    await logSyncEvent(supabase, events);
+    await logSyncEvent(supabase, events, runLogger);
   }
   return count;
 }

@@ -16,6 +16,11 @@ import { z } from "zod";
  * enkele consumer (service-bus-client, supabase-client, dispatcher/verifier)
  * breekt.
  */
+// LOG_LEVEL staat hier BEWUST NIET in: de logger moet ook bestaan wanneer
+// config-validatie faalt (kip-ei bij startup-fouten), dus logger.ts leest en
+// valideert LOG_LEVEL zelf met fallback "info" (round 2 F3). Een tweede
+// schema-entry hier zou dode validatie zijn -- niemand consumeert
+// config.LOG_LEVEL.
 const configSchema = z
   .object({
     SUPABASE_URL: z.string().url(),
@@ -57,6 +62,13 @@ const configSchema = z
   });
 
 export type Config = z.infer<typeof configSchema>;
+
+/**
+ * Shared fetch-timeout voor BC- en Service Bus-fetches (D-01 / RES-01).
+ * 30 seconden — ruim onder de 60s dispatcher-timeout en 300s verifier-timeout.
+ * AbortSignal.timeout(FETCH_TIMEOUT_MS) is native Node 18+; geen polyfill nodig.
+ */
+export const FETCH_TIMEOUT_MS = 30_000;
 
 /**
  * APP_TARGET selecteert welke omgeving wordt geresolved over BEIDE assen:
@@ -167,6 +179,7 @@ export function getConfig(): Config {
     cachedConfig = configSchema.parse({
       ...resolved,
       // Gedeelde keys ALTIJD ongeprefixt (omgeving-onafhankelijk).
+      // LOG_LEVEL bewust afwezig: die valideert logger.ts zelf (zie schema-comment).
       BC_TENANT_ID: process.env.BC_TENANT_ID,
       BC_CLIENT_ID: process.env.BC_CLIENT_ID,
       BC_CLIENT_SECRET: process.env.BC_CLIENT_SECRET,

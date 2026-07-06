@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { Context, SQSRecord } from "aws-lambda";
 
 import type { BcSyncEventInsert, BcSyncEventType } from "../shared/types";
 import {
@@ -12,6 +13,40 @@ import {
   type DispatchedRow,
   type SyncOrderRow,
 } from "./event-builders";
+import { extractSqsContext, handler } from "./handler";
+
+// ============================================================================
+// Logger-spy + crashende config voor de CR-02 crash-summary test onderaan.
+// De logger-mock registreert alle calls (ook die van extractSqsContext, die de
+// base logger gebruikt); de config-mock laat getConfig gooien zodat de handler
+// crasht vóór de batch-loop (het pad dat vóór CR-02 status "ok" rapporteerde).
+// ============================================================================
+
+const { logCalls } = vi.hoisted(() => ({
+  logCalls: [] as Array<{ level: string; obj: unknown; msg?: string }>,
+}));
+
+vi.mock("../shared/logger", () => {
+  const record =
+    (level: string) =>
+    (obj: unknown, msg?: string): void => {
+      logCalls.push({ level, obj, msg });
+    };
+  const spyLogger = {
+    info: record("info"),
+    warn: record("warn"),
+    error: record("error"),
+    debug: record("debug"),
+  };
+  return { logger: spyLogger, createRunLogger: () => spyLogger };
+});
+
+vi.mock("../shared/config", () => ({
+  FETCH_TIMEOUT_MS: 30_000,
+  getConfig: () => {
+    throw new Error("boom: config invalid (simulated Zod failure)");
+  },
+}));
 
 // ============================================================================
 // Per-transition event-builder tests (fase 185, TRACE-01).
@@ -26,6 +61,7 @@ const ctx: DispatchContext = {
   batchId: "batch-1",
   messageId: "msg-1",
   correlationId: "corr-1",
+  traceId: "trace-abc",
 };
 
 const dispatchedRow: DispatchedRow = {
@@ -86,7 +122,7 @@ describe("dispatcher event_type <-> status mapping (D-08)", () => {
     },
     {
       name: "send_failed",
-      event: buildSendFailedEvent(syncOrderRow, ctx.batchId, "boom"),
+      event: buildSendFailedEvent(syncOrderRow, ctx.batchId, "boom", "trace-abc"),
       fromStatus: "pending",
       toStatus: "failed",
     },
@@ -105,6 +141,7 @@ describe("dispatcher event_type <-> status mapping (D-08)", () => {
         { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
         "Recovered from stale pending",
         7,
+        "trace-abc",
       ),
       fromStatus: "pending",
       toStatus: "failed",
@@ -178,7 +215,7 @@ describe("buildSentFallbackEvent (D-06 edge)", () => {
 
 describe("buildSendFailedEvent", () => {
   it("zet to_status failed en error_message in detail", () => {
-    const event = buildSendFailedEvent(syncOrderRow, "batch-9", "BC rejected envelope");
+    const event = buildSendFailedEvent(syncOrderRow, "batch-9", "BC rejected envelope", "trace-abc");
     expect(event.event_type).toBe("send_failed");
     expect(event.to_status).toBe("failed");
     expect((event.detail as Record<string, unknown>).error_message).toBe("BC rejected envelope");
@@ -213,6 +250,7 @@ describe("buildStaleRecoveredEvent", () => {
       { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
       "Recovered from stale pending",
       12,
+      "trace-abc",
     );
     expect(event.event_type).toBe("stale_recovered");
     expect(event.from_status).toBe("pending");
@@ -228,7 +266,137 @@ describe("buildStaleRecoveredEvent", () => {
       { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
       "Recovered from stale pending",
       null,
+      "trace-abc",
     );
     expect((event.detail as Record<string, unknown>).age_min).toBeNull();
+  });
+});
+
+// ============================================================================
+// extractSqsContext — traceId extractie + fallback (fase 207-02, TRACE-04)
+// ============================================================================
+
+describe("extractSqsContext", () => {
+  it("extraheert traceId uit de SQS body als het aanwezig is", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2, traceId: "abc-123" }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result).not.toBeNull();
+    expect(result?.companyId).toBe(2);
+    expect(result?.traceId).toBe("abc-123");
+  });
+
+  it("valt terug op lege string als traceId ontbreekt in de body", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2 }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result).not.toBeNull();
+    expect(result?.traceId).toBe("");
+  });
+
+  it("valt terug op lege string als traceId een lege string is", () => {
+    const record = {
+      body: JSON.stringify({ companyId: 2, traceId: "" }),
+    } as SQSRecord;
+    const result = extractSqsContext(record);
+    expect(result?.traceId).toBe("");
+  });
+
+  it("retourneert null bij ontbrekende of ongeldige companyId", () => {
+    const record = {
+      body: JSON.stringify({ companyId: "invalid", traceId: "abc" }),
+    } as SQSRecord;
+    expect(extractSqsContext(record)).toBeNull();
+  });
+
+  it("retourneert null bij een ongeldig JSON-body", () => {
+    const record = { body: "not json" } as SQSRecord;
+    expect(extractSqsContext(record)).toBeNull();
+  });
+});
+
+// ============================================================================
+// CR-02: een crash buiten de per-batch catches (hier: getConfig gooit) moet
+// precies één dispatch.summary met status "failed" emitten én rethrowen
+// (SQS-retry-semantiek). Vóór de fix rapporteerde dit pad status "ok".
+// ============================================================================
+
+describe("dispatcher crash -> dispatch.summary (CR-02)", () => {
+  it("emit precies één dispatch.summary met status 'failed' en rethrowt de crash", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-crash-1" } as Context;
+
+    // Scheduled/manual pad (geen Records) -> getConfig() gooit in de try.
+    await expect(
+      handler({} as never, context),
+    ).rejects.toThrow("boom: config invalid");
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    const summaryObj = summaries[0].obj as Record<string, unknown>;
+    expect(summaryObj.status).toBe("failed");
+    expect(summaryObj.ordersSent).toBe(0);
+    expect(summaryObj.ordersFailed).toBe(0);
+
+    // De crash zelf is als error gelogd (diagnose-signaal naast de summary).
+    const crashErrors = logCalls.filter(
+      (c) =>
+        c.level === "error" &&
+        c.msg === "Dispatcher run failed unexpectedly",
+    );
+    expect(crashErrors).toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// Round 2 F2: een ongeldig SQS-bericht (onparseerbare body) keert terug VÓÓR de
+// try/finally en produceerde daardoor een run zonder dispatch.summary. De fix
+// emit op dat pad precies één summary met status "failed" en reason
+// "invalid_sqs_message", zonder de retry-semantiek te veranderen (het bericht
+// wordt nog steeds ingeslikt -- resolve, geen rethrow, geen SQS-redrive storm).
+// ============================================================================
+
+describe("dispatcher invalid SQS message -> dispatch.summary (round 2 F2)", () => {
+  it("slikt het bericht in (resolve) en emit exact één failed summary met reason invalid_sqs_message", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-invalid-sqs-1" } as Context;
+    const event = { Records: [{ body: "not json" } as SQSRecord] };
+
+    // Resolve (geen reject) bewijst óók dat de early-return vóór de try ligt:
+    // de gemockte getConfig() zou anders gooien (zie CR-02-test hierboven).
+    await expect(handler(event as never, context)).resolves.toBeUndefined();
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    const summaryObj = summaries[0].obj as Record<string, unknown>;
+    expect(summaryObj.status).toBe("failed");
+    expect(summaryObj.reason).toBe("invalid_sqs_message");
+    expect(summaryObj.ordersSent).toBe(0);
+    expect(summaryObj.ordersFailed).toBe(0);
+    expect(summaryObj.batchesProcessed).toBe(0);
+    expect(summaryObj.retriedOrders).toBe(0);
+  });
+
+  it("een geldig SQS-bericht met crashende config emit óók exact één summary (geen dubbel-emit op het SQS-pad)", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-valid-sqs-1" } as Context;
+    const event = {
+      Records: [{ body: JSON.stringify({ companyId: 2, traceId: "t-1" }) } as SQSRecord],
+    };
+
+    // Geldig bericht -> voorbij de early-return -> getConfig() gooit -> rethrow.
+    await expect(handler(event as never, context)).rejects.toThrow("boom: config invalid");
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    expect((summaries[0].obj as Record<string, unknown>).status).toBe("failed");
   });
 });

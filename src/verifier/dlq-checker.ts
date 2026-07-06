@@ -1,4 +1,6 @@
-import { getConfig } from "../shared/config";
+import type { Logger } from "pino";
+
+import { getConfig, FETCH_TIMEOUT_MS } from "../shared/config";
 import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
 import { TERMINAL_STATUSES } from "./error-queue-checker";
@@ -74,6 +76,9 @@ async function receiveDlqMessage(
 
   const response = await fetch(url, {
     method: "POST",
+    // RES-01/D-01: een hangende SB-receive mag de verifier niet tot de
+    // Lambda-timeout stallen; TimeoutError valt in de per-message catch.
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
@@ -129,6 +134,8 @@ async function completeDlqMessage(
 
   const response = await fetch(deleteUrl, {
     method: "DELETE",
+    // RES-01/D-01: zelfde 30s-timeout als de receive (TimeoutError -> per-message catch).
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
@@ -166,15 +173,13 @@ async function applyDlqDeadLetter(
   deadLetterReason: string,
   deadLetterErrorDescription: string,
   messageId: string,
+  logger: Logger,
 ): Promise<"updated" | "terminal" | "failed"> {
   // Terminal-guard: een order die al terminaal is (verified/dead_letter/skipped/
   // bc_rejected) NIET overschrijven. De error-queue-checker draait eerder in
   // dezelfde run; zonder guard wint een DLQ-bericht van een net gezette bc_rejected.
   if (TERMINAL_STATUSES.has(matchedOrder.status)) {
-    console.warn(
-      "DLQ match already in terminal status -- NOT overwriting to dead_letter",
-      { orderId: matchedOrder.id, currentStatus: matchedOrder.status, messageId },
-    );
+    logger.warn({ orderId: matchedOrder.id, currentStatus: matchedOrder.status, messageId }, "DLQ match already in terminal status -- NOT overwriting to dead_letter");
     return "terminal";
   }
 
@@ -187,23 +192,20 @@ async function applyDlqDeadLetter(
     .eq("id", matchedOrder.id);
 
   if (updateError) {
-    console.error("Failed to update bc_sync_orders for DLQ match", {
-      orderId: matchedOrder.id,
-      messageId,
-      error: updateError.message,
-    });
+    logger.error({ orderId: matchedOrder.id, messageId, error: updateError.message }, "Failed to update bc_sync_orders for DLQ match");
     return "failed";
   }
 
   // dead_lettered-event ALLEEN bij een geslaagde transitie naar dead_letter.
   await logSyncEvent(supabase, [
     buildDlqDeadLetteredEvent(matchedOrder, deadLetterReason, deadLetterErrorDescription),
-  ]);
+  ], logger);
   return "updated";
 }
 
 export async function checkDlqMessages(
   supabase: ReturnType<typeof getSupabaseClient>,
+  logger: Logger,
 ): Promise<DlqSummary> {
   const summary: DlqSummary = { processed: 0, matched: 0, unmatched: 0, skipped: 0, errors: 0 };
 
@@ -235,10 +237,7 @@ export async function checkDlqMessages(
       // opnieuw als nieuw verwerkt worden (mogelijk UNIQUE-violatie). Tel als error,
       // laat in de queue voor een volgende run (PR#5 claude #4, spiegelt error-queue).
       if (existingErr) {
-        console.error("DLQ idempotency-check faalde (DB-fout) -- bericht overgeslagen deze run", {
-          messageId,
-          error: existingErr.message,
-        });
+        logger.error({ messageId, error: existingErr.message }, "DLQ idempotency-check faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
         continue; // NIET completen
       }
@@ -254,10 +253,7 @@ export async function checkDlqMessages(
           .eq("message_id", messageId)
           .limit(1);
         if (healMatchErr) {
-          console.error("DLQ self-heal match faalde (DB-fout) -- laten staan voor retry", {
-            messageId,
-            error: healMatchErr.message,
-          });
+          logger.error({ messageId, error: healMatchErr.message }, "DLQ self-heal match faalde (DB-fout) -- laten staan voor retry");
           summary.errors++;
           continue; // NIET completen
         }
@@ -270,16 +266,14 @@ export async function checkDlqMessages(
             msg.deadLetterReason,
             msg.deadLetterErrorDescription,
             messageId,
+            logger,
           );
           if (outcome === "failed") {
             summary.errors++;
             continue; // NIET completen -- volgende run probeert de self-heal opnieuw
           }
         }
-        console.log("DLQ message already archived (idempotent skip, re-checked match)", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-        });
+        logger.debug({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber }, "DLQ message already archived (idempotent skip, re-checked match)");
         await completeDlqMessage(config.SB_NAMESPACE, config.SB_QUEUE, sasToken, msg);
         continue;
       }
@@ -296,10 +290,7 @@ export async function checkDlqMessages(
       // EN uit de queue verwijderen -> de dead_letter-koppeling permanent kwijt.
       // Tel als error, laat in de queue voor een volgende run (PR#5 claude High).
       if (matchError) {
-        console.error("DLQ match-lookup faalde (DB-fout) -- bericht overgeslagen deze run", {
-          messageId,
-          error: matchError.message,
-        });
+        logger.error({ messageId, error: matchError.message }, "DLQ match-lookup faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
         continue; // NIET archiveren/completen
       }
@@ -315,7 +306,7 @@ export async function checkDlqMessages(
         envelopeBody = JSON.parse(msg.body);
       } catch {
         // Body niet parseable als JSON -- opslaan als null
-        console.warn("DLQ message body is not valid JSON", { messageId });
+        logger.warn({ messageId }, "DLQ message body is not valid JSON");
       }
 
       // 4. INSERT in bc_sync_dlq_messages (D-05/D-06)
@@ -334,10 +325,7 @@ export async function checkDlqMessages(
         });
 
       if (insertError) {
-        console.error("Failed to insert DLQ message", {
-          messageId,
-          error: insertError.message,
-        });
+        logger.error({ messageId, error: insertError.message }, "Failed to insert DLQ message");
         summary.errors++;
         // NIET completen -- bericht blijft in queue voor volgende run
         continue;
@@ -351,6 +339,7 @@ export async function checkDlqMessages(
           msg.deadLetterReason,
           msg.deadLetterErrorDescription,
           messageId,
+          logger,
         );
 
         if (outcome === "failed") {
@@ -367,36 +356,23 @@ export async function checkDlqMessages(
           summary.unmatched++;
         } else {
           summary.matched++;
-          console.log("DLQ message processed (matched)", {
-            messageId,
-            sequenceNumber: msg.brokerProperties.SequenceNumber,
-            deadLetterReason: msg.deadLetterReason,
-            matched: true,
-            orderId: matchedOrder.id,
-          });
+          logger.info({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, deadLetterReason: msg.deadLetterReason, matched: true, orderId: matchedOrder.id }, "DLQ message processed (matched)");
         }
       } else {
         // D-12: geen match, alsnog opgeslagen
         summary.unmatched++;
-        console.warn("DLQ message processed (no match)", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-          deadLetterReason: msg.deadLetterReason,
-          matched: false,
-        });
+        logger.warn({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, deadLetterReason: msg.deadLetterReason, matched: false }, "DLQ message processed (no match)");
       }
 
       // 6. Complete bericht uit queue (D-03: alleen na succesvolle insert)
       await completeDlqMessage(config.SB_NAMESPACE, config.SB_QUEUE, sasToken, msg);
       summary.processed++;
     } catch (err) {
-      console.error("Error processing DLQ message", {
-        error: (err as Error).message,
-      });
+      logger.error({ error: (err as Error).message }, "Error processing DLQ message");
       summary.errors++;
     }
   }
 
-  console.log("DLQ check summary", summary);
+  logger.info({ ...summary }, "DLQ check summary");
   return summary;
 }

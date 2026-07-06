@@ -1,6 +1,7 @@
+import type { Logger } from "pino";
 import { z } from "zod";
 
-import { getConfig } from "../shared/config";
+import { getConfig, FETCH_TIMEOUT_MS } from "../shared/config";
 import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
 import type { getSupabaseClient } from "../shared/supabase-client";
@@ -87,6 +88,9 @@ async function receiveErrorMessage(
 
   const response = await fetch(url, {
     method: "POST",
+    // RES-01/D-01: een hangende SB-receive mag de verifier niet tot de
+    // Lambda-timeout stallen; TimeoutError valt in de per-message catch.
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
@@ -158,6 +162,8 @@ async function completeErrorMessage(
 
   const response = await fetch(deleteUrl, {
     method: "DELETE",
+    // RES-01/D-01: zelfde 30s-timeout als de receive (TimeoutError -> per-message catch).
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
@@ -168,11 +174,11 @@ async function completeErrorMessage(
 }
 
 /** Parse body als JSON; geeft null terug bij een parse-fout (nooit crashen, D-09) */
-function parseJsonOrNull(body: string, messageId: string): unknown {
+function parseJsonOrNull(body: string, messageId: string, logger: Logger): unknown {
   try {
     return JSON.parse(body);
   } catch {
-    console.warn("Error-queue message body is not valid JSON", { messageId });
+    logger.warn({ messageId }, "Error-queue message body is not valid JSON");
     return null;
   }
 }
@@ -273,6 +279,7 @@ export interface MatchResult {
 export async function matchOrder(
   supabase: ReturnType<typeof getSupabaseClient>,
   parsed: ErrorQueueMessage,
+  logger: Logger,
 ): Promise<MatchResult> {
   const metaMessageId = parsed.meta?.messageId ?? null;
   const poNumber = parsed.order?.poNumber ?? null;
@@ -290,10 +297,7 @@ export async function matchOrder(
     // Een DB-fout is GEEN "geen match": treat als transient, laat de caller het
     // bericht voor een volgende run laten staan (cursor High, PR#5).
     if (byExternalError) {
-      console.error(
-        "Error-queue match: external_id-lookup faalde (DB-fout) -- transient, NIET als unmatched behandelen",
-        { externalId, error: byExternalError.message },
-      );
+      logger.error({ externalId, error: byExternalError.message }, "Error-queue match: external_id-lookup faalde (DB-fout) -- transient, NIET als unmatched behandelen");
       return { matchedOrder: null, externalId, dbError: true };
     }
     if (byExternal && byExternal.length > 0) {
@@ -311,19 +315,13 @@ export async function matchOrder(
       .eq("message_id", metaMessageId)
       .limit(2);
     if (byMessageIdError) {
-      console.error(
-        "Error-queue match: message_id-fallback faalde (DB-fout) -- transient, NIET als unmatched behandelen",
-        { metaMessageId, error: byMessageIdError.message },
-      );
+      logger.error({ metaMessageId, error: byMessageIdError.message }, "Error-queue match: message_id-fallback faalde (DB-fout) -- transient, NIET als unmatched behandelen");
       return { matchedOrder: null, externalId, dbError: true };
     }
     if (byMessageId && byMessageId.length === 1) {
       matchedOrder = byMessageId[0] as MatchedOrder;
     } else if (byMessageId && byMessageId.length > 1) {
-      console.warn(
-        "Error-queue fallback match ambiguous (multiple orders share message_id) -- treating as UNMATCHED",
-        { metaMessageId, candidates: byMessageId.length },
-      );
+      logger.warn({ metaMessageId, candidates: byMessageId.length }, "Error-queue fallback match ambiguous (multiple orders share message_id) -- treating as UNMATCHED");
       // matchedOrder blijft null -> archive-as-unmatched
     }
   }
@@ -360,24 +358,15 @@ export async function applyRejection(
   // verwerkingstijd als hij ontbreekt. Voorkomt dat SLA/latency-metingen op
   // bc_sync_orders.failed_at de rejectie-latency overschatten (PR#5 claude #3).
   failedAtUtc: string | null = null,
+  logger: Logger,
 ): Promise<"updated" | "already" | "terminal" | "failed"> {
   if (matchedOrder.status === "bc_rejected") {
-    console.log("Order already bc_rejected (idempotent skip)", {
-      orderId: matchedOrder.id,
-      messageId,
-    });
+    logger.debug({ orderId: matchedOrder.id, messageId }, "Order already bc_rejected (idempotent skip)");
     return "already";
   }
 
   if (TERMINAL_STATUSES.has(matchedOrder.status)) {
-    console.warn(
-      "Order already in a terminal status -- NOT overwriting to bc_rejected (already settled)",
-      {
-        orderId: matchedOrder.id,
-        currentStatus: matchedOrder.status,
-        messageId,
-      },
-    );
+    logger.warn({ orderId: matchedOrder.id, currentStatus: matchedOrder.status, messageId }, "Order already in a terminal status -- NOT overwriting to bc_rejected (already settled)");
     return "terminal";
   }
 
@@ -391,11 +380,7 @@ export async function applyRejection(
     .eq("id", matchedOrder.id);
 
   if (updateError) {
-    console.error("Failed to update bc_sync_orders to bc_rejected", {
-      orderId: matchedOrder.id,
-      messageId,
-      error: updateError.message,
-    });
+    logger.error({ orderId: matchedOrder.id, messageId, error: updateError.message }, "Failed to update bc_sync_orders to bc_rejected");
     return "failed";
   }
 
@@ -414,7 +399,7 @@ export async function applyRejection(
     batch_id: matchedOrder.batch_id ?? null,
     detail: { po_number: matchedOrder.po_number, bc_error_message: errorMessage },
   };
-  await logSyncEvent(supabase, [event]);
+  await logSyncEvent(supabase, [event], logger);
 
   return "updated";
 }
@@ -437,6 +422,7 @@ export async function applyRejection(
  */
 export async function checkErrorQueue(
   supabase: ReturnType<typeof getSupabaseClient>,
+  logger: Logger,
 ): Promise<ErrorQueueSummary> {
   const summary: ErrorQueueSummary = {
     archived: 0,
@@ -476,9 +462,7 @@ export async function checkErrorQueue(
         // BrokerProperties ontbreekt/valideert niet -> bericht is un-keyable en
         // niet veilig te completen. Zelfde behandeling als missing-MessageId:
         // log, errors++, NIET verwijderen (laat voor retry) (claude Important, PR#5).
-        console.error("Error-queue message met ongeldige BrokerProperties -- niet verwijderd", {
-          reason: received.reason,
-        });
+        logger.error({ reason: received.reason }, "Error-queue message met ongeldige BrokerProperties -- niet verwijderd");
         summary.errors++;
         continue;
       }
@@ -490,9 +474,7 @@ export async function checkErrorQueue(
       //    non-empty -- deze guard blijft als defense-in-depth.
       const messageId = msg.brokerProperties.MessageId;
       if (!messageId) {
-        console.error("Error-queue message zonder MessageId -- niet verwijderd (un-keyable)", {
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-        });
+        logger.error({ sequenceNumber: msg.brokerProperties.SequenceNumber }, "Error-queue message zonder MessageId -- niet verwijderd (un-keyable)");
         summary.errors++;
         // NIET completen -- bericht zonder sleutel niet droppen
         continue;
@@ -501,7 +483,7 @@ export async function checkErrorQueue(
       // 3. Parse body DEFENSIVELY (D-09, D-10): nooit crashen, nooit droppen.
       //    Schema-validatie op de I/O-grens (Zod): incomplete error-sectie ->
       //    archive-as-unmatched, geen silently-incomplete matched archive.
-      const parsedRaw: unknown = parseJsonOrNull(msg.body, messageId);
+      const parsedRaw: unknown = parseJsonOrNull(msg.body, messageId, logger);
       const parsed: ErrorQueueMessage | null = parseWellFormed(parsedRaw);
       const wellFormed = parsed !== null;
 
@@ -515,11 +497,7 @@ export async function checkErrorQueue(
         .limit(1);
 
       if (existingErr) {
-        console.error("Idempotency check failed (DB error) -- skipping message this run", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-          error: existingErr.message,
-        });
+        logger.error({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, error: existingErr.message }, "Idempotency check failed (DB error) -- skipping message this run");
         summary.errors++;
         // NIET completen -- bericht blijft in queue voor een volgende run
         continue;
@@ -532,12 +510,9 @@ export async function checkErrorQueue(
         summary.skipped++;
 
         if (parsed) {
-          const reMatch = await matchOrder(supabase, parsed);
+          const reMatch = await matchOrder(supabase, parsed, logger);
           if (reMatch.dbError) {
-            console.error("Error-queue self-heal match faalde (DB-fout) -- bericht laten staan voor retry", {
-              messageId,
-              sequenceNumber: msg.brokerProperties.SequenceNumber,
-            });
+            logger.error({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber }, "Error-queue self-heal match faalde (DB-fout) -- bericht laten staan voor retry");
             summary.errors++;
             // NIET completen -- een volgende run probeert de self-heal opnieuw
             continue;
@@ -551,6 +526,7 @@ export async function checkErrorQueue(
               errorMessage,
               messageId,
               parsed.error?.failedAtUtc ?? null,
+              logger,
             );
             if (outcome === "failed") {
               summary.errors++;
@@ -568,10 +544,7 @@ export async function checkErrorQueue(
           }
         }
 
-        console.log("Error-queue message already archived (idempotent skip, re-checked match)", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-        });
+        logger.debug({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber }, "Error-queue message already archived (idempotent skip, re-checked match)");
         // Niets meer te updaten (of al bc_rejected / unmatched) -> completen uit de queue
         await completeErrorMessage(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, sasToken, msg);
         summary.deleted++;
@@ -580,17 +553,14 @@ export async function checkErrorQueue(
 
       // 4. Match (D-03), ALLEEN als goed-gevormd
       const matchResult: MatchResult = parsed
-        ? await matchOrder(supabase, parsed)
+        ? await matchOrder(supabase, parsed, logger)
         : { matchedOrder: null, externalId: null, dbError: false };
 
       // Een transient DB-fout tijdens de match mag het bericht NIET als unmatched
       // archiveren+completen (anders verdwijnt een rejection die wel een matchende
       // order had). Tel als error, laat in de queue voor een volgende run (cursor High, PR#5).
       if (matchResult.dbError) {
-        console.error("Error-queue match-lookup faalde (DB-fout) -- bericht overgeslagen deze run", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-        });
+        logger.error({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber }, "Error-queue match-lookup faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
         continue;
       }
@@ -623,10 +593,7 @@ export async function checkErrorQueue(
         .insert(insertRow);
 
       if (insertError) {
-        console.error("Failed to insert error-queue message", {
-          messageId,
-          error: insertError.message,
-        });
+        logger.error({ messageId, error: insertError.message }, "Failed to insert error-queue message");
         summary.errors++;
         // NIET completen -- bericht blijft in queue voor volgende run
         continue;
@@ -645,6 +612,7 @@ export async function checkErrorQueue(
           error?.message ?? "(no error message)",
           messageId,
           error?.failedAtUtc ?? null,
+          logger,
         );
 
         if (outcome === "failed") {
@@ -659,42 +627,26 @@ export async function checkErrorQueue(
           // skipped). Niet overschreven, maar wel gearchiveerd voor traceability;
           // tel als unmatched (geen bc_rejected-transitie door ons). Completen mag.
           summary.unmatched++;
-          console.warn("Error-queue message archived but order already settled (terminal)", {
-            messageId,
-            sequenceNumber: msg.brokerProperties.SequenceNumber,
-            externalId,
-            orderId: matchedOrder.id,
-          });
+          logger.warn({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, externalId, orderId: matchedOrder.id }, "Error-queue message archived but order already settled (terminal)");
         } else {
           summary.matched++;
-          console.log("Error-queue message processed (matched)", {
-            messageId,
-            sequenceNumber: msg.brokerProperties.SequenceNumber,
-            externalId,
-            orderId: matchedOrder.id,
-          });
+          logger.info({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, externalId, orderId: matchedOrder.id }, "Error-queue message processed (matched)");
         }
       } else {
         // D-03: geen match of niet goed-gevormd -> gearchiveerd zonder match
         summary.unmatched++;
-        console.warn("Error-queue message processed (no match)", {
-          messageId,
-          sequenceNumber: msg.brokerProperties.SequenceNumber,
-          wellFormed,
-        });
+        logger.warn({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, wellFormed }, "Error-queue message processed (no match)");
       }
 
       // 8. Completen uit de queue (D-02: alleen na succesvolle insert)
       await completeErrorMessage(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, sasToken, msg);
       summary.deleted++;
     } catch (err) {
-      console.error("Error processing error-queue message", {
-        error: (err as Error).message,
-      });
+      logger.error({ error: (err as Error).message }, "Error processing error-queue message");
       summary.errors++;
     }
   }
 
-  console.log("Error-queue check summary", summary);
+  logger.info({ ...summary }, "Error-queue check summary");
   return summary;
 }

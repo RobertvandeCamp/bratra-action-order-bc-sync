@@ -31,11 +31,13 @@ export interface SyncOrderRow {
   retry_count: number;
 }
 
-/** Gedeelde dispatch-context (batch/message-ids) per transitie. */
+/** Gedeelde dispatch-context (batch/message-ids + trace-id) per transitie. */
 export interface DispatchContext {
   batchId: string;
   messageId: string;
   correlationId: string;
+  /** End-to-end trace-id; verplicht zodra handler.ts traceId extraheert (TRACE-04/D-00c). */
+  traceId: string;
 }
 
 /**
@@ -57,7 +59,7 @@ export function buildDispatchedEvent(
     message_id: ctx.messageId,
     correlation_id: ctx.correlationId,
     batch_id: ctx.batchId,
-    detail: { po_number: row.po_number, batch_id: ctx.batchId, message_id: ctx.messageId },
+    detail: { po_number: row.po_number, batch_id: ctx.batchId, message_id: ctx.messageId, trace_id: ctx.traceId },
   };
 }
 
@@ -80,7 +82,7 @@ export function buildSentEvent(
     message_id: ctx.messageId,
     correlation_id: ctx.correlationId,
     batch_id: ctx.batchId,
-    detail: { po_number: row.po_number, batch_id: ctx.batchId, message_id: ctx.messageId },
+    detail: { po_number: row.po_number, batch_id: ctx.batchId, message_id: ctx.messageId, trace_id: ctx.traceId },
   };
 }
 
@@ -108,6 +110,7 @@ export function buildSentFallbackEvent(
       batch_id: ctx.batchId,
       message_id: ctx.messageId,
       db_update_failed: true,
+      trace_id: ctx.traceId,
     },
   };
 }
@@ -120,6 +123,7 @@ export function buildSendFailedEvent(
   row: SyncOrderRow,
   batchId: string,
   errorMessage: string,
+  traceId: string,
 ): BcSyncEventInsert {
   return {
     sync_order_id: row.id,
@@ -130,7 +134,7 @@ export function buildSendFailedEvent(
     from_status: "pending",
     to_status: "failed",
     batch_id: batchId,
-    detail: { po_number: row.po_number, error_message: errorMessage, batch_id: batchId },
+    detail: { po_number: row.po_number, error_message: errorMessage, batch_id: batchId, trace_id: traceId },
   };
 }
 
@@ -159,7 +163,7 @@ export function buildRedispatchedEvent(
     message_id: ctx.messageId,
     correlation_id: ctx.correlationId,
     batch_id: ctx.batchId,
-    detail: { po_number: args.po_number, batch_id: ctx.batchId, message_id: ctx.messageId },
+    detail: { po_number: args.po_number, batch_id: ctx.batchId, message_id: ctx.messageId, trace_id: ctx.traceId },
   };
 }
 
@@ -178,6 +182,7 @@ export function buildStaleRecoveredEvent(
   },
   reason: string,
   ageMin: number | null,
+  traceId: string,
 ): BcSyncEventInsert {
   return {
     sync_order_id: args.sync_order_id,
@@ -187,6 +192,6 @@ export function buildStaleRecoveredEvent(
     event_type: "stale_recovered",
     from_status: "pending",
     to_status: "failed",
-    detail: { po_number: args.po_number, reason, age_min: ageMin },
+    detail: { po_number: args.po_number, reason, age_min: ageMin, trace_id: traceId },
   };
 }

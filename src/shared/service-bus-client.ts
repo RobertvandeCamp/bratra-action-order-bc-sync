@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { getConfig } from "./config";
+import { getConfig, FETCH_TIMEOUT_MS } from "./config";
 import type { ActionOrderBatchV1Envelope } from "./types";
 
 /**
@@ -54,6 +54,7 @@ export async function sendToServiceBus(
 
   const response = await fetch(url, {
     method: "POST",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: {
       Authorization: token,
       "Content-Type": "application/json",

@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 
 import { logSyncEvent } from "./event-logger";
+import * as loggerModule from "./logger";
 import type { getSupabaseClient } from "./supabase-client";
 import type { BcSyncEventInsert } from "./types";
 
@@ -60,6 +61,10 @@ const sampleEvent: BcSyncEventInsert = {
 };
 
 describe("logSyncEvent", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("doet geen insert bij een lege array (early return)", async () => {
     const { client, inserts } = makeInsertFake();
     await logSyncEvent(client, []);
@@ -80,17 +85,17 @@ describe("logSyncEvent", () => {
 
   it("swallowt een DB-error en re-throwt niet (D-02)", async () => {
     const { client } = makeInsertFake({ message: "CHECK violation" });
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Migrated from console.error to pino logger.error (Task 3, 207-01)
+    const errorSpy = vi.spyOn(loggerModule.logger, "error").mockImplementation(() => loggerModule.logger);
     await expect(logSyncEvent(client, [sampleEvent])).resolves.toBeUndefined();
     expect(errorSpy).toHaveBeenCalled();
-    errorSpy.mockRestore();
   });
 
   it("swallowt een geworpen exception en re-throwt niet (D-02)", async () => {
     const client = makeThrowingInsertFake("boom");
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Migrated from console.error to pino logger.error (Task 3, 207-01)
+    const errorSpy = vi.spyOn(loggerModule.logger, "error").mockImplementation(() => loggerModule.logger);
     await expect(logSyncEvent(client, [sampleEvent])).resolves.toBeUndefined();
     expect(errorSpy).toHaveBeenCalled();
-    errorSpy.mockRestore();
   });
 });
