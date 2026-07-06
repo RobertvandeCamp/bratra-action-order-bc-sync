@@ -18,6 +18,7 @@ const silentLogger = pino({ level: "silent" });
 // ============================================================================
 
 vi.mock("../shared/config", () => ({
+  FETCH_TIMEOUT_MS: 30_000,
   getConfig: () => ({
     SB_NAMESPACE: "ns",
     SB_QUEUE: "q",
@@ -114,10 +115,10 @@ function makeResp(
 }
 
 /** fetch-stub: 1 DLQ-bericht ophalen (201), completen (200), daarna leeg (204). */
-function stubDlqFetchSingleMessage(): void {
+function stubDlqFetchSingleMessage(): ReturnType<typeof vi.fn> {
   let receiveCount = 0;
   const fetchMock = vi.fn(
-    async (_url: string, opts?: { method?: string }): Promise<FakeResponse> => {
+    async (_url: string, opts?: { method?: string; signal?: AbortSignal }): Promise<FakeResponse> => {
       const method = opts?.method;
       if (method === "POST") {
         receiveCount++;
@@ -148,6 +149,7 @@ function stubDlqFetchSingleMessage(): void {
     },
   );
   vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
 }
 
 /**
@@ -261,5 +263,41 @@ describe("checkDlqMessages event-logging", () => {
     // maar als unmatched -- consistent met error-queue-checker (PR#5 claude #3).
     expect(summary.matched).toBe(0);
     expect(summary.unmatched).toBe(1);
+  });
+});
+
+// ----------------------------------------------------------------------------
+// RES-01/D-01: FETCH_TIMEOUT_MS op de SB-fetches (receive + complete) en het
+// timeout-foutpad (TimeoutError -> per-message catch -> errors++, geen crash).
+// ----------------------------------------------------------------------------
+
+describe("checkDlqMessages fetch-timeout (RES-01)", () => {
+  it("geeft elke SB-fetch (receive POST + complete DELETE) een AbortSignal mee", async () => {
+    const fetchMock = stubDlqFetchSingleMessage();
+    const { client } = makeDlqSupabase([]); // no-match pad: receive + complete + lege receive
+
+    await checkDlqMessages(client, silentLogger);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(3); // receive, delete, lege receive
+    for (const call of fetchMock.mock.calls) {
+      const opts = call[1] as { signal?: AbortSignal } | undefined;
+      expect(opts?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("telt een fetch-TimeoutError als error en crasht niet (D-03: bestaand error-pad)", async () => {
+    const timeoutErr = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const fetchMock = vi.fn(async () => {
+      throw timeoutErr;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { client, eventInserts } = makeDlqSupabase([]);
+
+    const summary = await checkDlqMessages(client, silentLogger);
+
+    // 10 receive-pogingen (MAX_MESSAGES), elk in de per-message catch -> errors++
+    expect(summary.errors).toBe(10);
+    expect(summary.processed).toBe(0);
+    expect(eventInserts.flat()).toHaveLength(0);
   });
 });

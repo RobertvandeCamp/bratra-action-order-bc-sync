@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import pino from "pino";
 
 import type { getSupabaseClient } from "../shared/supabase-client";
@@ -8,12 +8,36 @@ const silentLogger = pino({ level: "silent" });
 import {
   applyRejection,
   brokerPropertiesSchema,
+  checkErrorQueue,
   deriveExternalId,
   errorQueueMessageSchema,
   matchOrder,
   parseWellFormed,
   TERMINAL_STATUSES,
 } from "./error-queue-checker";
+
+// Config + SAS-token gemockt zodat checkErrorQueue zonder echte Azure-toegang
+// draait (alleen gebruikt door de RES-01 fetch-timeout tests onderaan; de pure
+// functies hierboven raken config niet aan).
+vi.mock("../shared/config", () => ({
+  FETCH_TIMEOUT_MS: 30_000,
+  getConfig: () => ({
+    SB_NAMESPACE: "ns",
+    SB_QUEUE: "q",
+    SB_ERROR_QUEUE: "bratra-error",
+    SB_KEY_NAME: "key",
+    SB_KEY_VALUE: "secret",
+  }),
+}));
+
+vi.mock("../shared/service-bus-client", () => ({
+  generateSasToken: () => "SharedAccessSignature sr=fake",
+}));
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 // ============================================================================
 // Tiny inline Supabase fakes -- geen mocking-framework, alleen kleine objecten
@@ -468,5 +492,113 @@ describe("TERMINAL_STATUSES", () => {
     expect(TERMINAL_STATUSES.has("bc_rejected")).toBe(true);
     expect(TERMINAL_STATUSES.has("sent")).toBe(false);
     expect(TERMINAL_STATUSES.has("pending")).toBe(false);
+  });
+});
+
+// ============================================================================
+// RES-01/D-01: FETCH_TIMEOUT_MS op de SB-fetches van checkErrorQueue
+// (receive POST + complete DELETE) en het timeout-foutpad.
+// ============================================================================
+
+type FakeResponse = {
+  status: number;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+};
+
+function makeResp(status: number, headers: Record<string, string>, body: string): FakeResponse {
+  return {
+    status,
+    headers: { get: (name: string) => headers[name] ?? null },
+    text: async () => body,
+  };
+}
+
+/**
+ * Minimal supabase-fake voor de unmatched-flow (malformed body): idempotency-
+ * select op bc_sync_error_messages -> geen hit; archive-insert -> ok.
+ */
+function makeErrorQueueSupabase(): ReturnType<typeof getSupabaseClient> {
+  return {
+    from(table: string) {
+      if (table === "bc_sync_error_messages") {
+        const selectBuilder = {
+          eq() {
+            return selectBuilder;
+          },
+          limit() {
+            return Promise.resolve({ data: [], error: null });
+          },
+        };
+        return {
+          select() {
+            return selectBuilder;
+          },
+          insert() {
+            return Promise.resolve({ error: null });
+          },
+        };
+      }
+      throw new Error(`unexpected table ${table}`);
+    },
+  } as unknown as ReturnType<typeof getSupabaseClient>;
+}
+
+describe("checkErrorQueue fetch-timeout (RES-01)", () => {
+  it("geeft elke SB-fetch (receive POST + complete DELETE) een AbortSignal mee", async () => {
+    // 1 bericht met geldige BrokerProperties maar malformed body -> unmatched
+    // pad: receive (POST), archive, complete (DELETE), daarna lege receive (204).
+    let receiveCount = 0;
+    const fetchMock = vi.fn(
+      async (_url: string, opts?: { method?: string; signal?: AbortSignal }): Promise<FakeResponse> => {
+        if (opts?.method === "POST") {
+          receiveCount++;
+          if (receiveCount === 1) {
+            return makeResp(
+              201,
+              {
+                BrokerProperties: JSON.stringify({
+                  MessageId: "em1",
+                  SequenceNumber: 7,
+                  LockToken: "lt7",
+                  EnqueuedTimeUtc: "2026-07-06T00:00:00Z",
+                }),
+                Location: "https://ns.servicebus.windows.net/bratra-error/messages/7/lt7",
+              },
+              "not-json",
+            );
+          }
+          return makeResp(204, {}, "");
+        }
+        if (opts?.method === "DELETE") return makeResp(200, {}, "");
+        throw new Error(`unexpected fetch method ${opts?.method}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const summary = await checkErrorQueue(makeErrorQueueSupabase(), silentLogger);
+
+    expect(summary.archived).toBe(1);
+    expect(summary.deleted).toBe(1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(3); // receive, delete, lege receive
+    for (const call of fetchMock.mock.calls) {
+      const opts = call[1] as { signal?: AbortSignal } | undefined;
+      expect(opts?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("telt een fetch-TimeoutError als error en crasht niet (D-03: bestaand error-pad)", async () => {
+    const timeoutErr = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const fetchMock = vi.fn(async () => {
+      throw timeoutErr;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const summary = await checkErrorQueue(makeErrorQueueSupabase(), silentLogger);
+
+    // 10 receive-pogingen (MAX_MESSAGES), elk in de per-message catch -> errors++
+    expect(summary.errors).toBe(10);
+    expect(summary.archived).toBe(0);
+    expect(summary.deleted).toBe(0);
   });
 });

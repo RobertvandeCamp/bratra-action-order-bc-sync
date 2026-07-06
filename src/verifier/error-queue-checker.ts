@@ -1,7 +1,7 @@
 import type { Logger } from "pino";
 import { z } from "zod";
 
-import { getConfig } from "../shared/config";
+import { getConfig, FETCH_TIMEOUT_MS } from "../shared/config";
 import { logSyncEvent } from "../shared/event-logger";
 import { generateSasToken } from "../shared/service-bus-client";
 import type { getSupabaseClient } from "../shared/supabase-client";
@@ -88,6 +88,9 @@ async function receiveErrorMessage(
 
   const response = await fetch(url, {
     method: "POST",
+    // RES-01/D-01: een hangende SB-receive mag de verifier niet tot de
+    // Lambda-timeout stallen; TimeoutError valt in de per-message catch.
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
@@ -159,6 +162,8 @@ async function completeErrorMessage(
 
   const response = await fetch(deleteUrl, {
     method: "DELETE",
+    // RES-01/D-01: zelfde 30s-timeout als de receive (TimeoutError -> per-message catch).
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
 
