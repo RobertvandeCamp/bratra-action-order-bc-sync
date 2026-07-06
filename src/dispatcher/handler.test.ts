@@ -351,3 +351,52 @@ describe("dispatcher crash -> dispatch.summary (CR-02)", () => {
     expect(crashErrors).toHaveLength(1);
   });
 });
+
+// ============================================================================
+// Round 2 F2: een ongeldig SQS-bericht (onparseerbare body) keert terug VÓÓR de
+// try/finally en produceerde daardoor een run zonder dispatch.summary. De fix
+// emit op dat pad precies één summary met status "failed" en reason
+// "invalid_sqs_message", zonder de retry-semantiek te veranderen (het bericht
+// wordt nog steeds ingeslikt -- resolve, geen rethrow, geen SQS-redrive storm).
+// ============================================================================
+
+describe("dispatcher invalid SQS message -> dispatch.summary (round 2 F2)", () => {
+  it("slikt het bericht in (resolve) en emit exact één failed summary met reason invalid_sqs_message", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-invalid-sqs-1" } as Context;
+    const event = { Records: [{ body: "not json" } as SQSRecord] };
+
+    // Resolve (geen reject) bewijst óók dat de early-return vóór de try ligt:
+    // de gemockte getConfig() zou anders gooien (zie CR-02-test hierboven).
+    await expect(handler(event as never, context)).resolves.toBeUndefined();
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    const summaryObj = summaries[0].obj as Record<string, unknown>;
+    expect(summaryObj.status).toBe("failed");
+    expect(summaryObj.reason).toBe("invalid_sqs_message");
+    expect(summaryObj.ordersSent).toBe(0);
+    expect(summaryObj.ordersFailed).toBe(0);
+    expect(summaryObj.batchesProcessed).toBe(0);
+    expect(summaryObj.retriedOrders).toBe(0);
+  });
+
+  it("een geldig SQS-bericht met crashende config emit óók exact één summary (geen dubbel-emit op het SQS-pad)", async () => {
+    logCalls.length = 0;
+    const context = { awsRequestId: "req-valid-sqs-1" } as Context;
+    const event = {
+      Records: [{ body: JSON.stringify({ companyId: 2, traceId: "t-1" }) } as SQSRecord],
+    };
+
+    // Geldig bericht -> voorbij de early-return -> getConfig() gooit -> rethrow.
+    await expect(handler(event as never, context)).rejects.toThrow("boom: config invalid");
+
+    const summaries = logCalls.filter(
+      (c) => (c.obj as Record<string, unknown> | undefined)?.event === "dispatch.summary",
+    );
+    expect(summaries).toHaveLength(1);
+    expect((summaries[0].obj as Record<string, unknown>).status).toBe("failed");
+  });
+});

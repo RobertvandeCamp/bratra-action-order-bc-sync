@@ -103,6 +103,10 @@ export const handler = async (
   event: DispatcherEvent,
   context: Context,
 ): Promise<void> => {
+  // Vóór alle branches, zodat óók het invalid-SQS-pad (round 2 F2) een echte
+  // durationMs in zijn dispatch.summary heeft.
+  const startMs = Date.now();
+
   // Dual-trigger: detect SQS vs ScheduledEvent (D-10)
   let companyId: number;
   let traceId: string;
@@ -112,8 +116,32 @@ export const handler = async (
     const record = event.Records[0]; // batch_size=1 per D-12
     const extracted = extractSqsContext(record);
     if (extracted === null) {
-      // Invalid message -- return success to delete from queue (avoid DLQ pollution)
-      logger.error("Skipping invalid SQS message");
+      // Invalid message -- return success to delete from queue (avoid DLQ
+      // pollution / SQS-redrive storm). Retry-semantiek: NIET rethrowen.
+      //
+      // Round 2 F2: dit pad ligt VÓÓR de try/finally-constructie hieronder,
+      // dus emit hier zelf precies één dispatch.summary met status "failed"
+      // (one-summary-per-run garantie, D-07/D-08). companyId is per definitie
+      // onbekend (body onparseerbaar); traceId valt terug op awsRequestId.
+      const invalidMsgLogger = createRunLogger({
+        traceId: context.awsRequestId,
+        requestId: context.awsRequestId,
+        trigger: "sqs",
+      });
+      invalidMsgLogger.error("Skipping invalid SQS message");
+      invalidMsgLogger.info(
+        {
+          event: "dispatch.summary",
+          status: "failed",
+          reason: "invalid_sqs_message",
+          durationMs: Date.now() - startMs,
+          ordersSent: 0,
+          ordersFailed: 0,
+          batchesProcessed: 0,
+          retriedOrders: 0,
+        },
+        "dispatch.summary",
+      );
       return;
     }
     companyId = extracted.companyId;
@@ -140,7 +168,6 @@ export const handler = async (
     batchesProcessed: 0,
     retriedOrders: 0,
   };
-  const startMs = Date.now();
   // CR-02: een crash buiten de per-batch catches (config, order-fetch, guard)
   // moet dispatch.summary status "failed" geven — dit is het emit-punt voor de
   // 999.25-alarmen; "ok" bij een crash is actief vals bewijs.
