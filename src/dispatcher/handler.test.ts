@@ -26,6 +26,7 @@ const ctx: DispatchContext = {
   batchId: "batch-1",
   messageId: "msg-1",
   correlationId: "corr-1",
+  traceId: "trace-abc",
 };
 
 const dispatchedRow: DispatchedRow = {
@@ -86,7 +87,7 @@ describe("dispatcher event_type <-> status mapping (D-08)", () => {
     },
     {
       name: "send_failed",
-      event: buildSendFailedEvent(syncOrderRow, ctx.batchId, "boom"),
+      event: buildSendFailedEvent(syncOrderRow, ctx.batchId, "boom", "trace-abc"),
       fromStatus: "pending",
       toStatus: "failed",
     },
@@ -105,6 +106,7 @@ describe("dispatcher event_type <-> status mapping (D-08)", () => {
         { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
         "Recovered from stale pending",
         7,
+        "trace-abc",
       ),
       fromStatus: "pending",
       toStatus: "failed",
@@ -178,7 +180,7 @@ describe("buildSentFallbackEvent (D-06 edge)", () => {
 
 describe("buildSendFailedEvent", () => {
   it("zet to_status failed en error_message in detail", () => {
-    const event = buildSendFailedEvent(syncOrderRow, "batch-9", "BC rejected envelope");
+    const event = buildSendFailedEvent(syncOrderRow, "batch-9", "BC rejected envelope", "trace-abc");
     expect(event.event_type).toBe("send_failed");
     expect(event.to_status).toBe("failed");
     expect((event.detail as Record<string, unknown>).error_message).toBe("BC rejected envelope");
@@ -213,6 +215,7 @@ describe("buildStaleRecoveredEvent", () => {
       { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
       "Recovered from stale pending",
       12,
+      "trace-abc",
     );
     expect(event.event_type).toBe("stale_recovered");
     expect(event.from_status).toBe("pending");
@@ -228,6 +231,7 @@ describe("buildStaleRecoveredEvent", () => {
       { sync_order_id: 10, order_id: 100, company_id: 2, po_number: "PO-100", retry_count: 1 },
       "Recovered from stale pending",
       null,
+      "trace-abc",
     );
     expect((event.detail as Record<string, unknown>).age_min).toBeNull();
   });
