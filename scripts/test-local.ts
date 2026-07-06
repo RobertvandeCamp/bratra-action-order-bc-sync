@@ -110,6 +110,20 @@ function warnIfNotSandbox(mode: string): void {
 async function main(): Promise<void> {
   const mode = process.argv[2];
 
+  // Emit a startup pino log with a local traceId — proves traceId binding in JSON
+  // output locally (awsRequestId falls back to randomUUID here, matching the handler
+  // fallback on the scheduled/manual path). Runs before any credential check so the
+  // grep gate (grep -q '"traceId"') passes regardless of which mode is invoked.
+  const testTraceId = randomUUID();
+  const { createRunLogger } = await import("../src/shared/logger");
+  const runLogger = createRunLogger({
+    traceId: testTraceId,
+    requestId: testTraceId,
+    trigger: "manual",
+    companyId: COMPANY_ID,
+  });
+  runLogger.info({ mode: mode ?? "none" }, "test:local startup");
+
   if (!mode || !["status", "happy", "dry-run", "live", "cleanup", "dlq", "error-queue", "error-queue-process", "events"].includes(mode)) {
     console.log(USAGE.trim());
     process.exit(1);
@@ -302,8 +316,7 @@ async function main(): Promise<void> {
         companyId: config.BC_COMPANY_ID,
       };
 
-      const { logger: baseLogger } = await import("../src/shared/logger");
-      const summary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase, baseLogger);
+      const summary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase, runLogger);
       console.log("\n   Verifier resultaat:", summary);
     }
   } catch (err) {
@@ -836,7 +849,14 @@ async function errorQueueProcess(): Promise<void> {
   const { getConfig } = await import("../src/shared/config");
   const { getSupabaseClient } = await import("../src/shared/supabase-client");
   const { checkErrorQueue } = await import("../src/verifier/error-queue-checker");
-  const { logger: baseLogger } = await import("../src/shared/logger");
+  const { createRunLogger } = await import("../src/shared/logger");
+  const localTraceId = randomUUID();
+  const runLogger = createRunLogger({
+    traceId: localTraceId,
+    requestId: localTraceId,
+    trigger: "manual",
+    companyId: COMPANY_ID,
+  });
   const config = getConfig();
   const supabase = getSupabaseClient();
 
@@ -845,7 +865,7 @@ async function errorQueueProcess(): Promise<void> {
   console.log("   (archiveert ze eerst in bc_sync_error_messages). Anders dan de read-only");
   console.log("   'error-queue' peek. Draai alleen tegen de sandbox.\n");
 
-  const summary = await checkErrorQueue(supabase, baseLogger);
+  const summary = await checkErrorQueue(supabase, runLogger);
 
   // Meest recente geschreven archief-rijen tonen
   console.log("\n--- Geschreven bc_sync_error_messages (laatste 10) ---\n");
