@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMetricsLogger } from "aws-embedded-metrics";
 
 // ============================================================================
 // Mock aws-embedded-metrics op top-level (voor hoisting).
@@ -13,6 +14,17 @@ vi.mock("aws-embedded-metrics", () => ({
   })),
   Unit: { Count: "Count" },
 }));
+
+const mockedCreateMetricsLogger = vi.mocked(createMetricsLogger);
+
+function makeMockLogger() {
+  return {
+    setNamespace: vi.fn(),
+    setDimensions: vi.fn(),
+    putMetric: vi.fn(),
+    flush: vi.fn().mockResolvedValue(undefined),
+  };
+}
 
 // ============================================================================
 // resolveMetricsTarget — APP_TARGET resolutie
@@ -138,5 +150,124 @@ describe("emitVerifierMetrics", () => {
         stuckInSent: 4,
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Lock-step-checks (WR-06): dit is de CANONIEKE module — een typo in
+// namespace, dimensies of metriek-namen propageert naar drie repos.
+// Asserteer daarom exact wat er geput wordt (spiegelt het patroon van
+// bratra-action-order-bc-sync-trigger/src/metrics.test.ts).
+// ============================================================================
+
+describe("emitDispatcherMetrics lock-step checks", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('gebruikt namespace "Bratra/BcSync" en dimensies {Service:"dispatcher", Target} met precies één flush', async () => {
+    vi.stubEnv("APP_TARGET", "production");
+    const mockLogger = makeMockLogger();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedCreateMetricsLogger.mockReturnValueOnce(mockLogger as any);
+
+    const { emitDispatcherMetrics } = await import("./metrics");
+    await emitDispatcherMetrics({
+      ordersSent: 0,
+      ordersFailed: 0,
+      retriedOrders: 0,
+      batchesProcessed: 0,
+    });
+
+    expect(mockLogger.setNamespace).toHaveBeenCalledWith("Bratra/BcSync");
+    expect(mockLogger.setDimensions).toHaveBeenCalledWith({
+      Service: "dispatcher",
+      Target: "production",
+    });
+    expect(mockLogger.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("emiteert exact de vier MET-01 metriek-namen met de aangeleverde waarden", async () => {
+    vi.stubEnv("APP_TARGET", "sandbox");
+    const mockLogger = makeMockLogger();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedCreateMetricsLogger.mockReturnValueOnce(mockLogger as any);
+
+    const { emitDispatcherMetrics } = await import("./metrics");
+    await emitDispatcherMetrics({
+      ordersSent: 5,
+      ordersFailed: 1,
+      retriedOrders: 2,
+      batchesProcessed: 3,
+    });
+
+    expect(mockLogger.putMetric).toHaveBeenCalledTimes(4);
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("OrdersSent", 5, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("OrdersFailed", 1, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("RetriedOrders", 2, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("BatchesProcessed", 3, "Count");
+    expect(mockLogger.setDimensions).toHaveBeenCalledWith({
+      Service: "dispatcher",
+      Target: "sandbox",
+    });
+  });
+});
+
+describe("emitVerifierMetrics lock-step checks", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('gebruikt namespace "Bratra/BcSync" en dimensies {Service:"verifier", Target} met precies één flush', async () => {
+    vi.stubEnv("APP_TARGET", "production");
+    const mockLogger = makeMockLogger();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedCreateMetricsLogger.mockReturnValueOnce(mockLogger as any);
+
+    const { emitVerifierMetrics } = await import("./metrics");
+    await emitVerifierMetrics({
+      ordersVerified: 0,
+      ordersBcRejected: 0,
+      ordersDeadLetter: 0,
+      dlqDepth: 0,
+      errorQueueMessages: 0,
+      stuckInSent: 0,
+    });
+
+    expect(mockLogger.setNamespace).toHaveBeenCalledWith("Bratra/BcSync");
+    expect(mockLogger.setDimensions).toHaveBeenCalledWith({
+      Service: "verifier",
+      Target: "production",
+    });
+    expect(mockLogger.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("emiteert exact de zes MET-02 metriek-namen met de aangeleverde waarden", async () => {
+    vi.stubEnv("APP_TARGET", "sandbox");
+    const mockLogger = makeMockLogger();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedCreateMetricsLogger.mockReturnValueOnce(mockLogger as any);
+
+    const { emitVerifierMetrics } = await import("./metrics");
+    await emitVerifierMetrics({
+      ordersVerified: 10,
+      ordersBcRejected: 2,
+      ordersDeadLetter: 1,
+      dlqDepth: 3,
+      errorQueueMessages: 5,
+      stuckInSent: 4,
+    });
+
+    expect(mockLogger.putMetric).toHaveBeenCalledTimes(6);
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("OrdersVerified", 10, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("OrdersBcRejected", 2, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("OrdersDeadLetter", 1, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("DlqDepth", 3, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("ErrorQueueMessages", 5, "Count");
+    expect(mockLogger.putMetric).toHaveBeenCalledWith("StuckInSent", 4, "Count");
+    expect(mockLogger.setDimensions).toHaveBeenCalledWith({
+      Service: "verifier",
+      Target: "sandbox",
+    });
   });
 });
