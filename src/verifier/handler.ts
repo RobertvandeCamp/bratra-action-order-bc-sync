@@ -197,6 +197,9 @@ export const handler = async (
       dlqDepth: dlqSummary?.processed ?? 0,
       errorQueueMessages: errorQueueSummary?.deleted ?? 0,
       stuckInSent,
+    }).catch((err: Error) => {
+      // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+      runLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
     });
   }
 };
