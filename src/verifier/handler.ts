@@ -2,7 +2,7 @@ import type { ScheduledEvent, Context } from "aws-lambda";
 
 import { getConfig } from "../shared/config";
 import { createRunLogger } from "../shared/logger";
-import { emitVerifierMetrics } from "../shared/metrics";
+import { emitMetricsSafely, emitVerifierMetrics } from "../shared/metrics";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { fetchAllPages } from "../shared/paginate";
@@ -192,16 +192,17 @@ export const handler = async (
     //                         zie docstring op VerifierMetricsCounts.dlqDepth)
     //   ErrorQueueMessages <- errorQueueSummary.deleted  (error-queue-berichten geconsumeerd)
     //   StuckInSent        <- stuckInSent                (al-opgehaalde sent-set, sent_at < now-60min)
-    await emitVerifierMetrics({
-      ordersVerified: bufferSummary?.verified ?? 0,
-      ordersBcRejected: errorQueueSummary?.matched ?? 0,
-      ordersDeadLetter: bufferSummary?.deadLetter ?? 0,
-      dlqDepth: (dlqSummary?.processed ?? 0) + (dlqSummary?.errors ?? 0),
-      errorQueueMessages: errorQueueSummary?.deleted ?? 0,
-      stuckInSent,
-    }).catch((err: Error) => {
-      // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
-      runLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
-    });
+    // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+    await emitMetricsSafely(
+      emitVerifierMetrics({
+        ordersVerified: bufferSummary?.verified ?? 0,
+        ordersBcRejected: errorQueueSummary?.matched ?? 0,
+        ordersDeadLetter: bufferSummary?.deadLetter ?? 0,
+        dlqDepth: (dlqSummary?.processed ?? 0) + (dlqSummary?.errors ?? 0),
+        errorQueueMessages: errorQueueSummary?.deleted ?? 0,
+        stuckInSent,
+      }),
+      runLogger,
+    );
   }
 };

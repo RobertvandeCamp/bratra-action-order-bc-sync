@@ -9,7 +9,12 @@
 //
 // Target-resolutie spiegelt logger.ts: process.env.APP_TARGET?.trim() met
 // "sandbox" als veilige default voor unset/leeg (geen "legacy" — Target-dim
-// accepteert alleen "production" | "sandbox").
+// accepteert alleen "production" | "sandbox"); andere niet-lege waarden
+// gooien fail-fast (spiegelt config.ts resolveTargetPrefix()).
+//
+// emitMetricsSafely() is de canonieke emit-guard: call-sites wrappen hun
+// emit-promise erin i.p.v. losse `.catch((err: Error) => ...)`-guards
+// (non-Error-rejections ontsnapten daar uit de catch).
 // ============================================================================
 import { createMetricsLogger, Unit } from "aws-embedded-metrics";
 
@@ -41,6 +46,27 @@ export function resolveMetricsTarget(): "production" | "sandbox" {
   throw new Error(
     `Invalid APP_TARGET "${normalized}" for metrics Target dimension; allowed values: "production", "sandbox" (or unset/empty for the "sandbox" default)`,
   );
+}
+
+/**
+ * Guard rond een emit-promise: await en vang ELKE rejection op als een
+ * metrics.flush_error-warn-log (T-209-03: een flush-fout mag summary-bewijs,
+ * rethrow- of swallow-semantiek van de handler nooit beïnvloeden).
+ *
+ * Veilige narrowing (`err instanceof Error ? err.message : String(err)`):
+ * een non-Error-rejection zou anders binnen de catch zelf gooien en alsnog
+ * uit de guard ontsnappen.
+ */
+export async function emitMetricsSafely(
+  emit: Promise<void>,
+  log: { warn: (obj: object, msg: string) => void },
+): Promise<void> {
+  try {
+    await emit;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.warn({ error: message, event: "metrics.flush_error" }, "metrics.flush_error");
+  }
 }
 
 // ============================================================================

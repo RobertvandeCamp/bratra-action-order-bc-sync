@@ -113,6 +113,46 @@ describe("resolveMetricsTarget", () => {
 });
 
 // ============================================================================
+// emitMetricsSafely — canonieke emit-guard (PR #16 review, Rule of Three)
+// ============================================================================
+
+describe("emitMetricsSafely", () => {
+  it("await de emit-promise en logt niets bij succes", async () => {
+    const { emitMetricsSafely } = await import("./metrics");
+    const warn = vi.fn();
+    await expect(
+      emitMetricsSafely(Promise.resolve(), { warn }),
+    ).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("vangt een Error-rejection op als metrics.flush_error-warn", async () => {
+    const { emitMetricsSafely } = await import("./metrics");
+    const warn = vi.fn();
+    await expect(
+      emitMetricsSafely(Promise.reject(new Error("flush failed")), { warn }),
+    ).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      { error: "flush failed", event: "metrics.flush_error" },
+      "metrics.flush_error",
+    );
+  });
+
+  it("vangt een non-Error-rejection op zonder zelf te gooien (veilige narrowing)", async () => {
+    const { emitMetricsSafely } = await import("./metrics");
+    const warn = vi.fn();
+    await expect(
+      emitMetricsSafely(Promise.reject(undefined), { warn }),
+    ).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      { error: "undefined", event: "metrics.flush_error" },
+      "metrics.flush_error",
+    );
+  });
+});
+
+// ============================================================================
 // emitDispatcherMetrics — exported async function, resolves zonder te gooien
 // ============================================================================
 

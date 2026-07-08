@@ -18,7 +18,7 @@ import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import { logger, createRunLogger } from "../shared/logger";
-import { emitDispatcherMetrics } from "../shared/metrics";
+import { emitDispatcherMetrics, emitMetricsSafely } from "../shared/metrics";
 import {
   buildDispatchedEvent,
   buildSentEvent,
@@ -145,14 +145,15 @@ export const handler = async (
       );
       // T-209-03: flush-fout mag de swallow-semantiek van dit pad (bericht
       // verwijderen, NIET rethrowen) nooit doorbreken.
-      await emitDispatcherMetrics({
-        ordersSent: 0,
-        ordersFailed: 0,
-        retriedOrders: 0,
-        batchesProcessed: 0,
-      }).catch((err: Error) => {
-        invalidMsgLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
-      });
+      await emitMetricsSafely(
+        emitDispatcherMetrics({
+          ordersSent: 0,
+          ordersFailed: 0,
+          retriedOrders: 0,
+          batchesProcessed: 0,
+        }),
+        invalidMsgLogger,
+      );
       return;
     }
     companyId = extracted.companyId;
@@ -789,15 +790,16 @@ export const handler = async (
       },
       "dispatch.summary",
     );
-    await emitDispatcherMetrics({
-      ordersSent: summary.ordersSent,
-      ordersFailed: summary.ordersFailed,
-      retriedOrders: summary.retriedOrders,
-      batchesProcessed: summary.batchesProcessed,
-    }).catch((err: Error) => {
-      // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
-      runLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
-    });
+    // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+    await emitMetricsSafely(
+      emitDispatcherMetrics({
+        ordersSent: summary.ordersSent,
+        ordersFailed: summary.ordersFailed,
+        retriedOrders: summary.retriedOrders,
+        batchesProcessed: summary.batchesProcessed,
+      }),
+      runLogger,
+    );
   }
 };
 
