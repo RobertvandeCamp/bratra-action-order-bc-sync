@@ -21,10 +21,26 @@ import { createMetricsLogger, Unit } from "aws-embedded-metrics";
  * - unset / leeg / whitespace -> "sandbox" (veilige default; spiegelt config.ts
  *   resolveTargetPrefix()-logica maar kiest "sandbox" i.p.v. de legacy-prefix
  *   omdat Target-dim alleen production|sandbox mag zijn)
+ * - andere niet-lege waarde (bv. "prod", "Production") -> throw (fail-fast,
+ *   spiegelt de enum-validatie in config.ts resolveTargetPrefix(); zonder deze
+ *   guard zou een typo stil als "sandbox" gelabeld worden). De emit-call-sites
+ *   zijn met een catch-guard omgeven, dus de throw surfacet als een
+ *   metrics.flush_error-log i.p.v. een misgelabelde metriek.
+ *
+ * Bewust GEEN zod en GEEN import van config.ts: deze module moet self-contained
+ * blijven voor de lock-step-kopieën.
  */
 export function resolveMetricsTarget(): "production" | "sandbox" {
   const normalized = process.env.APP_TARGET?.trim();
-  return normalized === "production" ? "production" : "sandbox";
+  if (!normalized) {
+    return "sandbox";
+  }
+  if (normalized === "production" || normalized === "sandbox") {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid APP_TARGET "${normalized}" for metrics Target dimension; allowed values: "production", "sandbox" (or unset/empty for the "sandbox" default)`,
+  );
 }
 
 // ============================================================================

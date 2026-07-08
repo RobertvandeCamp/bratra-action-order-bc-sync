@@ -77,6 +77,39 @@ describe("resolveMetricsTarget", () => {
     const { resolveMetricsTarget } = await importFreshMetrics();
     expect(resolveMetricsTarget()).toBe("sandbox");
   });
+
+  // Fail-fast (PR #16 review): een typo mag NOOIT stil als "sandbox" gelabeld
+  // worden — spiegelt de enum-validatie van config.ts resolveTargetPrefix().
+  it('APP_TARGET="Production" (verkeerde casing) gooit fail-fast', async () => {
+    process.env.APP_TARGET = "Production";
+    const { resolveMetricsTarget } = await importFreshMetrics();
+    expect(() => resolveMetricsTarget()).toThrow(
+      'Invalid APP_TARGET "Production"',
+    );
+  });
+
+  it('APP_TARGET="prod" (typo) gooit fail-fast met toegestane waarden in de melding', async () => {
+    process.env.APP_TARGET = "prod";
+    const { resolveMetricsTarget } = await importFreshMetrics();
+    expect(() => resolveMetricsTarget()).toThrow(
+      /Invalid APP_TARGET "prod".*"production", "sandbox"/,
+    );
+  });
+
+  it("fail-fast in resolver surfacet als rejection van de async emit (catch-guard pad)", async () => {
+    process.env.APP_TARGET = "prod";
+    const { emitDispatcherMetrics } = await importFreshMetrics();
+    // emitDispatcherMetrics is async: de sync throw wordt een rejection die de
+    // .catch-guard op de call-sites opvangt (metrics.flush_error-log).
+    await expect(
+      emitDispatcherMetrics({
+        ordersSent: 0,
+        ordersFailed: 0,
+        retriedOrders: 0,
+        batchesProcessed: 0,
+      }),
+    ).rejects.toThrow('Invalid APP_TARGET "prod"');
+  });
 });
 
 // ============================================================================
