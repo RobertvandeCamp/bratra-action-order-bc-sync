@@ -187,14 +187,16 @@ export const handler = async (
     //   OrdersVerified     <- bufferSummary.verified     (BC buffer Done -> verified)
     //   OrdersBcRejected   <- errorQueueSummary.matched  (error-queue matched = bc_rejected-transitie)
     //   OrdersDeadLetter   <- bufferSummary.deadLetter   (>1h NotFound -> dead_letter)
-    //   DlqDepth           <- dlqSummary.processed       (DLQ-berichten gezien/verwerkt deze run)
+    //   DlqDepth           <- dlqSummary.processed + errors (DLQ-berichten GEZIEN deze run,
+    //                         incl. verwerkingsfouten; per-run teller, GEEN queue-diepte —
+    //                         zie docstring op VerifierMetricsCounts.dlqDepth)
     //   ErrorQueueMessages <- errorQueueSummary.deleted  (error-queue-berichten geconsumeerd)
     //   StuckInSent        <- stuckInSent                (al-opgehaalde sent-set, sent_at < now-60min)
     await emitVerifierMetrics({
       ordersVerified: bufferSummary?.verified ?? 0,
       ordersBcRejected: errorQueueSummary?.matched ?? 0,
       ordersDeadLetter: bufferSummary?.deadLetter ?? 0,
-      dlqDepth: dlqSummary?.processed ?? 0,
+      dlqDepth: (dlqSummary?.processed ?? 0) + (dlqSummary?.errors ?? 0),
       errorQueueMessages: errorQueueSummary?.deleted ?? 0,
       stuckInSent,
     }).catch((err: Error) => {

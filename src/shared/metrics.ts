@@ -66,6 +66,17 @@ export interface VerifierMetricsCounts {
   ordersVerified: number;
   ordersBcRejected: number;
   ordersDeadLetter: number;
+  /**
+   * Aantal DLQ-berichten GEZIEN in deze verifier-run:
+   * dlqSummary.processed (verwerkt en uit de queue verwijderd)
+   * + dlqSummary.errors (gezien maar verwerking faalde).
+   *
+   * LET OP: dit is een per-run consumptieteller, GEEN standing queue-diepte
+   * (ApproximateNumberOfMessages). De naam "DlqDepth" ligt vast in MET-02 en
+   * de fase-210-alarmen bouwen erop — NIET hernoemen. Door errors mee te
+   * tellen onderrapporteert de metriek niet juist wanneer de DLQ-checker
+   * faalt en de backlog groeit.
+   */
   dlqDepth: number;
   errorQueueMessages: number;
   stuckInSent: number;
