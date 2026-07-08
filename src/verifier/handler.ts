@@ -2,6 +2,7 @@ import type { ScheduledEvent, Context } from "aws-lambda";
 
 import { getConfig } from "../shared/config";
 import { createRunLogger } from "../shared/logger";
+import { emitVerifierMetrics } from "../shared/metrics";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { authenticateM2M } from "../shared/bc-auth";
 import { fetchAllPages } from "../shared/paginate";
@@ -49,6 +50,10 @@ export const handler = async (
   let bufferNote = "not reached";
   let dlqSummary: DlqSummary | null = null;
   let verifyStatus: "ok" | "failed" = "ok";
+  // StuckInSent: berekend op de al-opgehaalde sentOrders (sent_at < now-60min),
+  // geen extra Supabase-query. Default 0 zodat een crash vóór de fetch geen
+  // ongedefinieerde waarde emits.
+  let stuckInSent = 0;
 
   try {
     // 1. Validated config
@@ -97,6 +102,13 @@ export const handler = async (
           .range(from, to),
       "Failed to query sent orders",
     );
+
+    // StuckInSent: orders die al ≥60 min in "sent" staan zonder verificatie.
+    // Berekend op de al-opgehaalde sentOrders — geen extra Supabase-query (MET-02).
+    const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    stuckInSent = sentOrders.filter(
+      (o) => o.sent_at !== null && o.sent_at < sixtyMinutesAgo,
+    ).length;
 
     // 5-7. Buffer check. Defer ALLEEN wanneer de error-queue-check WEL draaide maar
     // berichten ONVERWERKT liet (errors > 0): dan kan er nog een pending bc_rejected-
@@ -171,5 +183,20 @@ export const handler = async (
       dlq: dlqSummary ?? "skipped (error)",
       errorQueue: errorQueueSummary ?? "skipped (error)",
     }, "verify.summary");
+    // Metriek-bronnen (MET-02):
+    //   OrdersVerified     <- bufferSummary.verified     (BC buffer Done -> verified)
+    //   OrdersBcRejected   <- errorQueueSummary.matched  (error-queue matched = bc_rejected-transitie)
+    //   OrdersDeadLetter   <- bufferSummary.deadLetter   (>1h NotFound -> dead_letter)
+    //   DlqDepth           <- dlqSummary.processed       (DLQ-berichten gezien/verwerkt deze run)
+    //   ErrorQueueMessages <- errorQueueSummary.deleted  (error-queue-berichten geconsumeerd)
+    //   StuckInSent        <- stuckInSent                (al-opgehaalde sent-set, sent_at < now-60min)
+    await emitVerifierMetrics({
+      ordersVerified: bufferSummary?.verified ?? 0,
+      ordersBcRejected: errorQueueSummary?.matched ?? 0,
+      ordersDeadLetter: bufferSummary?.deadLetter ?? 0,
+      dlqDepth: dlqSummary?.processed ?? 0,
+      errorQueueMessages: errorQueueSummary?.deleted ?? 0,
+      stuckInSent,
+    });
   }
 };

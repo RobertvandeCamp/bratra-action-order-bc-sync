@@ -35,6 +35,18 @@ vi.mock("../shared/config", () => ({
   },
 }));
 
+// aws-embedded-metrics: mock zodat emitVerifierMetrics() geen netwerkverbinding
+// probeert in tests (ECONNREFUSED 0.0.0.0:25888 bij echte flush naar CW Agent).
+vi.mock("aws-embedded-metrics", () => ({
+  createMetricsLogger: vi.fn(() => ({
+    setNamespace: vi.fn(),
+    setDimensions: vi.fn(),
+    putMetric: vi.fn(),
+    flush: vi.fn().mockResolvedValue(undefined),
+  })),
+  Unit: { Count: "Count" },
+}));
+
 import { handler } from "./handler";
 
 describe("verifier crash -> verify.summary + rethrow (round 2 F1)", () => {
