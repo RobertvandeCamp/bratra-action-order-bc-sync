@@ -143,7 +143,16 @@ export const handler = async (
         },
         "dispatch.summary",
       );
-      await emitDispatcherMetrics({ ordersSent: 0, ordersFailed: 0, retriedOrders: 0, batchesProcessed: 0 });
+      // T-209-03: flush-fout mag de swallow-semantiek van dit pad (bericht
+      // verwijderen, NIET rethrowen) nooit doorbreken.
+      await emitDispatcherMetrics({
+        ordersSent: 0,
+        ordersFailed: 0,
+        retriedOrders: 0,
+        batchesProcessed: 0,
+      }).catch((err: Error) => {
+        invalidMsgLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
+      });
       return;
     }
     companyId = extracted.companyId;
@@ -785,6 +794,9 @@ export const handler = async (
       ordersFailed: summary.ordersFailed,
       retriedOrders: summary.retriedOrders,
       batchesProcessed: summary.batchesProcessed,
+    }).catch((err: Error) => {
+      // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+      runLogger.warn({ error: err.message, event: "metrics.flush_error" }, "metrics.flush_error");
     });
   }
 };
