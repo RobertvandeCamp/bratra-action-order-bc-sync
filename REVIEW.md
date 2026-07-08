@@ -23,7 +23,9 @@ review only.
 ## What "Important" means here (fix before merge)
 
 - **Correctness:** incorrect logic, unhandled edge cases, broken error
-  propagation, off-by-one, race conditions in async/concurrent code.
+  propagation, off-by-one, race conditions in async/concurrent code; floating
+  promises — an async call that is neither awaited, returned, nor explicitly
+  handled silently drops its errors (in Python: coroutines never awaited).
 - **Contracts:** an external I/O boundary (DB, S3, SFTP, network, queue) without
   schema validation (Zod/Pydantic), or types that aren't derived from the schema.
   `any` or unsafe casts that silence the type checker at a boundary.
@@ -34,7 +36,9 @@ review only.
 - **Security:** unsanitized user input reaching a sink; SSRF (server-side
   requests built from user input); `eval` or dynamic code execution; open
   redirects; commands built from user input; secrets hardcoded instead of in a
-  secret store.
+  secret store; weak or hand-rolled crypto in a security context (MD5/SHA-1 for
+  integrity/signatures, `Math.random()` for tokens, passwords not hashed with
+  bcrypt/scrypt/argon2).
 - **Data scope:** database queries not scoped to the caller's tenant/company;
   PII (emails, user IDs, request bodies) in logs or error messages.
 - **Reversibility:** a non-backward-compatible change without a migration or
@@ -68,6 +72,13 @@ review only.
 - Log lines exclude emails, user IDs, and request bodies.
 - Secrets resolve from a secret store, never from hardcoded values or committed
   config.
+- Logs go through the structured logger with levels and a correlation/request
+  id; no stray `console.log` / `print` left in production paths (CLI tools and
+  dev scripts are exempt).
+- Lambda/serverless: SDK clients, DB pools, and other reusable resources are
+  created at module scope so warm invocations reuse them, not per invocation.
+- Python: no mutable default arguments, no bare `except` or silently swallowed
+  exceptions, `is` (not `==`) for `None` comparisons, no `from module import *`.
 
 ## Verification bar
 
