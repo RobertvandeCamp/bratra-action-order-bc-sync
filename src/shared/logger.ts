@@ -46,7 +46,7 @@ export const logger = pino({
 export function createRunLogger(context: {
   traceId: string;
   requestId: string;
-  trigger: "sqs" | "scheduled" | "manual";
+  trigger: "sqs" | "s3" | "http" | "scheduled" | "manual";
   companyId?: number;
 }): pino.Logger {
   return logger.child(context);
