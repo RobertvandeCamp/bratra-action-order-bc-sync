@@ -18,6 +18,7 @@ import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import { logger, createRunLogger } from "../shared/logger";
+import { emitDispatcherMetrics } from "../shared/metrics";
 import {
   buildDispatchedEvent,
   buildSentEvent,
@@ -142,6 +143,7 @@ export const handler = async (
         },
         "dispatch.summary",
       );
+      await emitDispatcherMetrics({ ordersSent: 0, ordersFailed: 0, retriedOrders: 0, batchesProcessed: 0 });
       return;
     }
     companyId = extracted.companyId;
@@ -778,6 +780,12 @@ export const handler = async (
       },
       "dispatch.summary",
     );
+    await emitDispatcherMetrics({
+      ordersSent: summary.ordersSent,
+      ordersFailed: summary.ordersFailed,
+      retriedOrders: summary.retriedOrders,
+      batchesProcessed: summary.batchesProcessed,
+    });
   }
 };
 
