@@ -18,6 +18,7 @@ import { getConfig } from "../shared/config";
 import { getSupabaseClient } from "../shared/supabase-client";
 import { logSyncEvent } from "../shared/event-logger";
 import { logger, createRunLogger } from "../shared/logger";
+import { emitDispatcherMetrics, emitMetricsSafely } from "../shared/metrics";
 import {
   buildDispatchedEvent,
   buildSentEvent,
@@ -141,6 +142,17 @@ export const handler = async (
           retriedOrders: 0,
         },
         "dispatch.summary",
+      );
+      // T-209-03: flush-fout mag de swallow-semantiek van dit pad (bericht
+      // verwijderen, NIET rethrowen) nooit doorbreken.
+      await emitMetricsSafely(
+        emitDispatcherMetrics({
+          ordersSent: 0,
+          ordersFailed: 0,
+          retriedOrders: 0,
+          batchesProcessed: 0,
+        }),
+        invalidMsgLogger,
       );
       return;
     }
@@ -777,6 +789,16 @@ export const handler = async (
         ...summary,
       },
       "dispatch.summary",
+    );
+    // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+    await emitMetricsSafely(
+      emitDispatcherMetrics({
+        ordersSent: summary.ordersSent,
+        ordersFailed: summary.ordersFailed,
+        retriedOrders: summary.retriedOrders,
+        batchesProcessed: summary.batchesProcessed,
+      }),
+      runLogger,
     );
   }
 };
