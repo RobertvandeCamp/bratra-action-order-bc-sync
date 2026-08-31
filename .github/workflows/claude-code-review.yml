@@ -20,6 +20,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      # Lesson 3 needs BOTH halves: the gh pr checks grant in the allowlist below
+      # AND this scope. Without it `gh pr checks` fails with "GraphQL: Resource
+      # not accessible by integration" and the reviewer falls straight back into
+      # the caveat that lesson exists to remove ("could not verify CI"). Measured
+      # on bratra-bc-mcp-server PR #8 (2026-08-31): both checks were green while
+      # the review said CI was unverifiable. Handing out a tool without its scope
+      # is the same failure as handing out one without its data (Lesson 1/2).
+      checks: read
       id-token: write
     steps:
       - name: Checkout repository
