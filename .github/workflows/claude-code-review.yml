@@ -20,13 +20,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      # Lesson 3 needs BOTH halves: the gh pr checks grant in the allowlist below
-      # AND this scope. Without it `gh pr checks` fails with "GraphQL: Resource
-      # not accessible by integration" and the reviewer falls straight back into
-      # the caveat that lesson exists to remove ("could not verify CI"). Measured
-      # on bratra-bc-mcp-server PR #8 (2026-08-31): both checks were green while
-      # the review said CI was unverifiable. Handing out a tool without its scope
-      # is the same failure as handing out one without its data (Lesson 1/2).
+      # Least-privilege completeness for the allowlist's `gh pr checks` grant.
+      # NECESSARY BUT NOT SUFFICIENT — read the next paragraph before assuming
+      # this fixes Lesson 3.
       checks: read
       id-token: write
     steps:
@@ -104,6 +100,29 @@ jobs:
           # added, and the prompt now states explicitly that gates are not its job.
           # Do NOT add npm ci to this job: it duplicates CI, costs runtime, and widens
           # the Bash grant in a job whose prompt contains PR-author-controlled text.
+          #
+          # Lesson 3b — bratra-bc-mcp-server PR #8 (2026-08-31): Lesson 3 was NOT
+          # actually fixed by adding gh pr checks. Measured from run 33394240527's
+          # claude-execution-output.json: both checks green, yet the review still
+          # opened with "CI status could not be verified" because the command failed
+          # with "GraphQL: Resource not accessible BY INTEGRATION".
+          #
+          # The word "integration" is the tell: it means a GitHub App, not the
+          # workflow token. This action exchanges its OIDC token for an App
+          # installation token ("Exchanging OIDC token for app token" in the job log)
+          # and `gh` runs under THAT token — so the `permissions:` block above, which
+          # only governs GITHUB_TOKEN, cannot grant this. `checks: read` there is
+          # correct least-privilege hygiene and harmless, but it is NOT the fix, and
+          # a first attempt that assumed otherwise changed nothing.
+          #
+          # THE ACTUAL FIX IS OUTSIDE THIS FILE: the Claude GitHub App installation
+          # needs repository permission Checks: Read (GitHub → App installation →
+          # Repository permissions). That is an account/org setting, applies to every
+          # repo at once, and needs no workflow change. Until it is granted, expect
+          # the CI caveat regardless of what this file says.
+          #
+          # Verify with the artifact, not by eye: download claude-execution-output.json
+          # from the run and grep for "Resource not accessible". Absent = granted.
           #
           # HEALTH METRIC: permission_denials_count (~0), not pass/fail. Green with 13
           # denials is one PR away from the cliff. Read it from the
