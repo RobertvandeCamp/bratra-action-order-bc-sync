@@ -1,9 +1,15 @@
 name: Claude Code Review
 
+# Automated code review by Claude on every PR.
+# Auth via Claude Pro/Max subscription (OAuth token), not via an API key.
+# Secret CLAUDE_CODE_OAUTH_TOKEN must be set as a repository secret (Actions).
+# Review behavior is tuned by REVIEW.md in the repo root (see this folder).
+
 on:
   pull_request:
     types: [opened, synchronize]
 
+# Avoid duplicate/parallel reviews on rapid successive pushes.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -19,12 +25,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          # Full history, NOT fetch-depth: 1. At depth 1 there is only one commit, so
+          # git diff/log/show cannot compare against the base — the reviewer would be
+          # handed tools that cannot work. See the claude_args comment below.
+          fetch-depth: 0
 
       - name: Claude Code Review
+        id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Keep the other PR bot's comments out of Claude's context.
           exclude_comments_by_actor: "cursor[bot]"
           prompt: |
             REPO: ${{ github.repository }}
@@ -34,6 +45,83 @@ jobs:
             working directory. Follow REVIEW.md in the repo root and honor any
             CLAUDE.md conventions. Add inline comments on specific lines and use a
             top-level comment for the summary.
+
+            QUALITY GATES ARE NOT YOUR JOB. A separate `ci` workflow runs lint,
+            typecheck, test, build and validate on every commit of this PR. You have
+            no node_modules and no install step — that is deliberate, not a gap.
+            Do NOT try to run them, and do NOT write a caveat saying you could not
+            verify them: run `gh pr checks <PR NUMBER>` and cite the actual result.
+            A red `ci` check is a finding worth raising; a green one means the gates
+            are verified and you can spend your turns on judgement instead.
+          # Cost control (--max-turns) + tools to READ code and post comments.
+          #
+          # error_max_turns is almost never a budget problem — it is an allowlist
+          # problem. The reviewer burns turns on permission denials and hits the cap.
+          # So NEVER raise --max-turns on its own; look at permission_denials_count
+          # first.
+          #
+          # Lesson 1 — bratra-action-order-bc-sync (2026-07-01): --max-turns 15 (and
+          # even 40) died on error_max_turns because the allowlist granted NO read
+          # access at all. Read/Grep/Glob added.
+          #
+          # Lesson 2 — money-masters bankfiles-to-csv-service PR #17 (2026-07-16), run
+          # 29504885153: still dying on error_max_turns. Measured from that run:
+          # num_turns 41 (cap 40), permission_denials_count 13, total_cost_usd 0.89
+          # for ZERO review output. A third of the budget went to denied calls.
+          # Two gaps closed:
+          #   * git log/show — a re-review must see what changed since the commit it
+          #     already commented on; git diff alone cannot do that. Requires
+          #     fetch-depth: 0 (see checkout above), otherwise you are handing out
+          #     tools that cannot work.
+          #   * gh api — gh pr view does NOT return inline review comments; without
+          #     this the reviewer cannot read its own earlier remarks and repeats
+          #     them. DELIBERATELY SCOPED to exactly that read path, not
+          #     Bash(gh api:*): this job's prompt contains PR-author-controlled text
+          #     (title, body, diff), so with an unrestricted grant a successful prompt
+          #     injection would become a WRITE primitive (merge the PR, dismiss
+          #     reviews) over everything the pull-requests: write token can reach.
+          #     Residual risk: the path still permits writing to this one PR's
+          #     comments — accepted deliberately, since gh pr comment and the inline
+          #     comment MCP tool already grant that.
+          #
+          # Lesson 3 — bratra-supplier-onboarding PR #50 (2026-08-06): the reviewer
+          # closed four passes with "gate re-verification wasn't possible in this
+          # sandboxed session (npm install requires interactive approval)". That reads
+          # like an unverified PR, while ci.yml runs lint/typecheck/test/build/validate
+          # on every commit and was green. The gap was not the missing install — that
+          # separation is deliberate: CI verifies, the reviewer judges — but that it
+          # COULD NOT SEE the CI result: gh pr view returns no check status. Without
+          # that, all it can do is write a caveat that reads more alarming than
+          # reality, and a reader may conclude the gates are uncovered. gh pr checks
+          # added, and the prompt now states explicitly that gates are not its job.
+          # Do NOT add npm ci to this job: it duplicates CI, costs runtime, and widens
+          # the Bash grant in a job whose prompt contains PR-author-controlled text.
+          #
+          # HEALTH METRIC: permission_denials_count (~0), not pass/fail. Green with 13
+          # denials is one PR away from the cliff. Read it from the
+          # claude-execution-output.json artifact (see the upload step below).
+          # 60 turns is a ceiling, not a target: a run that needs 25 turns costs 25.
           claude_args: |
-            --max-turns 40
-            --allowedTools "Read,Grep,Glob,Bash(git diff:*),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*)"
+
+      # Makes the next error_max_turns diagnosable: this JSON file carries num_turns,
+      # permission_denials_count and total_cost_usd. Without this artifact "which tools
+      # were denied?" is unanswerable and every allowlist fix stays guesswork (exactly
+      # the problem on PR #17). if: always() — the failed run is the interesting one.
+      - name: Upload Claude execution log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-output
+          # The path comes from the action output, NOT from a guess at runner.temp.
+          # Proven wrong (bratra-supplier-onboarding run 31093959426, 2026-08-06):
+          # "No files were found with the provided path:
+          #  /home/runner/work/_temp/claude-execution-output.json."
+          # With if-no-files-found: ignore the step then reports success while nothing
+          # is uploaded — and that leaves the health metric (permission_denials_count)
+          # invisible, which is the one thing this artifact exists to fix. Hence `warn`
+          # instead of `ignore`, so the next path defect reports itself.
+          path: ${{ steps.claude.outputs.execution_file }}
+          if-no-files-found: warn
+          retention-days: 14
