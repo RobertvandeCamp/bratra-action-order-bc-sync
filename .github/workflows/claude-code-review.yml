@@ -24,6 +24,7 @@ jobs:
       # NECESSARY BUT NOT SUFFICIENT — read the next paragraph before assuming
       # this fixes Lesson 3.
       checks: read
+      actions: read
       id-token: write
     steps:
       - name: Checkout repository
@@ -39,6 +40,13 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The action mints a scope-reduced installation token, so the permissions
+          # block above is not enough on its own -- these must be requested here too
+          # or `gh pr checks` fails with "Resource not accessible by integration".
+          # checks covers the contexts, actions covers checkSuite.workflowRun.
+          additional_permissions: |
+            checks: read
+            actions: read
           # Keep the other PR bot's comments out of Claude's context.
           exclude_comments_by_actor: "cursor[bot]"
           prompt: |
