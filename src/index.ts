@@ -1,9 +1,11 @@
 /**
  * HANDLER env var routing.
  *
- * Dit bestand is NIET een esbuild entry point (die zijn dispatcher/handler.ts
- * en verifier/handler.ts). Het is een convenience re-export voor het geval
- * een enkele Dockerfile CMD naar index.handler wijst.
+ * Dit is de entry point van de Lambda: esbuild bundelt het naar dist/index.js
+ * en de Docker CMD `index.handler` wijst hierheen. Elke Lambda-functie zet
+ * HANDLER in zijn eigen configuratie; dit bestand re-exporteert de bijbehorende
+ * handler. dispatcher/handler.ts en verifier/handler.ts worden daarnaast als
+ * losse bundels gebouwd.
  */
 
 const HANDLER = process.env.HANDLER;
