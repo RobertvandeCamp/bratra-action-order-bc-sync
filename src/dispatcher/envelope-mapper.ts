@@ -12,14 +12,14 @@ import {
 } from "../shared/types";
 
 // ============================================================================
-// Legal Entity Routing (SEG-03)
+// Legal Entity Routing
 // ============================================================================
 
 /**
  * Determine the legal entity for an order via data-driven routing on
- * orders.business_unit (D-02). Fail-fast (throw) bij null/onbekende
- * business_unit (D-04) -- geen stille fallback, zodat ongeclassificeerde
- * orders direct opvallen i.p.v. naar de verkeerde entity gerouteerd te worden.
+ * orders.business_unit. Fail-fast (throw) bij null/onbekende business_unit --
+ * geen stille fallback, zodat ongeclassificeerde orders direct opvallen i.p.v.
+ * naar de verkeerde entity gerouteerd te worden.
  *
  * NB: alle LEGAL_ENTITY_MAP-waarden staan tijdelijk op BRATRA-NL totdat ERP
  * Company de waarden per Bratra-bedrijf bevestigt (zie types.ts).
@@ -179,7 +179,7 @@ export interface SkippedOrder {
 /**
  * Group orders by legal entity and split into sub-batches of max MAX_ORDERS_PER_BATCH.
  *
- * Fail-fast isolatie (D-04, RESEARCH Pitfall 1): determineLegalEntity throwt bij
+ * Fail-fast isolatie: determineLegalEntity throwt bij
  * een ongeclassificeerde order. Die throw wordt PER ORDER opgevangen zodat één
  * slechte order de batch (en daarmee de hele Lambda-invocatie) niet keldert --
  * deze functie wordt namelijk BUITEN de per-batch try/catch in de handler

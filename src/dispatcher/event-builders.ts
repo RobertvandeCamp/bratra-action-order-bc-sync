@@ -1,14 +1,15 @@
 import type { BcSyncEventInsert } from "../shared/types";
 
 /**
- * Pure event-builders voor de dispatcher-transities (fase 185, TRACE-01).
+ * Pure event-builders voor de dispatcher-transities.
  *
- * Elke builder mapt een DB-`.select()`-rij (of, op de D-06 faalpaden, een
- * in-memory fallback-identiteit) naar één `BcSyncEventInsert`. Het `event_type`
- * is per builder HARDcoded (D-02/D-08): de status alleen is niet genoeg, want
- * meerdere event_types mappen op dezelfde status (1:N). De builders zijn puur
- * (geen I/O) zodat de event_type<->status-mapping en de detail-policy
- * (D-03/D-04/D-05) deterministisch te unit-testen zijn.
+ * Elke builder mapt een DB-`.select()`-rij (of, op de faalpaden waar Service Bus
+ * wel verstuurde maar de DB-update faalde, een in-memory fallback-identiteit)
+ * naar één `BcSyncEventInsert`. Het `event_type` is per builder HARDcoded: de
+ * status alleen is niet genoeg, want meerdere event_types mappen op dezelfde
+ * status (1:N). De builders zijn puur (geen I/O) zodat de
+ * event_type<->status-mapping en de detail-policy deterministisch te unit-testen
+ * zijn.
  */
 
 /** Vorm van de rij die de `dispatched`-INSERT-`.select("id")` teruggeeft. */
@@ -36,7 +37,7 @@ export interface DispatchContext {
   batchId: string;
   messageId: string;
   correlationId: string;
-  /** End-to-end trace-id; verplicht zodra handler.ts traceId extraheert (TRACE-04/D-00c). */
+  /** End-to-end trace-id; handler.ts levert hem altijd (SQS-body of awsRequestId). */
   traceId: string;
 }
 
@@ -87,7 +88,7 @@ export function buildSentEvent(
 }
 
 /**
- * `sent` D-06 faalpad: SB is verstuurd maar de DB-update faalde, dus `.select()`
+ * `sent`-faalpad: SB is verstuurd maar de DB-update faalde, dus `.select()`
  * gaf niets. `sync_order_id` komt uit de in-memory map (`DispatchedRow`).
  * `detail.db_update_failed = true` markeert dat de status-kolom achterloopt.
  */
@@ -117,7 +118,7 @@ export function buildSentFallbackEvent(
 
 /**
  * `send_failed`: pending -> failed. `detail.error_message` draagt de bestaande
- * dispatcher-foutstring (geen nieuwe blootstelling, T-185-06 accept).
+ * dispatcher-foutstring (dezelfde string als bc_sync_orders.error_message).
  */
 export function buildSendFailedEvent(
   row: SyncOrderRow,

@@ -36,7 +36,7 @@ import type {
 } from "../shared/types";
 
 /**
- * In-memory fallback voor de D-06 edge: bij de `dispatched`-INSERT-loop vangen
+ * In-memory fallback voor de SB-sent-maar-DB-faalt-edge: bij de `dispatched`-INSERT-loop vangen
  * we per order de teruggekomen `sync_order_id` (de bc_sync_orders.id). Als
  * later de status-update naar `sent` faalt (SB is al verstuurd, `.select()`
  * geeft niets terug), leveren deze entries de identiteit voor het `sent`-event
@@ -57,7 +57,7 @@ function isSqsEvent(event: DispatcherEvent): event is SQSEvent {
 }
 
 /**
- * Extract and validate companyId + traceId from SQS message body (T-152.2-02 / TRACE-04).
+ * Extract and validate companyId + traceId from SQS message body.
  *
  * Returns `null` on parse error or invalid companyId (caller deletes from queue).
  * traceId is returned as-is if present and non-empty; empty string otherwise (caller
@@ -82,7 +82,7 @@ export function extractSqsContext(record: SQSRecord): { companyId: number; trace
   }
 }
 
-/** Non-food company (D-04: Non-food first) */
+/** Non-food company: the default for the scheduled/manual trigger path */
 const COMPANY_ID = 2;
 
 /** Postgres unique violation error code */
@@ -97,32 +97,32 @@ const PG_UNIQUE_VIOLATION = "23505";
  * Per-batch error isolation: failure in one batch does not block others.
  * Re-dispatch of failed orders uses UPDATE (not INSERT) on existing bc_sync_orders records.
  *
- * CONSTRAINT D-01: ONLY BC Sandbox. Handler does NOT call BC API (D-02).
- * CONSTRAINT D-02: Sends ONLY to Service Bus via sendToServiceBus(). No direct BC API calls.
+ * Warns (does not block) when the resolved BC_ENVIRONMENT is not a sandbox.
+ * CONSTRAINT: sends ONLY to Service Bus via sendToServiceBus(). No direct BC API calls.
  */
 export const handler = async (
   event: DispatcherEvent,
   context: Context,
 ): Promise<void> => {
-  // Vóór alle branches, zodat óók het invalid-SQS-pad (round 2 F2) een echte
+  // Vóór alle branches, zodat óók het invalid-SQS-pad een echte
   // durationMs in zijn dispatch.summary heeft.
   const startMs = Date.now();
 
-  // Dual-trigger: detect SQS vs ScheduledEvent (D-10)
+  // Dual-trigger: detect SQS vs ScheduledEvent
   let companyId: number;
   let traceId: string;
 
   if (isSqsEvent(event)) {
-    // SQS trigger path: extract companyId + traceId from message body (D-11 / TRACE-04)
-    const record = event.Records[0]; // batch_size=1 per D-12
+    // SQS trigger path: extract companyId + traceId from message body
+    const record = event.Records[0]; // batch_size=1
     const extracted = extractSqsContext(record);
     if (extracted === null) {
       // Invalid message -- return success to delete from queue (avoid DLQ
       // pollution / SQS-redrive storm). Retry-semantiek: NIET rethrowen.
       //
-      // Round 2 F2: dit pad ligt VÓÓR de try/finally-constructie hieronder,
+      // Dit pad ligt VÓÓR de try/finally-constructie hieronder,
       // dus emit hier zelf precies één dispatch.summary met status "failed"
-      // (one-summary-per-run garantie, D-07/D-08). companyId is per definitie
+      // (one-summary-per-run garantie). companyId is per definitie
       // onbekend (body onparseerbaar); traceId valt terug op awsRequestId.
       const invalidMsgLogger = createRunLogger({
         traceId: context.awsRequestId,
@@ -143,7 +143,7 @@ export const handler = async (
         },
         "dispatch.summary",
       );
-      // T-209-03: flush-fout mag de swallow-semantiek van dit pad (bericht
+      // Een flush-fout mag de swallow-semantiek van dit pad (bericht
       // verwijderen, NIET rethrowen) nooit doorbreken.
       await emitMetricsSafely(
         emitDispatcherMetrics({
@@ -157,11 +157,11 @@ export const handler = async (
       return;
     }
     companyId = extracted.companyId;
-    traceId = extracted.traceId || context.awsRequestId; // fallback to awsRequestId (TRACE-04)
+    traceId = extracted.traceId || context.awsRequestId; // fallback to awsRequestId
   } else {
     // ScheduledEvent / manual invoke path (existing behavior)
     companyId = COMPANY_ID;
-    traceId = context.awsRequestId; // altijd awsRequestId op scheduled/manual pad (TRACE-04)
+    traceId = context.awsRequestId; // altijd awsRequestId op scheduled/manual pad
   }
 
   // Run-logger: gebonden aan deze invocatie (traceId, requestId, trigger, companyId)
@@ -173,20 +173,20 @@ export const handler = async (
   });
   runLogger.info("Dispatcher handler invoked");
 
-  // Summary tellers voor het dispatch-run (buiten try: ook bij crash precies één summary-event -- D-07/D-08)
+  // Summary tellers voor het dispatch-run (buiten try: ook bij crash precies één summary-event)
   const summary = {
     ordersSent: 0,
     ordersFailed: 0,
     batchesProcessed: 0,
     retriedOrders: 0,
   };
-  // CR-02: een crash buiten de per-batch catches (config, order-fetch, guard)
-  // moet dispatch.summary status "failed" geven — dit is het emit-punt voor de
-  // 999.25-alarmen; "ok" bij een crash is actief vals bewijs.
+  // Een crash buiten de per-batch catches (config, order-fetch, guard) moet
+  // dispatch.summary status "failed" geven — de CloudWatch-alarmen lezen dit
+  // emit-punt; "ok" bij een crash is actief vals bewijs.
   let crashed = false;
 
   try {
-    // D-01: Warn if the RESOLVED BC_ENVIRONMENT is not sandbox. Read it from
+    // Warn if the RESOLVED BC_ENVIRONMENT is not sandbox. Read it from
     // getConfig() (APP_TARGET-resolver) instead of raw process.env.BC_ENVIRONMENT,
     // so the warning reflects the real target after resolution -- mirrors
     // verifier/handler.ts.
@@ -200,7 +200,7 @@ export const handler = async (
 
     const supabase = getSupabaseClient();
 
-    // D-06: in-memory map order_id -> {sync_order_id, po_number, company_id},
+    // In-memory map order_id -> {sync_order_id, po_number, company_id},
     // gevuld bij elke geslaagde `dispatched`-INSERT. Voedt de SB-sent-maar-DB-
     // faalt-edges (happy-path heeft de identiteit al uit `.select()`).
     const dispatchedIdByOrderId = new Map<number, DispatchedIdentity>();
@@ -232,9 +232,9 @@ export const handler = async (
     if (trulyNewOrders.length > 0) {
       const { batches, skipped } = groupOrdersIntoBatches(trulyNewOrders);
 
-      // Fail-fast (D-04): ongeclassificeerde NEW orders hebben nog geen
+      // Fail-fast: ongeclassificeerde NEW orders hebben nog geen
       // bc_sync_orders-rij. INSERT een rij met status 'failed' zodat de order
-      // traceerbaar is i.p.v. stilletjes te verdwijnen (RESEARCH Open Question 1).
+      // traceerbaar is i.p.v. stilletjes te verdwijnen.
       for (const { order, reason } of skipped) {
         const failedAt = new Date().toISOString();
         runLogger.error(
@@ -257,7 +257,7 @@ export const handler = async (
 
         if (skipInsertError) {
           if (skipInsertError.code === PG_UNIQUE_VIOLATION) {
-            // WR-01: concurrent run already inserted a tracking row for this
+            // A concurrent run already inserted a tracking row for this
             // order. The failed-trace row exists, so this is benign -- mirror the
             // batch INSERT path which also skips silently on 23505.
             runLogger.warn({ orderId: order.id }, "Skipping unclassified order -- concurrent run already claimed");
@@ -280,7 +280,7 @@ export const handler = async (
         // Track claimed orders outside try for catch block access
         const claimedOrders: WarehouseOrder[] = [];
         try {
-          // a. INSERT bc_sync_orders records (status: pending) per D-12
+          // a. INSERT bc_sync_orders records (status: pending)
           const insertRecords: BcSyncOrderInsert[] = batch.orders.map(
             (order) => ({
               status: "pending",
@@ -290,7 +290,7 @@ export const handler = async (
               batch_id: batchId,
               message_id: messageId,
               correlation_id: correlationId,
-              external_id: `BRA-AC-${messageId}-${order.po_number}`, // D-11
+              external_id: `BRA-AC-${messageId}-${order.po_number}`, // key the verifier looks up in the BC buffer
             }),
           );
 
@@ -317,7 +317,7 @@ export const handler = async (
             const syncOrderId = (insertedRows ?? [])[0]?.id as number | undefined;
             claimedOrders.push(order);
 
-            // D-06: bewaar de zojuist gecreëerde sync_order_id voor de fallback.
+            // Bewaar de zojuist gecreëerde sync_order_id voor de fallback.
             if (typeof syncOrderId === "number") {
               dispatchedIdByOrderId.set(order.id, {
                 sync_order_id: syncOrderId,
@@ -339,7 +339,7 @@ export const handler = async (
             }
           }
 
-          // D-01: bulk-log alle dispatched-events in 1 call ná de loop.
+          // Bulk-log alle dispatched-events in 1 call ná de loop.
           await logSyncEvent(supabase, dispatchedEvents, runLogger);
 
           if (claimedOrders.length === 0) {
@@ -355,7 +355,7 @@ export const handler = async (
             legalEntity: batch.legalEntity,
           });
 
-          // c. Check envelope size (D-10, T-151-07)
+          // c. Check envelope size
           if (!checkEnvelopeSize(envelope)) {
             runLogger.warn(
               { batchId, orderCount: batch.orders.length },
@@ -370,7 +370,7 @@ export const handler = async (
           // d. Send to Service Bus
           await sendToServiceBus(envelope);
 
-          // e. Update tracking records -> sent (D-13)
+          // e. Update tracking records -> sent
           const sentAt = new Date().toISOString();
           const { data: sentRows, error: updateError } = await supabase
             .from("bc_sync_orders")
@@ -385,7 +385,7 @@ export const handler = async (
               { batchId, error: updateError.message },
               "SB sent but DB status update failed (orders trackable via externalId)",
             );
-            // D-06 edge: `.select()` gaf niets -> val terug op de in-memory map.
+            // `.select()` gaf niets -> val terug op de in-memory map.
             const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
             const fallbackEvents: BcSyncEventInsert[] = [];
             for (const o of claimedOrders) {
@@ -407,7 +407,7 @@ export const handler = async (
 
           summary.ordersSent += claimedOrders.length;
         } catch (err) {
-          // f. Update tracking records -> failed (D-14)
+          // f. Update tracking records -> failed
           const errorMessage = (err as Error).message;
           const failedAt = new Date().toISOString();
 
@@ -442,7 +442,7 @@ export const handler = async (
       }
     }
 
-    // ---- Re-dispatch FAILED orders (D-05, RESEARCH.md Pitfall 2) ----
+    // ---- Re-dispatch FAILED orders ----
     if (failedRecords.length > 0) {
       // Get the warehouse order data for failed orders
       const failedOrderMap = new Map<number, BcSyncOrderRow>();
@@ -451,7 +451,7 @@ export const handler = async (
       }
 
       // Fetch warehouse data separately for failed orders (they're excluded from newOrders
-      // because 'failed' is in the step 1 anti-join exclusion list)
+      // because the anti-join excludes every order with a bc_sync_orders record)
       const failedOrderIdsList = failedRecords.map((r) => r.order_id);
       const { data: failedOrderRows, error: failedFetchError } = await supabase
         .from("orders")
@@ -466,7 +466,7 @@ export const handler = async (
           "Failed to fetch warehouse data for re-dispatch -- skipping re-dispatch",
         );
         // Don't silently continue -- update summary and skip re-dispatch entirely.
-        // finally will emit dispatch.summary (D-07).
+        // finally will emit dispatch.summary.
         summary.ordersFailed += failedRecords.length;
         runLogger.warn(
           { failedOrderCount: failedRecords.length },
@@ -475,19 +475,19 @@ export const handler = async (
         return; // finally fires → dispatch.summary emitted
       }
 
-      // WR-05: guard the load-bearing shape at the re-dispatch fetch boundary.
+      // Guard the load-bearing shape at the re-dispatch fetch boundary.
       const failedOrderData = assertWarehouseOrders(
         failedOrderRows ?? [],
         "re-dispatch warehouse fetch",
       );
 
-      // WR-02: failed rows whose order is no longer 'approved' (rejected/pending)
+      // Failed rows whose order is no longer 'approved' (rejected/pending)
       // must be terminated ('skipped') so they leave the candidate set, otherwise
-      // they keep retry_count < max_retries and are re-fetched every run forever
-      // (same unbounded-loop family as CR-01). SYNC-01 already guarantees we do
-      // not re-send unapproved orders; this also stops the churn.
+      // they keep retry_count < max_retries and are re-fetched every run forever.
+      // The approval filter on the fetch above already guarantees we do not
+      // re-send unapproved orders; this also stops the churn.
       //
-      // BUGFIX: absence from failedOrderData is NOT proof of disapproval. The
+      // Absence from failedOrderData is NOT proof of disapproval. The
       // re-dispatch fetch above also drops rows via `action_articles!inner` and
       // other line filters, so a STILL-approved order can be missing purely
       // because a join filtered it out. Marking those 'skipped' would wrongly
@@ -510,7 +510,7 @@ export const handler = async (
         if (approvalCheckError) {
           // Cannot determine approval -- do NOT skip on inference. Leave the rows
           // 'failed' so they remain candidates; a later run re-checks them. This
-          // is safe: SYNC-01 still prevents re-sending unapproved orders.
+          // is safe: the approval filter on the fetch still prevents re-sending them.
           runLogger.error(
             { error: approvalCheckError.message, absentCount: absentOrderIds.length },
             "Failed to re-check approval_status for absent failed records -- not terminating them",
@@ -559,7 +559,7 @@ export const handler = async (
         const { batches: failedBatches, skipped: failedSkipped } =
           groupOrdersIntoBatches(failedOrderData);
 
-        // Fail-fast (D-04): ongeclassificeerde re-dispatch orders hebben AL een
+        // Fail-fast: ongeclassificeerde re-dispatch orders hebben AL een
         // bc_sync_orders-rij. Markeer die 'failed' met de skip-reason (match op
         // order_id, want de order zit niet in een batch).
         for (const { order, reason } of failedSkipped) {
@@ -575,11 +575,10 @@ export const handler = async (
             continue;
           }
 
-          // CR-01: increment retry_count so a structurally unroutable order
+          // Increment retry_count so a structurally unroutable order
           // (permanent null/unknown business_unit) eventually reaches max_retries
           // and drops out of fetchFailedSyncRecords -- without this it is
-          // re-fetched and re-skipped on every invocation forever (never reaches
-          // dead_letter). Mirrors the batch-failure path below (handler.ts ~382).
+          // re-fetched and re-skipped on every invocation forever.
           const { error: skipUpdateError } = await supabase
             .from("bc_sync_orders")
             .update({
@@ -648,7 +647,7 @@ export const handler = async (
               }
               resetOrders.push(order);
 
-              // D-06: bewaar de identiteit voor de re-dispatch SB-sent-DB-faalt-edge.
+              // Bewaar de identiteit voor de re-dispatch SB-sent-DB-faalt-edge.
               dispatchedIdByOrderId.set(order.id, {
                 sync_order_id: syncRecord.id,
                 po_number: order.po_number,
@@ -716,7 +715,7 @@ export const handler = async (
                 { batchId, error: sentError.message },
                 "SB re-dispatch sent but DB update failed",
               );
-              // D-06 edge (re-dispatch): val terug op de in-memory map.
+              // Re-dispatch: `.select()` gaf niets -> val terug op de in-memory map.
               const ctx: DispatchContext = { batchId, messageId, correlationId, traceId };
               const fallbackEvents: BcSyncEventInsert[] = [];
               for (const o of resetOrders) {
@@ -779,8 +778,8 @@ export const handler = async (
     runLogger.error({ error: (err as Error).message }, "Dispatcher run failed unexpectedly");
     throw err; // rethrow: SQS-retry-semantiek behouden
   } finally {
-    // Precies één dispatch.summary per run, ook bij crash of vroege return (D-07/D-08).
-    // Emit-punt voor 999.25 EMF-metrics (GEEN rij in bc_sync_events).
+    // Precies één dispatch.summary per run, ook bij crash of vroege return.
+    // Emit-punt voor de EMF-metrics (GEEN rij in bc_sync_events).
     runLogger.info(
       {
         event: "dispatch.summary",
@@ -790,7 +789,7 @@ export const handler = async (
       },
       "dispatch.summary",
     );
-    // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+    // Een flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
     await emitMetricsSafely(
       emitDispatcherMetrics({
         ordersSent: summary.ordersSent,
@@ -818,22 +817,21 @@ async function sendOrdersOneByOne(
   supabase: ReturnType<typeof getSupabaseClient>,
   summary: { ordersSent: number; ordersFailed: number },
   dispatchedIdByOrderId: Map<number, DispatchedIdentity>,
-  // WR-04: on re-dispatch the row was already claimed-as-pending with a stable
+  // On re-dispatch the row was already claimed-as-pending with a stable
   // external_id (the verifier reconciles BC buffer records by external_id).
   // Re-randomizing the external_id here would churn it and break that
   // reconciliation, so the re-dispatch caller signals (isRedispatch) that the
   // row's external_id must be left untouched. The NEW path omits it and gets a
-  // fresh single-send external_id as before.
+  // fresh single-send external_id.
   isRedispatch = false,
   traceId: string,
   runLogger: Logger,
 ): Promise<void> {
   for (const order of orders) {
-    // BUGFIX (Duplicate Service Bus message IDs): every individual send MUST get
-    // a UNIQUE broker MessageId. Previously the re-dispatch path reused one
-    // shared batch messageId for every one-by-one POST, so each envelope (and
-    // thus each BrokerProperties.MessageId) was identical -> the broker
-    // deduplicated/rejected the later sends. The broker messageId is decoupled
+    // Every individual send MUST get a UNIQUE broker MessageId. One shared
+    // batch messageId across the one-by-one POSTs makes every envelope (and
+    // thus every BrokerProperties.MessageId) identical, and the broker
+    // deduplicates/rejects the later sends. The broker messageId is decoupled
     // from external_id: we always mint a fresh per-send id for the envelope,
     // while the stable external_id on the row is preserved on re-dispatch.
     const preserveExternalId = isRedispatch;
@@ -874,7 +872,7 @@ async function sendOrdersOneByOne(
         continue;
       }
 
-      // WR-04: keep the stable external_id on re-dispatch (verifier reconciles
+      // Keep the stable external_id on re-dispatch (verifier reconciles
       // by external_id), but still record THIS send's unique broker message_id
       // so the row reflects the id actually sent to the broker. On the NEW path
       // we assign a fresh external_id derived from that same unique messageId.
@@ -906,13 +904,14 @@ async function sendOrdersOneByOne(
         .select("id, order_id, company_id, po_number, retry_count");
 
       if (sentError) {
-        // SB message already sent -- log but mark as sent anyway to prevent
-        // re-dispatch duplicates. The verifier will pick this up via externalId.
+        // SB message already sent -- log and count it as sent; do NOT throw (the
+        // catch below would mark it failed and re-dispatch a duplicate). The
+        // verifier can still find it via externalId.
         runLogger.error(
           { orderId: order.id, error: sentError.message },
           "SB sent but DB update failed (order still trackable via externalId)",
         );
-        // D-06 edge (single): `.select()` gaf niets -> val terug op de map.
+        // Single send: `.select()` gaf niets -> val terug op de map.
         const singleCtx: DispatchContext = {
           batchId: originalBatchId,
           messageId: singleMessageId,

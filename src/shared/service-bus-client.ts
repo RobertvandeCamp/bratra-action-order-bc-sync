@@ -5,7 +5,7 @@ import type { ActionOrderBatchV1Envelope } from "./types";
 /**
  * Generate a SAS token for Azure Service Bus authentication.
  *
- * ResourceUri uses .servicebus.windows.net suffix (RESEARCH.md Pitfall 4).
+ * ResourceUri must use the .servicebus.windows.net suffix.
  * Token TTL: 10 minutes.
  */
 export function generateSasToken(
@@ -27,7 +27,7 @@ export function generateSasToken(
  * Send an ActionOrderBatchV1 envelope to Azure Service Bus via HTTP POST.
  *
  * Uses SAS token authentication. Expects HTTP 201 Created.
- * Never logs the SAS token or key value (T-150-02 threat mitigation).
+ * Never logs the SAS token or key value.
  */
 export async function sendToServiceBus(
   envelope: ActionOrderBatchV1Envelope,

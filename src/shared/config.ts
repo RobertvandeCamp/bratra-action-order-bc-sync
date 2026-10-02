@@ -10,15 +10,14 @@ import { z } from "zod";
  * Config return type opgenomen -- authenticateM2M leest ze direct uit process.env
  * (zelfde patroon als bratra-bc-mcp-server).
  *
- * Let op: dit schema verandert NIET door de APP_TARGET-resolver. Het ontvangt
- * voortaan een door resolveTarget() samengesteld object i.p.v. de hele
- * process.env, maar de veldnamen en het Config-type blijven identiek zodat geen
- * enkele consumer (service-bus-client, supabase-client, dispatcher/verifier)
- * breekt.
+ * Let op: het schema valideert het door resolveTarget() samengestelde object,
+ * niet process.env zelf. De veldnamen en het Config-type zijn ongeprefixt, zodat
+ * de consumers (service-bus-client, supabase-client, dispatcher/verifier) niets
+ * van APP_TARGET hoeven te weten.
  */
 // LOG_LEVEL staat hier BEWUST NIET in: de logger moet ook bestaan wanneer
 // config-validatie faalt (kip-ei bij startup-fouten), dus logger.ts leest en
-// valideert LOG_LEVEL zelf met fallback "info" (round 2 F3). Een tweede
+// valideert LOG_LEVEL zelf met fallback "info". Een tweede
 // schema-entry hier zou dode validatie zijn -- niemand consumeert
 // config.LOG_LEVEL.
 const configSchema = z
@@ -29,7 +28,7 @@ const configSchema = z
     SB_QUEUE: z.string().min(1),
     SB_KEY_NAME: z.string().min(1),
     SB_KEY_VALUE: z.string().min(1),
-    // Error queue (Leo, 15-06-2026): BC-afgekeurde orders belanden hier verrijkt
+    // Error queue: BC-afgekeurde orders belanden hier verrijkt
     // met een error-sectie. Aparte queue -- geen $DeadLetterQueue-subqueue.
     // SB_ERROR_QUEUE default "bratra-error". De Listen-key kan afwijken van de
     // inbound-key; valt terug op SB_KEY_NAME/VALUE als niet apart gezet.
@@ -42,7 +41,7 @@ const configSchema = z
     BC_ENVIRONMENT: z.string().min(1),
     BC_COMPANY_ID: z.string().uuid(),
   })
-  // Cross-field check (claude Important, PR#5): de error-key is een PAAR. Eén
+  // Cross-field check: de error-key is een PAAR. Eén
   // helft zonder de andere mixt SB_ERROR_KEY_NAME met SB_KEY_VALUE (of andersom)
   // -> een kapot SAS-token. Eis beide-gezet of beide-leeg, fail-fast op de grens.
   // De check draait NA resolutie, op de geresolvete error-key-waarden.
@@ -64,9 +63,9 @@ const configSchema = z
 export type Config = z.infer<typeof configSchema>;
 
 /**
- * Shared fetch-timeout voor BC- en Service Bus-fetches (D-01 / RES-01).
+ * Shared fetch-timeout voor BC- en Service Bus-fetches.
  * 30 seconden — ruim onder de 60s dispatcher-timeout en 300s verifier-timeout.
- * AbortSignal.timeout(FETCH_TIMEOUT_MS) is native Node 18+; geen polyfill nodig.
+ * AbortSignal.timeout(FETCH_TIMEOUT_MS) is native in Node; geen polyfill nodig.
  */
 export const FETCH_TIMEOUT_MS = 30_000;
 
@@ -124,9 +123,9 @@ const TARGETED_KEYS = [
  * Cruciaal: APP_TARGET wordt EERST genormaliseerd (trim). Een lege string of
  * whitespace-only waarde -- zoals een nog-niet-gezette repo-variabele die leeg
  * expandeert -- telt als ongezet en valt terug op het legacy-pad ZONDER
- * fail-fast, zodat een deploy met nog-niet-gemigreerde env vars niet breekt en
- * de draaiende default sandbox blijft (scope fence: geen flip). Alleen een
- * niet-lege, niet-toegestane waarde (bv. "prod") faalt fail-fast via de enum.
+ * fail-fast, zodat een deploy met alleen ongeprefixte env vars niet breekt.
+ * Alleen een niet-lege, niet-toegestane waarde (bv. "prod") faalt fail-fast via
+ * de enum.
  */
 function resolveTargetPrefix(): "" | "SANDBOX_" | "PROD_" {
   const normalized = process.env.APP_TARGET?.trim();

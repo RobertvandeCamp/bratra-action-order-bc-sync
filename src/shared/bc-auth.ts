@@ -44,7 +44,7 @@ function getMsalClient(tenantId: string): ConfidentialClientApplication {
  * Uses singleton MSAL client for token caching.
  *
  * BC_CLIENT_ID and BC_CLIENT_SECRET are read directly from process.env
- * by getMsalClient -- never passed through the Config type (T-150-03).
+ * by getMsalClient -- never passed through the Config type.
  */
 export async function authenticateM2M(tenantId: string): Promise<string> {
   const client = getMsalClient(tenantId);
