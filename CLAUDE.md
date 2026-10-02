@@ -31,8 +31,10 @@ scripts/
 ## Dependencies
 
 - @supabase/supabase-js -- Supabase client (action_orders schema)
-- @azure/msal-node v5 -- BC API authenticatie (M2M)
+- @azure/msal-node -- BC API authenticatie (M2M)
 - zod -- Config validatie
+
+Versies staan in `package.json` (gepind in `package-lock.json`).
 
 ## Environment Variables
 
