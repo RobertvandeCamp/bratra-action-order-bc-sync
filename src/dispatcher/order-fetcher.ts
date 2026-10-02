@@ -28,7 +28,7 @@ const ORDER_SELECT = `
 `;
 
 /**
- * WR-05: lightweight runtime guard at the warehouse-fetch I/O boundary.
+ * Lightweight runtime guard at the warehouse-fetch I/O boundary.
  *
  * The Supabase client is untyped, so the result is cast to WarehouseOrder[].
  * Because the WarehouseOrder type is hand-synced (not generated), a renamed
@@ -37,8 +37,8 @@ const ORDER_SELECT = `
  * mapOrder/mapOrderLine actually dereference (order_lines array,
  * action_articles.article_number), failing fast at the boundary instead.
  *
- * Not a full schema validation (Zod would be over-engineering here per the
- * review) -- just the load-bearing shape mapOrder relies on.
+ * Deliberately not a full schema validation -- just the load-bearing shape
+ * mapOrder relies on.
  */
 export function assertWarehouseOrders(
   rows: unknown,
@@ -76,7 +76,7 @@ const CHUNK_SIZE = 500;
  * Fetch orders that have not been synced to BC yet (no bc_sync_orders record in any status).
  *
  * Uses an in-memory anti-join because Supabase JS does not support NOT EXISTS, and
- * the previous `NOT IN (<all synced ids>)` URL did not scale to thousands of ids:
+ * a `NOT IN (<all synced ids>)` URL does not scale to thousands of ids:
  *   1. Collect ALL synced order_ids (any status), paginated past the 1000-row cap.
  *   2a. Collect ALL approved order ids (ids only -- cheap), paginated.
  *   2b. Anti-join in memory: approved ids minus synced ids.
@@ -91,11 +91,11 @@ export async function fetchUnsyncedOrders(
   const supabase = getSupabaseClient();
 
   // Step 1: collect order_ids that already have ANY bc_sync_orders record.
-  // The status filter is intentionally dropped: the contract is "no bc_sync_orders
+  // There is intentionally no status filter: the contract is "no bc_sync_orders
   // record in ANY status", so every record counts -- a superset is exactly what the
   // anti-join needs. This also keeps terminal statuses (skipped/dead_letter/
-  // bc_rejected) excluded from re-dispatch, including bc_rejected which the phase-183
-  // partial unique index does not constrain (ERR-04).
+  // bc_rejected) excluded from re-dispatch, including bc_rejected, which the
+  // partial unique index on bc_sync_orders does not constrain.
   const syncedRows = await fetchAllPages<{ order_id: number }>(
     (from, to) =>
       supabase
@@ -136,7 +136,7 @@ export async function fetchUnsyncedOrders(
   // well under the 1000-row cap. In steady-state unsyncedIds is small.
   // Re-apply company_id + approval_status here (not just on the Step 2a id query):
   // approval can change between Step 2a and this fetch, so the filter must hold at
-  // the warehouse I/O boundary too (SYNC-01).
+  // the warehouse I/O boundary too.
   const orders: WarehouseOrder[] = [];
   for (let i = 0; i < unsyncedIds.length; i += CHUNK_SIZE) {
     const chunk = unsyncedIds.slice(i, i + CHUNK_SIZE);
@@ -155,7 +155,7 @@ export async function fetchUnsyncedOrders(
 
     // Cast via unknown: Supabase untyped client infers distribution_centers as array,
     // but the FK on distribution_center_id makes it a single object at runtime.
-    // WR-05: guard the load-bearing shape at the boundary before casting.
+    // Guard the load-bearing shape at the boundary before casting.
     orders.push(...assertWarehouseOrders(data ?? [], "fetchUnsyncedOrders"));
   }
 
@@ -171,8 +171,8 @@ export async function fetchFailedSyncRecords(
 ): Promise<BcSyncOrderRow[]> {
   const supabase = getSupabaseClient();
 
-  // Fetch all failed records (paginated past the 1000-row cap -- same latent bug
-  // as fetchUnsyncedOrders), then filter retry_count < max_retries in JS
+  // Fetch all failed records (paginated past the 1000-row cap, like
+  // fetchUnsyncedOrders), then filter retry_count < max_retries in JS
   // (PostgREST cannot compare two columns directly).
   const allFailed = await fetchAllPages<BcSyncOrderRow>(
     (from, to) =>
