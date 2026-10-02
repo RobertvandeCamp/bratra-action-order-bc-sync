@@ -22,7 +22,7 @@
     "@types/aws-lambda": "^8.10.161",
     "@types/node": "^24",
     "dotenv": "^17",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.2",
     "tsx": "^4.22.3",
     "typescript": "^5.9",
     "vitest": "^4.1.9"
