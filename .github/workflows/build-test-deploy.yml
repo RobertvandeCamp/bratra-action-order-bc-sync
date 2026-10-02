@@ -2,7 +2,6 @@ name: Build test and deploy
 on:
   push:
     branches:
-      - main
       - master
   # Build and test every PR as well, so a dependency bump is checked before the merge.
   # Merging deploys, so a check that only runs after the merge comes too late.
