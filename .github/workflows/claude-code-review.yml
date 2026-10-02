@@ -47,6 +47,10 @@ jobs:
           additional_permissions: |
             checks: read
             actions: read
+          # Without this the action rejects every Dependabot-triggered run before it
+          # authenticates. Not "*": the token has pull-requests: write, so a wildcard
+          # would let any bot trigger a reviewer with write access.
+          allowed_bots: "dependabot[bot]"
           # Keep the other PR bot's comments out of Claude's context.
           exclude_comments_by_actor: "cursor[bot]"
           prompt: |

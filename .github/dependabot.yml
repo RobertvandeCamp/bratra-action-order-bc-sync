@@ -1,0 +1,38 @@
+# Dependabot version updates.
+#
+# One grouped PR per ecosystem per week (minor + patch), no major bumps.
+# Majors are a deliberate upgrade, not a bot PR. Security alerts and security
+# updates are switched on separately in the repo settings.
+#
+# One `updates` entry per lockfile, plus github-actions.
+
+version: 2
+updates:
+  # GitHub Actions used in .github/workflows/ (tags and SHA pins; a SHA pin's
+  # trailing "# vX.Y.Z" comment is rewritten too).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # npm — root package-lock.json.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
