@@ -4,8 +4,8 @@
 // Verantwoordelijkheid: EMF-records naar stdout (CloudWatch).
 // Namespace: "Bratra/BcSync", dimensies: [Service, Target].
 //
-// Dit is de CANONIEKE bron-module; fase 210 en de importer/trigger-kopieën
-// overnemen exact deze code (multi-repo-kopieconventie zoals de v5.10-logger).
+// Dit is de CANONIEKE bron-module; de kopieën in de importer- en trigger-repo
+// nemen exact deze code over (zelfde multi-repo-kopieconventie als logger.ts).
 //
 // Target-resolutie spiegelt logger.ts: process.env.APP_TARGET?.trim() met
 // "sandbox" als veilige default voor unset/leeg (geen "legacy" — Target-dim
@@ -50,8 +50,8 @@ export function resolveMetricsTarget(): "production" | "sandbox" {
 
 /**
  * Guard rond een emit-promise: await en vang ELKE rejection op als een
- * metrics.flush_error-warn-log (T-209-03: een flush-fout mag summary-bewijs,
- * rethrow- of swallow-semantiek van de handler nooit beïnvloeden).
+ * metrics.flush_error-warn-log (een flush-fout mag summary-bewijs, rethrow- of
+ * swallow-semantiek van de handler nooit beïnvloeden).
  *
  * Veilige narrowing (`err instanceof Error ? err.message : String(err)`):
  * een non-Error-rejection zou anders binnen de catch zelf gooien en alsnog
@@ -84,10 +84,10 @@ export interface DispatcherMetricsCounts {
  * Emit precies één EMF-record voor een dispatcher-run.
  *
  * Namespace: "Bratra/BcSync", dimensies: { Service: "dispatcher", Target }.
- * Metriek-namen (MET-01): OrdersSent, OrdersFailed, RetriedOrders, BatchesProcessed.
+ * Metriek-namen: OrdersSent, OrdersFailed, RetriedOrders, BatchesProcessed.
  *
  * Roep aan DIRECT NA de dispatch.summary logger.info, zodat een flush-fout
- * het summary-bewijs nooit kan onderdrukken (T-209-03).
+ * het summary-bewijs nooit kan onderdrukken.
  */
 export async function emitDispatcherMetrics(counts: DispatcherMetricsCounts): Promise<void> {
   const metrics = createMetricsLogger();
@@ -114,8 +114,8 @@ export interface VerifierMetricsCounts {
    * + dlqSummary.errors (gezien maar verwerking faalde).
    *
    * LET OP: dit is een per-run consumptieteller, GEEN standing queue-diepte
-   * (ApproximateNumberOfMessages). De naam "DlqDepth" ligt vast in MET-02 en
-   * de fase-210-alarmen bouwen erop — NIET hernoemen. Door errors mee te
+   * (ApproximateNumberOfMessages). De naam "DlqDepth" ligt vast: de
+   * CloudWatch-alarmen bouwen erop — NIET hernoemen. Door errors mee te
    * tellen onderrapporteert de metriek niet juist wanneer de DLQ-checker
    * faalt en de backlog groeit.
    */
@@ -128,10 +128,11 @@ export interface VerifierMetricsCounts {
  * Emit precies één EMF-record voor een verifier-run.
  *
  * Namespace: "Bratra/BcSync", dimensies: { Service: "verifier", Target }.
- * Metriek-namen (MET-02): OrdersVerified, OrdersBcRejected, OrdersDeadLetter,
+ * Metriek-namen: OrdersVerified, OrdersBcRejected, OrdersDeadLetter,
  * DlqDepth, ErrorQueueMessages, StuckInSent.
  *
- * Roep aan DIRECT NA de verify.summary logger.info (T-209-03).
+ * Roep aan DIRECT NA de verify.summary logger.info, zodat een flush-fout het
+ * summary-bewijs nooit kan onderdrukken.
  */
 export async function emitVerifierMetrics(counts: VerifierMetricsCounts): Promise<void> {
   const metrics = createMetricsLogger();

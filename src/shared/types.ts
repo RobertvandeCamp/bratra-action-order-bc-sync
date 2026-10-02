@@ -84,7 +84,7 @@ export type SyncStatus =
   | "bc_rejected";
 
 // ============================================================================
-// bc_sync_events (append-only audit-log) -- fase 185, TRACE-01
+// bc_sync_events (append-only audit-log)
 // ============================================================================
 
 /**
@@ -92,8 +92,8 @@ export type SyncStatus =
  * `action_orders.bc_sync_events` (migratie 20260623151957). Eén type per
  * statusovergang; meerdere types kunnen op dezelfde `status` mappen (1:N), bv.
  * `send_failed`/`stale_recovered`/`buffer_error` schrijven allemaal status
- * `failed` -- daarom is `event_type` per call-site hardcoded (D-02), niet uit
- * de status afgeleid.
+ * `failed` -- daarom is `event_type` per call-site hardcoded, niet uit de
+ * status afgeleid.
  *
  * Let op: event_type `dead_lettered` (dubbele t) is NIET de status
  * `dead_letter` (enkele t) -- zie `BcSyncEventStatus`.
@@ -115,21 +115,21 @@ export type BcSyncEventType =
  * (7 waarden), dus hergebruiken we `SyncStatus` i.p.v. dupliceren.
  *
  * NB: status `dead_letter` (enkele t) hoort bij event_type `dead_lettered`
- * (dubbele t) -- een veelgemaakte verwarring (Pitfall 2).
+ * (dubbele t) -- een veelgemaakte verwarring.
  */
 export type BcSyncEventStatus = SyncStatus;
 
 /**
- * Insert-vorm voor `action_orders.bc_sync_events` (migratie 20260623151957,
- * fase 183). Velden spiegelen de kolommen een-op-een. `id`, `occurred_at` en
- * `created_at` zijn DB-defaulted en daarom weggelaten.
+ * Insert-vorm voor `action_orders.bc_sync_events` (migratie 20260623151957).
+ * Velden spiegelen de kolommen een-op-een. `id`, `occurred_at` en `created_at`
+ * zijn DB-defaulted en daarom weggelaten.
  *
  * Verplicht (NOT NULL, geen default): `sync_order_id` (FK -> bc_sync_orders),
  * de gedenormaliseerde `order_id`/`company_id`, en `event_type`. De rest is
  * optioneel-nullable.
  *
  * Omdat de Supabase-client `<any>`-getypeerd is, is dit type de ENIGE
- * compile-time guard op de event-payload (Pitfall 5): `logSyncEvent` typt zijn
+ * compile-time guard op de event-payload: `logSyncEvent` typt zijn
  * `events`-parameter hierop zodat `tsc` de call-sites controleert.
  */
 export interface BcSyncEventInsert {
@@ -139,9 +139,9 @@ export interface BcSyncEventInsert {
   order_id: number;
   /** Gedenormaliseerd company_id (RLS-scope) -- verplicht */
   company_id: number;
-  /** Type statusovergang -- verplicht, per call-site hardcoded (D-02) */
+  /** Type statusovergang -- verplicht, per call-site hardcoded */
   event_type: BcSyncEventType;
-  /** Status vóór de overgang (afgeleid uit call-site context, D-07) */
+  /** Status vóór de overgang (afgeleid uit call-site context) */
   from_status?: BcSyncEventStatus | null;
   /** Status ná de overgang */
   to_status?: BcSyncEventStatus | null;
@@ -153,7 +153,7 @@ export interface BcSyncEventInsert {
   correlation_id?: string | null;
   /** Dispatch-batch-id */
   batch_id?: string | null;
-  /** Vrije event-specifieke context als JSONB (altijd po_number, D-04) */
+  /** Vrije event-specifieke context als JSONB (altijd po_number) */
   detail?: Record<string, unknown> | null;
 }
 
@@ -244,8 +244,8 @@ export interface BcSyncOrderUpdate {
 // ============================================================================
 
 /**
- * Bratra business unit, spiegelt enum public.company_type (169-D-06).
- * Bron van de legal-entity-routing (SEG-03).
+ * Bratra business unit, spiegelt enum public.company_type.
+ * Bron van de legal-entity-routing.
  */
 export type CompanyType = "food" | "non_food" | "pet_products";
 
@@ -315,14 +315,12 @@ export interface WarehouseOrderLine {
 /**
  * Company ID to BC legal entity mapping.
  *
- * non_food: "BRATRA-NL" — bevestigd door operator (Robert van de Camp) op
- *   2026-06-30 (SYNC-03). Basis: de enige tot nu toe bewezen werkende waarde
- *   (happy-test 2026-06-11 + Postman-collectie). Formele ERP-Company-sign-off
- *   wordt nog gefinaliseerd; een afwijkende code is een one-line change.
+ * non_food: "BRATRA-NL" — door de operator bevestigd en de enige waarde die
+ *   bewezen werkt (happy-test + Postman-collectie). De formele sign-off van
+ *   ERP Company staat nog open; een afwijkende code is een one-line change.
  *
- * food / pet_products: nog op de tijdelijke BRATRA-NL-aanname. food-routing en
- *   pet-routing-activatie zijn buiten scope van fase 201 (pet = v2 / fase 204);
- *   niet hier aanraken.
+ * food / pet_products: nog op de tijdelijke BRATRA-NL-aanname, niet bevestigd.
+ *   Wijzig deze pas als de routing voor die business unit is afgestemd.
  */
 export const LEGAL_ENTITY_MAP: Record<CompanyType, string> = {
   food: "BRATRA-NL",
@@ -388,10 +386,10 @@ export type BcBufferStatus =
  *
  * BC OData v2.0 API retourneert camelCase property namen.
  *
- * Veldnamen geverifieerd tegen een echte buffer-respons (2026-06-27, sandbox):
- * het salesordernummer heet `createdDocumentNo` (was eerder aangenomen als
- * `salesDocumentNo`, wat altijd undefined teruggaf). Subset van de respons; BC
- * stuurt méér velden (externalReference/customerNo/carrier/timestamps).
+ * Veldnamen geverifieerd tegen een echte buffer-respons: het salesordernummer
+ * heet `createdDocumentNo`; een veld `salesDocumentNo` bestaat niet in de respons
+ * en leest altijd undefined. Subset van de respons; BC stuurt méér velden
+ * (externalReference/customerNo/carrier/timestamps).
  */
 export interface BcBufferRecord {
   /** BC system UUID */
@@ -409,7 +407,7 @@ export interface BcBufferRecord {
 }
 
 // ============================================================================
-// DLQ types (Phase 152.1)
+// DLQ types
 // ============================================================================
 
 /** Summary van DLQ verwerking per verifier run */
@@ -451,7 +449,7 @@ export interface DlqMessage {
 }
 
 // ============================================================================
-// SQS Trigger types (Phase 152.2)
+// SQS Trigger types
 // ============================================================================
 
 /**
@@ -464,15 +462,14 @@ export interface SqsTriggerMessage {
   /** ISO timestamp of when the import completed (optional, for logging) */
   timestamp?: string;
   /**
-   * End-to-end trace-id. Optioneel: backward-compatible met bestaande producers.
-   * Fase 208 vult dit veld in de SQS-body; dispatcher valt terug op awsRequestId
-   * als het ontbreekt (D-00c / TRACE-04 contract).
+   * End-to-end trace-id. Optioneel: niet elke producer vult dit veld in de
+   * SQS-body; de dispatcher valt terug op awsRequestId als het ontbreekt.
    */
   traceId?: string;
 }
 
 // ============================================================================
-// Error queue types (Leo, 15-06-2026) -- bratra-error
+// Error queue types -- bratra-error
 // ============================================================================
 
 /**
@@ -491,7 +488,7 @@ export interface ErrorQueueErrorSection {
   attempts?: number;
   /** true = transient, veilig te replayen; false = permanente data/validatiefout.
    * Optioneel: het Zod-schema staat afwezigheid toe (z.boolean().optional()), dus de
-   * interface mag geen aanwezigheid beloven die de wire niet garandeert (PR#5 #3). */
+   * interface mag geen aanwezigheid beloven die de wire niet garandeert. */
   retryable?: boolean;
   /** ISO-timestamp van de definitieve fout */
   failedAtUtc?: string;

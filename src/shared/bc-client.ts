@@ -14,7 +14,7 @@ function getBaseUrl(config: BCConfig, apiRoute = "api/v2.0"): string {
 /**
  * Internal: fetch with retry on HTTP 429 (rate limit).
  * Respects Retry-After header if present, falls back to exponential backoff.
- * Aborts after FETCH_TIMEOUT_MS (30s) via AbortSignal.timeout — RES-01/D-01.
+ * Aborts after FETCH_TIMEOUT_MS via AbortSignal.timeout.
  */
 async function fetchWithRetry(
   url: string,
@@ -34,7 +34,7 @@ async function fetchWithRetry(
         },
       });
     } catch (err) {
-      // WR-03: maak de 30s-abort observeerbaar in de run-context voordat de
+      // Maak de timeout-abort observeerbaar in de run-context voordat de
       // TimeoutError/AbortError als opaque per-order error string opduikt.
       const name = (err as Error).name;
       if (name === "TimeoutError" || name === "AbortError") {
@@ -55,8 +55,8 @@ async function fetchWithRetry(
       const retryAfterSeconds = Number.isNaN(parsed) ? 5 : parsed;
       const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
       const delay = Math.max(retryAfterSeconds * 1000, baseDelay);
-      // WR-03: 429-backoff observeerbaar op debug (loop-verbositeit, D-05) —
-      // zonder dit slaapt een 429-storm 1s/2s/4s per order zonder één logregel.
+      // 429-backoff observeerbaar op debug (loop-verbositeit) — zonder dit
+      // slaapt een 429-storm 1s/2s/4s per order zonder één logregel.
       logger?.debug({ url, attempt, delayMs: delay, retryAfterSeconds }, "BC API 429 -- backing off");
       // Release connection back to pool before sleeping (Node fetch/Undici requirement)
       await response.body?.cancel();
@@ -122,14 +122,14 @@ export async function bcGet<T = Record<string, unknown>>(
 }
 
 /**
- * Get the company ID. If config.companyId is already a UUID, return it directly.
- * Otherwise query the BC API to resolve by name.
+ * Get the company ID. Returns config.companyId when set; otherwise falls back
+ * to the first company the BC API returns.
  */
 export async function getCompanyId(
   token: string,
   config: BCConfig,
 ): Promise<string> {
-  // companyId is already a UUID in this project (D-05: BC_COMPANY_ID is z.string().uuid())
+  // companyId is already a UUID in this project (BC_COMPANY_ID is z.string().uuid())
   if (config.companyId) {
     return config.companyId;
   }

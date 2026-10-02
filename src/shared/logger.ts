@@ -3,7 +3,7 @@
 //
 // Verantwoordelijkheid: JSON-logs naar stdout (CloudWatch).
 // NIET verwarren met event-logger.ts = Supabase-audit (bc_sync_events).
-// Context-propagatie via expliciete parameter (D-00b/D-06), niet via
+// Context-propagatie via expliciete parameter, niet via
 // async-local-storage (Express-specifiek; bewust weggelaten).
 // ============================================================================
 import pino from "pino";
@@ -15,7 +15,7 @@ const ENV = process.env.APP_TARGET?.trim() || "legacy";
 
 // LOG_LEVEL wordt hier BEWUST raw uit process.env gelezen en lokaal
 // gevalideerd, NIET via getConfig(): de logger moet ook bestaan wanneer
-// config-validatie faalt (kip-ei bij startup-fouten). Round 2 F3: een
+// config-validatie faalt (kip-ei bij startup-fouten). Een
 // ongeldige waarde valt terug op "info" i.p.v. pino te laten crashen bij
 // module-import. Dit is de ENIGE plek die LOG_LEVEL valideert (config.ts
 // bevat er bewust géén tweede, dode schema-entry voor).
