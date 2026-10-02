@@ -4,6 +4,9 @@ on:
     branches:
       - main
       - master
+  # Build and test every PR as well, so a dependency bump is checked before the merge.
+  # Merging deploys, so a check that only runs after the merge comes too late.
+  pull_request:
 
 env:
   AWS_REGION: eu-central-1
@@ -40,6 +43,8 @@ jobs:
   deploy:
     name: Deploy to AWS
     needs: build-and-test
+    # Never deploy from a PR; on pull_request github.ref is refs/pull/N/merge.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
 
     steps:
