@@ -21,8 +21,8 @@ const COMPANY_ID = 2;
  * Orchestrates: query sent orders > 2 min -> M2M auth -> check BC buffer
  * statuses -> log summary.
  *
- * CONSTRAINT D-01: ONLY BC Sandbox. Warns if BC_ENVIRONMENT does not start
- * with "Sandbox" (same pattern as dispatcher).
+ * Warns (does not block) when BC_ENVIRONMENT does not start with "Sandbox"
+ * (same pattern as dispatcher).
  */
 export const handler = async (
   _event: ScheduledEvent,
@@ -41,10 +41,10 @@ export const handler = async (
   const startMs = Date.now();
 
   // Summary-accumulators declareren VOOR de try, zodat verify.summary altijd
-  // één keer emitted (ook bij een crash) — D-07/D-09.
+  // één keer emitted (ook bij een crash).
   let errorQueueSummary: ErrorQueueSummary | null = null;
   let bufferSummary: VerifySummary | null = null;
-  // "not reached" tot het expliciete no-sent-orders-pad (WR-02): bij een crash
+  // "not reached" tot het expliciete no-sent-orders-pad: bij een crash
   // vóór de sent-orders-query mag de summary niet suggereren dat er geen
   // sent orders waren.
   let bufferNote = "not reached";
@@ -62,7 +62,7 @@ export const handler = async (
     // 2. Supabase client
     const supabase = getSupabaseClient();
 
-    // 3. D-01: Sandbox guard
+    // 3. Sandbox warning (does not block)
     if (!config.BC_ENVIRONMENT.startsWith("Sandbox")) {
       runLogger.warn(
         { BC_ENVIRONMENT: config.BC_ENVIRONMENT },
@@ -70,7 +70,7 @@ export const handler = async (
       );
     }
 
-    // 4. Error-queue check FIRST (non-fatal, D-05/ERR-03). Runs BEFORE the sent-orders
+    // 4. Error-queue check FIRST (non-fatal). Runs BEFORE the sent-orders
     // query so a BC-rejected order is moved to 'bc_rejected' and leaves the 'sent' set
     // before the buffer-check's "NotFound > 1h -> dead_letter" path can mislabel it.
     try {
@@ -78,13 +78,13 @@ export const handler = async (
     } catch (err) {
       // Non-fatal voor de run, maar WEL een failed-signaal in verify.summary:
       // een checker die volledig faalt (verkeerde queue-naam, ongeldige SAS)
-      // mag niet eeuwig status "ok" rapporteren (WR-02, spiegelt dispatch.summary).
+      // mag niet eeuwig status "ok" rapporteren (spiegelt dispatch.summary).
       verifyStatus = "failed";
       runLogger.error({ error: (err as Error).message }, "Error-queue check failed (non-fatal)");
     }
 
-    // 5. D-03: Query sent orders older than 2 minutes. Paginated past the PostgREST
-    // 1000-row cap (same latent bug as the dispatcher's anti-join): a mass-dispatch
+    // 5. Query sent orders older than 2 minutes. Paginated past the PostgREST
+    // 1000-row cap (like the dispatcher's anti-join): a mass-dispatch
     // can leave >1000 orders simultaneously 'sent', and an unbounded select would
     // silently drop the overflow from verification. `.order("id")` gives the stable
     // paging key the pagination requires.
@@ -104,7 +104,7 @@ export const handler = async (
     );
 
     // StuckInSent: orders die al ≥60 min in "sent" staan zonder verificatie.
-    // Berekend op de al-opgehaalde sentOrders — geen extra Supabase-query (MET-02).
+    // Berekend op de al-opgehaalde sentOrders — geen extra Supabase-query.
     const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     stuckInSent = sentOrders.filter(
       (o) => o.sent_at !== null && o.sent_at < sixtyMinutesAgo,
@@ -114,8 +114,8 @@ export const handler = async (
     // berichten ONVERWERKT liet (errors > 0): dan kan er nog een pending bc_rejected-
     // transitie openstaan en zou de buffer-check een 'sent'-order onterecht naar
     // 'dead_letter' kunnen verouderen. Bij een volledige exception (summary null) NIET
-    // meer oneindig deferren -- anders blijven orders bij een persistente fout (verkeerde
-    // queue-naam, ongeldige SAS) eeuwig in 'sent' hangen zonder verificatie (PR#5 #2).
+    // deferren -- anders blijven orders bij een persistente fout (verkeerde
+    // queue-naam, ongeldige SAS) eeuwig in 'sent' hangen zonder verificatie.
     const deferBuffer =
       errorQueueSummary !== null && errorQueueSummary.errors > 0;
 
@@ -131,7 +131,7 @@ export const handler = async (
     } else {
       runLogger.info({ count: sentOrders.length }, "Sent orders to verify");
 
-      // 5. D-06: M2M auth for BC API
+      // 5. M2M auth for BC API
       const token = await authenticateM2M(config.BC_TENANT_ID);
 
       // 6. Build BCConfig
@@ -145,29 +145,29 @@ export const handler = async (
       bufferSummary = await checkBufferStatuses(sentOrders, token, bcConfig, supabase, runLogger);
     }
 
-    // 8. DLQ check (non-fatal, always runs -- D-09)
+    // 8. DLQ check (non-fatal, always runs)
     try {
       dlqSummary = await checkDlqMessages(supabase, runLogger);
     } catch (err) {
-      // Zelfde WR-02-semantiek als de error-queue-check hierboven.
+      // Zelfde failed-signaal als bij de error-queue-check hierboven.
       verifyStatus = "failed";
       runLogger.error({ error: (err as Error).message }, "DLQ check failed (non-fatal)");
     }
   } catch (err) {
     verifyStatus = "failed";
     runLogger.error({ error: (err as Error).message }, "Verifier run failed unexpectedly");
-    // Round 2 F1: rethrow zodat een gecrashte run de Lambda-invocatie laat
-    // FALEN (voedt de AWS `Errors`-metric + de 999.25-alarmen; zonder rethrow
+    // Rethrow zodat een gecrashte run de Lambda-invocatie laat
+    // FALEN (voedt de AWS `Errors`-metric + de CloudWatch-alarmen; zonder rethrow
     // lijkt een gecrashte verifier-run een geslaagde invocatie). Het finally-
     // blok draait vóór de propagatie, dus verify.summary wordt nog steeds
     // precies één keer emitted. Rethrow is hier veilig: scheduled, idempotent,
-    // read-mostly, reserved concurrency 1 (spiegelt dispatcher CR-02).
+    // read-mostly, reserved concurrency 1.
     throw err;
   } finally {
-    // 9. Eén gegarandeerd verify.summary-event per run (D-07/D-08/D-09).
+    // 9. Eén gegarandeerd verify.summary-event per run.
     // Nestels per checker (buffer/dlq/errorQueue) + durationMs + status.
     // Wordt ALLEEN als CloudWatch-logregel geschreven (niet naar bc_sync_events).
-    // WR-02: status ook "failed" bij per-item errors in de checker-summaries
+    // Status ook "failed" bij per-item errors in de checker-summaries
     // (spiegelt dispatch.summary, waar één failed order al status "failed" geeft)
     // — anders missen alarmen op verify.summary.status elke persistente
     // partiële failure.
@@ -183,7 +183,7 @@ export const handler = async (
       dlq: dlqSummary ?? "skipped (error)",
       errorQueue: errorQueueSummary ?? "skipped (error)",
     }, "verify.summary");
-    // Metriek-bronnen (MET-02):
+    // Metriek-bronnen:
     //   OrdersVerified     <- bufferSummary.verified     (BC buffer Done -> verified)
     //   OrdersBcRejected   <- errorQueueSummary.matched  (error-queue matched = bc_rejected-transitie)
     //   OrdersDeadLetter   <- bufferSummary.deadLetter   (>1h NotFound -> dead_letter)
@@ -192,7 +192,7 @@ export const handler = async (
     //                         zie docstring op VerifierMetricsCounts.dlqDepth)
     //   ErrorQueueMessages <- errorQueueSummary.deleted  (error-queue-berichten geconsumeerd)
     //   StuckInSent        <- stuckInSent                (al-opgehaalde sent-set, sent_at < now-60min)
-    // T-209-03: flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
+    // Een flush-fout mag het summary-bewijs of de rethrow-semantiek nooit beïnvloeden
     await emitMetricsSafely(
       emitVerifierMetrics({
         ordersVerified: bufferSummary?.verified ?? 0,

@@ -24,7 +24,7 @@ import type {
 //  - matched order -> status 'bc_rejected' (BC-content-rejection, terminal).
 //
 // Idempotentie via BrokerProperties.MessageId (envelope-header -- ook beschikbaar
-// als de body malformed is). Archiveren VOOR completen/verwijderen (D-02).
+// als de body malformed is). Archiveren VOOR completen/verwijderen.
 // ============================================================================
 
 /** Max berichten per verifier run (DoS-mitigatie, mirror dlq-checker MAX_MESSAGES) */
@@ -42,11 +42,11 @@ interface ReceivedErrorMessage {
 
 // ============================================================================
 // BrokerProperties is een externe I/O-grens (Service Bus response-header) en
-// MOET door Zod (coding-principles: validate every external boundary). MessageId
+// MOET door Zod (elke externe grens wordt gevalideerd). MessageId
 // is de idempotentie-sleutel; LockToken/SequenceNumber zijn nodig om het bericht
 // te DELETE'en. Een header die niet valideert -> behandel als een onbruikbaar
 // bericht (log, errors++, NIET verwijderen -- laat voor retry), exact zoals de
-// bestaande missing-MessageId branch (claude Important, PR#5).
+// missing-MessageId branch in checkErrorQueue.
 // ============================================================================
 
 export const brokerPropertiesSchema = z
@@ -63,13 +63,6 @@ export const brokerPropertiesSchema = z
   .passthrough();
 
 /**
- * Receive a single message from the ORDINARY bratra-error queue via peek-lock.
- *
- * Endpoint: `{queue}/messages/head` -- the ordinary queue, NOT a dead-letter subqueue (D-01).
- * Returns null when the queue is empty (HTTP 204).
- * Uses the Location header for the DELETE URL when available.
- */
-/**
  * Resultaat van een receive: "empty" (queue leeg), "ok" (gevalideerd bericht),
  * of "invalid-header" (BrokerProperties ontbreekt/valideert niet -- het bericht
  * is un-keyable en mag NIET verwijderd worden; behandeld als errors++).
@@ -79,6 +72,13 @@ type ReceiveResult =
   | { kind: "ok"; message: ReceivedErrorMessage }
   | { kind: "invalid-header"; reason: string };
 
+/**
+ * Receive a single message from the ORDINARY bratra-error queue via peek-lock.
+ *
+ * Endpoint: `{queue}/messages/head` -- the ordinary queue, NOT a dead-letter subqueue.
+ * Returns `{ kind: "empty" }` when the queue is empty (HTTP 204).
+ * Uses the Location header for the DELETE URL when available.
+ */
 async function receiveErrorMessage(
   namespace: string,
   queue: string,
@@ -88,7 +88,7 @@ async function receiveErrorMessage(
 
   const response = await fetch(url, {
     method: "POST",
-    // RES-01/D-01: een hangende SB-receive mag de verifier niet tot de
+    // Een hangende SB-receive mag de verifier niet tot de
     // Lambda-timeout stallen; TimeoutError valt in de per-message catch.
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
@@ -103,7 +103,7 @@ async function receiveErrorMessage(
   }
 
   // BrokerProperties envelope-header (MessageId, SequenceNumber, LockToken, ...).
-  // Externe I/O-grens: valideer met Zod (claude Important, PR#5). Body altijd
+  // Externe I/O-grens: valideer met Zod. Body altijd
   // consumeren zodat de connection vrijkomt, ook bij een ongeldige header.
   const brokerPropsRaw = response.headers.get("BrokerProperties");
   const body = await response.text();
@@ -162,7 +162,7 @@ async function completeErrorMessage(
 
   const response = await fetch(deleteUrl, {
     method: "DELETE",
-    // RES-01/D-01: zelfde 30s-timeout als de receive (TimeoutError -> per-message catch).
+    // Zelfde timeout als de receive (TimeoutError -> per-message catch).
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
@@ -173,7 +173,7 @@ async function completeErrorMessage(
   }
 }
 
-/** Parse body als JSON; geeft null terug bij een parse-fout (nooit crashen, D-09) */
+/** Parse body als JSON; geeft null terug bij een parse-fout (nooit crashen) */
 function parseJsonOrNull(body: string, messageId: string, logger: Logger): unknown {
   try {
     return JSON.parse(body);
@@ -184,12 +184,12 @@ function parseJsonOrNull(body: string, messageId: string, logger: Logger): unkno
 }
 
 // ============================================================================
-// Schema-validatie van de externe I/O-grens (coding-principles: Zod op elke
-// external I/O boundary). Een bericht is ALLEEN goed-gevormd als de error-sectie
+// Schema-validatie van de externe I/O-grens (Zod op elke external I/O
+// boundary). Een bericht is ALLEEN goed-gevormd als de error-sectie
 // BOTH een non-empty `stage` EN een non-empty `message` heeft -- een incomplete/
-// hernoemde error-sectie routeert naar archive-as-unmatched (D-09/D-10), nooit
+// hernoemde error-sectie routeert naar archive-as-unmatched, nooit
 // naar een silently-incomplete matched archive. Onbekende velden worden bewust
-// genegeerd (.passthrough) zodat de volledige body bewaard blijft (D-09).
+// genegeerd (.passthrough) zodat de volledige body bewaard blijft.
 // ============================================================================
 
 const errorQueueErrorSchema = z
@@ -219,18 +219,18 @@ export function parseWellFormed(parsed: unknown): ErrorQueueMessage | null {
 }
 
 /**
- * Een gematchte bc_sync_orders-rij. Verbreed (RISK-2) met de gedenormaliseerde
- * identiteit-velden zodat `applyRejection` een COMPLETE `BcSyncEventInsert` kan
- * bouwen (order_id/company_id zijn NOT NULL op bc_sync_events). De extra velden
- * zijn optioneel-getypeerd: oudere call-sites/tests die alleen {id,status}
- * leveren blijven compileren.
+ * Een gematchte bc_sync_orders-rij, met de gedenormaliseerde identiteit-velden
+ * zodat `applyRejection` een COMPLETE `BcSyncEventInsert` kan bouwen
+ * (order_id/company_id zijn NOT NULL op bc_sync_events en hier dus verplicht).
+ * De overige velden zijn optioneel-getypeerd, zodat call-sites/tests die ze
+ * niet leveren blijven compileren.
  */
 export type MatchedOrder = {
   id: number;
   status: string;
   // order_id/company_id zijn VERPLICHT: de matchOrder-select haalt ze altijd op en
   // applyRejection schrijft ze als NOT NULL-kolommen in het bc_rejected-event. Zonder
-  // deze garantie zou een ! een event stil laten falen in logSyncEvent (PR#5 #1).
+  // deze garantie zou een ! een event stil laten falen in logSyncEvent.
   order_id: number;
   company_id: number;
   po_number?: string;
@@ -252,7 +252,7 @@ export function deriveExternalId(metaMessageId: string, poNumber: string): strin
 /**
  * Terminale statussen: een order in een van deze toestanden is al definitief
  * gesetteld en mag NIET door een (mogelijk stale) error-queue bericht worden
- * overschreven naar bc_rejected (claude Important, PR#5). `bc_rejected` zit hier
+ * overschreven naar bc_rejected. `bc_rejected` zit hier
  * ook in maar wordt apart als idempotent-skip behandeld voor een duidelijke log.
  */
 export const TERMINAL_STATUSES = new Set(["verified", "dead_letter", "skipped", "bc_rejected"]);
@@ -264,12 +264,12 @@ export interface MatchResult {
   // true wanneer een Supabase-select een DB-fout teruggaf (transient: netwerk/RLS/
   // timeout). Cruciaal onderscheid van "geen match": de caller mag bij dbError NIET
   // archiveren-als-unmatched en NIET completen, anders gaat een BC-rejection die wel
-  // een matchende order had permanent verloren. errors++ + laten voor retry (PR#5 cursor High).
+  // een matchende order had permanent verloren. errors++ + laten voor retry.
   dbError: boolean;
 }
 
 /**
- * Match een goed-gevormd bericht aan een bc_sync_orders-rij (D-03).
+ * Match een goed-gevormd bericht aan een bc_sync_orders-rij.
  *
  * Primair: `external_id` = `BRA-AC-{metaMessageId}-{poNumber}` (uniek per PO).
  * Fallback: `message_id` = metaMessageId. Batch-dispatches DELEN een message_id,
@@ -295,7 +295,7 @@ export async function matchOrder(
       .eq("external_id", externalId)
       .limit(1);
     // Een DB-fout is GEEN "geen match": treat als transient, laat de caller het
-    // bericht voor een volgende run laten staan (cursor High, PR#5).
+    // bericht voor een volgende run laten staan.
     if (byExternalError) {
       logger.error({ externalId, error: byExternalError.message }, "Error-queue match: external_id-lookup faalde (DB-fout) -- transient, NIET als unmatched behandelen");
       return { matchedOrder: null, externalId, dbError: true };
@@ -307,7 +307,7 @@ export async function matchOrder(
 
   // Fallback: meta.messageId -> bc_sync_orders.message_id. GEEN limit(1):
   // bij meerdere hits is de match ambigu en mag GEEN willekeurige order
-  // gemislabeld worden (cursor/claude: batch deelt een message_id).
+  // gemislabeld worden (een batch deelt een message_id).
   if (!matchedOrder && metaMessageId) {
     const { data: byMessageId, error: byMessageIdError } = await supabase
       .from("bc_sync_orders")
@@ -330,7 +330,7 @@ export async function matchOrder(
 }
 
 /**
- * Zet een gematchte order op `bc_rejected` (D-04, idempotent + terminal-guard).
+ * Zet een gematchte order op `bc_rejected` (idempotent + terminal-guard).
  *
  * Returns:
  *  - "updated"  -- order succesvol op bc_rejected gezet (matched++)
@@ -342,7 +342,7 @@ export async function matchOrder(
  *
  * Een (mogelijk stale) error-queue bericht dat matcht aan een order die al
  * verified/dead_letter/skipped is, mag die definitieve uitkomst NIET terugzetten
- * naar bc_rejected met een verse failed_at (claude Important, PR#5). De order
+ * naar bc_rejected met een verse failed_at. De order
  * blijft ongemoeid; het bericht wordt wel gearchiveerd voor traceability en uit
  * de queue gehaald.
  *
@@ -356,7 +356,7 @@ export async function applyRejection(
   messageId: string,
   // De echte BC-rejectietijd (error.failedAtUtc uit de body). Valt terug op de
   // verwerkingstijd als hij ontbreekt. Voorkomt dat SLA/latency-metingen op
-  // bc_sync_orders.failed_at de rejectie-latency overschatten (PR#5 claude #3).
+  // bc_sync_orders.failed_at de rejectie-latency overschatten.
   failedAtUtc: string | null = null,
   logger: Logger,
 ): Promise<"updated" | "already" | "terminal" | "failed"> {
@@ -385,7 +385,7 @@ export async function applyRejection(
   }
 
   // Event ALLEEN op het "updated"-pad (niet bij already/terminal/failed).
-  // from_status = matchedOrder.status (sent of failed) -- exact, geen D-07-aanname.
+  // from_status = matchedOrder.status (sent of failed) -- exact, geen aanname "sent".
   const event: BcSyncEventInsert = {
     sync_order_id: matchedOrder.id,
     order_id: matchedOrder.order_id,
@@ -408,16 +408,16 @@ export async function applyRejection(
  * Check the `bratra-error` Service Bus queue for BC content-rejections.
  *
  * Per message:
- * 1. messageId = envelope BrokerProperties.MessageId (idempotency key, D-10)
- * 2. Idempotency check (D-02): skip if already in bc_sync_error_messages
- * 3. Parse body DEFENSIVELY (D-09/D-10): malformed/missing sections -> unmatched
- * 4. Match (D-03): external_id `BRA-AC-{messageId}-{poNumber}`, fallback meta.messageId
- * 5. Archive: INSERT into bc_sync_error_messages BEFORE delete (D-02)
- * 6. On match: SET bc_sync_orders.status = 'bc_rejected' (skip if already, D-04)
- * 7. Complete: DELETE from queue ONLY after a successful insert (D-02)
+ * 1. messageId = envelope BrokerProperties.MessageId (idempotency key)
+ * 2. Idempotency check: skip if already in bc_sync_error_messages
+ * 3. Parse body DEFENSIVELY: malformed/missing sections -> unmatched
+ * 4. Match: external_id `BRA-AC-{messageId}-{poNumber}`, fallback meta.messageId
+ * 5. Archive: INSERT into bc_sync_error_messages BEFORE delete
+ * 6. On match: SET bc_sync_orders.status = 'bc_rejected' (skip if already)
+ * 7. Complete: DELETE from queue ONLY after a successful insert
  *
  * On a successful bc_rejected transition, applyRejection appends one
- * `bc_rejected` event to bc_sync_events (best-effort, non-fatal -- phase 185, TRACE-01).
+ * `bc_rejected` event to bc_sync_events (best-effort, non-fatal).
  * Non-fatal: per-message errors are counted, not thrown. Sequential (no Promise.all).
  */
 export async function checkErrorQueue(
@@ -436,9 +436,9 @@ export async function checkErrorQueue(
   const config = getConfig();
 
   // SAS token scoped op de error-queue. Listen-key kan afwijken van de inbound-key;
-  // valt terug op SB_KEY_NAME/VALUE als niet apart gezet (D-01, mirror errorQueuePeek).
+  // valt terug op SB_KEY_NAME/VALUE als niet apart gezet (mirror errorQueuePeek).
   // De error-key is een PAAR: resolve atomisch zodat name/value NOOIT van een
-  // andere key-set komen (config.superRefine garandeert beide-of-geen, PR#5).
+  // andere key-set komen (config.superRefine garandeert beide-of-geen).
   const useErrorKey = config.SB_ERROR_KEY_NAME !== undefined;
   const sasKeyName = useErrorKey ? config.SB_ERROR_KEY_NAME! : config.SB_KEY_NAME;
   const sasKeyValue = useErrorKey ? config.SB_ERROR_KEY_VALUE! : config.SB_KEY_VALUE;
@@ -461,7 +461,7 @@ export async function checkErrorQueue(
       if (received.kind === "invalid-header") {
         // BrokerProperties ontbreekt/valideert niet -> bericht is un-keyable en
         // niet veilig te completen. Zelfde behandeling als missing-MessageId:
-        // log, errors++, NIET verwijderen (laat voor retry) (claude Important, PR#5).
+        // log, errors++, NIET verwijderen (laat voor retry).
         logger.error({ reason: received.reason }, "Error-queue message met ongeldige BrokerProperties -- niet verwijderd");
         summary.errors++;
         continue;
@@ -469,7 +469,7 @@ export async function checkErrorQueue(
 
       const msg = received.message;
 
-      // 1. Idempotentie-sleutel uit de ENVELOPE (D-10: ook bij malformed body).
+      // 1. Idempotentie-sleutel uit de ENVELOPE (ook bij malformed body).
       //    Door de Zod-validatie in receiveErrorMessage is MessageId gegarandeerd
       //    non-empty -- deze guard blijft als defense-in-depth.
       const messageId = msg.brokerProperties.MessageId;
@@ -480,14 +480,14 @@ export async function checkErrorQueue(
         continue;
       }
 
-      // 3. Parse body DEFENSIVELY (D-09, D-10): nooit crashen, nooit droppen.
+      // 3. Parse body DEFENSIVELY: nooit crashen, nooit droppen.
       //    Schema-validatie op de I/O-grens (Zod): incomplete error-sectie ->
       //    archive-as-unmatched, geen silently-incomplete matched archive.
       const parsedRaw: unknown = parseJsonOrNull(msg.body, messageId, logger);
       const parsed: ErrorQueueMessage | null = parseWellFormed(parsedRaw);
       const wellFormed = parsed !== null;
 
-      // 2. Idempotency check (D-02). Captureer OOK de error: een transiente
+      // 2. Idempotency check. Captureer OOK de error: een transiente
       //    DB-fout geeft data=null + error!=null; zonder check zou de guard
       //    doorvallen en een duplicate INSERT (UNIQUE-violation) proberen.
       const { data: existing, error: existingErr } = await supabase
@@ -504,7 +504,7 @@ export async function checkErrorQueue(
       }
 
       if (existing && existing.length > 0) {
-        // Al gearchiveerd. Self-heal (D-04): re-attempt de match + bc_rejected
+        // Al gearchiveerd. Self-heal: re-attempt de match + bc_rejected
         // update voor het geval een eerdere run wel archiveerde maar de update
         // faalde. Pas completen NA een geslaagde (of niet-nodige) update.
         summary.skipped++;
@@ -535,7 +535,7 @@ export async function checkErrorQueue(
             }
             // Self-heal slaagde (of was niet nodig): tel matched, consistent met
             // het hoofdpad. `skipped` blijft staan (archief bestond al), maar het
-            // matched-signaal mag niet verloren gaan (claude Nit, PR#5). Een
+            // matched-signaal mag niet verloren gaan. Een
             // terminale order (verified/dead_letter/skipped) is NIET door ons
             // gerejecteerd -> niet als matched tellen.
             if (outcome === "updated" || outcome === "already") {
@@ -551,14 +551,14 @@ export async function checkErrorQueue(
         continue;
       }
 
-      // 4. Match (D-03), ALLEEN als goed-gevormd
+      // 4. Match, ALLEEN als goed-gevormd
       const matchResult: MatchResult = parsed
         ? await matchOrder(supabase, parsed, logger)
         : { matchedOrder: null, externalId: null, dbError: false };
 
       // Een transient DB-fout tijdens de match mag het bericht NIET als unmatched
       // archiveren+completen (anders verdwijnt een rejection die wel een matchende
-      // order had). Tel als error, laat in de queue voor een volgende run (cursor High, PR#5).
+      // order had). Tel als error, laat in de queue voor een volgende run.
       if (matchResult.dbError) {
         logger.error({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber }, "Error-queue match-lookup faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
@@ -567,7 +567,7 @@ export async function checkErrorQueue(
       const { matchedOrder, externalId } = matchResult;
 
       // 5. Bouw de archief-rij. Body altijd volledig bewaren: parsed object bij
-      // goed-gevormd, anders de raw string (D-09: niets verliezen).
+      // goed-gevormd, anders de raw string (niets verliezen).
       const error = parsed?.error;
       const insertRow: BcSyncErrorMessageInsert = {
         message_id: messageId,
@@ -587,7 +587,7 @@ export async function checkErrorQueue(
         received_at: msg.brokerProperties.EnqueuedTimeUtc ?? new Date().toISOString(),
       };
 
-      // 6. Archiveren VOOR completen (D-02)
+      // 6. Archiveren VOOR completen
       const { error: insertError } = await supabase
         .from("bc_sync_error_messages")
         .insert(insertRow);
@@ -600,7 +600,7 @@ export async function checkErrorQueue(
       }
       summary.archived++;
 
-      // 7. Bij match: order op bc_rejected zetten (D-04, idempotent skip).
+      // 7. Bij match: order op bc_rejected zetten (idempotent skip).
       //    Als de UPDATE faalt: errors++, NIET completen (bericht blijft in de
       //    queue zodat een volgende run de update opnieuw probeert -- via het
       //    self-heal pad in de idempotency-skip). matched++ is CONDITIONEEL op
@@ -633,12 +633,12 @@ export async function checkErrorQueue(
           logger.info({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, externalId, orderId: matchedOrder.id }, "Error-queue message processed (matched)");
         }
       } else {
-        // D-03: geen match of niet goed-gevormd -> gearchiveerd zonder match
+        // Geen match of niet goed-gevormd -> gearchiveerd zonder match
         summary.unmatched++;
         logger.warn({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, wellFormed }, "Error-queue message processed (no match)");
       }
 
-      // 8. Completen uit de queue (D-02: alleen na succesvolle insert)
+      // 8. Completen uit de queue (alleen na succesvolle insert)
       await completeErrorMessage(config.SB_NAMESPACE, config.SB_ERROR_QUEUE, sasToken, msg);
       summary.deleted++;
     } catch (err) {

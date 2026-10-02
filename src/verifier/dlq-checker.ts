@@ -13,7 +13,7 @@ import type {
   DlqMessage,
 } from "../shared/types";
 
-/** Vorm van de verbrede DLQ-match-select-rij (RISK-2). */
+/** Vorm van de DLQ-match-select-rij: genoeg velden voor een compleet dead_lettered-event. */
 export interface DlqMatchedOrder {
   id: number;
   order_id: number;
@@ -24,12 +24,12 @@ export interface DlqMatchedOrder {
 }
 
 /**
- * Pure builder voor het DLQ `dead_lettered`-event (fase 185, TRACE-01).
+ * Pure builder voor het DLQ `dead_lettered`-event.
  *
- * KRITISCH (Pitfall 2): event_type `dead_lettered` (dubbel-t) mapt op status
+ * KRITISCH: event_type `dead_lettered` (dubbel-t) mapt op status
  * `dead_letter` (enkel-t). `from_status` komt uit `matchedOrder.status`; valt
- * terug op `"sent"` (D-07) als de status ontbreekt. Puur zodat de
- * event_type<->status-mapping en de detail-policy (D-03/D-04) deterministisch
+ * terug op `"sent"` als de status ontbreekt. Puur zodat de
+ * event_type<->status-mapping en de detail-policy deterministisch
  * te unit-testen zijn -- de aanroep gebeurt ALLEEN binnen `if (matchedOrder)`.
  */
 export function buildDlqDeadLetteredEvent(
@@ -57,15 +57,16 @@ export function buildDlqDeadLetteredEvent(
 // DLQ Checker -- Service Bus Dead Letter Queue monitoring
 // ============================================================================
 
-/** Max berichten per verifier run (D-06 DoS mitigatie) */
+/** Max berichten per verifier run (DoS-mitigatie) */
 const MAX_MESSAGES = 10;
 
 /**
  * Receive a single message from the DLQ via peek-lock.
  *
  * Returns null when queue is empty (HTTP 204).
- * Uses Location header for DELETE URL when available (Pitfall 3).
- * Reads DeadLetterReason/Description as separate response headers (Pitfall 2).
+ * Uses Location header for DELETE URL when available.
+ * Reads DeadLetterReason/Description as separate response headers (they are not
+ * part of BrokerProperties).
  */
 async function receiveDlqMessage(
   namespace: string,
@@ -76,7 +77,7 @@ async function receiveDlqMessage(
 
   const response = await fetch(url, {
     method: "POST",
-    // RES-01/D-01: een hangende SB-receive mag de verifier niet tot de
+    // Een hangende SB-receive mag de verifier niet tot de
     // Lambda-timeout stallen; TimeoutError valt in de per-message catch.
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
@@ -97,14 +98,14 @@ async function receiveDlqMessage(
   }
   const brokerProperties: DlqBrokerProperties = JSON.parse(brokerPropsRaw);
 
-  // DeadLetterReason en DeadLetterErrorDescription als aparte headers (Pitfall 2)
+  // DeadLetterReason en DeadLetterErrorDescription als aparte headers
   const deadLetterReason = response.headers.get("DeadLetterReason") ?? "Unknown";
   const deadLetterErrorDescription = response.headers.get("DeadLetterErrorDescription") ?? "";
 
   // Message body
   const body = await response.text();
 
-  // Location header voor DELETE URL (Pitfall 3)
+  // Location header voor DELETE URL
   const locationUrl = response.headers.get("Location") ?? null;
 
   return {
@@ -134,7 +135,7 @@ async function completeDlqMessage(
 
   const response = await fetch(deleteUrl, {
     method: "DELETE",
-    // RES-01/D-01: zelfde 30s-timeout als de receive (TimeoutError -> per-message catch).
+    // Zelfde timeout als de receive (TimeoutError -> per-message catch).
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: { Authorization: sasToken },
   });
@@ -146,21 +147,9 @@ async function completeDlqMessage(
 }
 
 /**
- * Check the Service Bus DLQ for dead-lettered messages.
- *
- * Per message:
- * 1. Idempotency check (D-13): skip if already in bc_sync_dlq_messages
- * 2. Match check (D-11): find corresponding bc_sync_orders record
- * 3. Archive: INSERT into bc_sync_dlq_messages (D-05/D-06)
- * 4. Update: SET bc_sync_orders.status = 'dead_letter' if matched (D-11)
- * 5. Complete: DELETE from queue only after successful insert (D-03)
- *
- * Non-fatal: errors are counted, not thrown. Sequential processing (no Promise.all).
- */
-/**
  * Zet een gematchte order op `dead_letter` (idempotent + terminal-guard). Gedeeld
  * door het hoofdpad en het self-heal-pad in de idempotency-skip -- spiegelt
- * applyRejection in error-queue-checker.ts (PR#5 claude review).
+ * applyRejection in error-queue-checker.ts.
  *
  * Returns:
  *  - "updated"  -- order succesvol op dead_letter gezet + dead_lettered-event gelogd
@@ -203,6 +192,18 @@ async function applyDlqDeadLetter(
   return "updated";
 }
 
+/**
+ * Check the Service Bus DLQ for dead-lettered messages.
+ *
+ * Per message:
+ * 1. Idempotency check: skip if already in bc_sync_dlq_messages
+ * 2. Match check: find corresponding bc_sync_orders record
+ * 3. Archive: INSERT into bc_sync_dlq_messages
+ * 4. Update: SET bc_sync_orders.status = 'dead_letter' if matched
+ * 5. Complete: DELETE from queue only after successful insert
+ *
+ * Non-fatal: errors are counted, not thrown. Sequential processing (no Promise.all).
+ */
 export async function checkDlqMessages(
   supabase: ReturnType<typeof getSupabaseClient>,
   logger: Logger,
@@ -211,7 +212,7 @@ export async function checkDlqMessages(
 
   const config = getConfig();
 
-  // SAS token scoped to parent queue (grants DLQ access per PATTERNS.md)
+  // SAS token scoped to the parent queue; that scope also covers its DLQ subqueue
   const sasToken = generateSasToken(
     config.SB_NAMESPACE,
     config.SB_QUEUE,
@@ -226,7 +227,7 @@ export async function checkDlqMessages(
 
       const messageId = msg.brokerProperties.MessageId;
 
-      // 1. Idempotency check (D-13)
+      // 1. Idempotency check
       const { data: existing, error: existingErr } = await supabase
         .from("bc_sync_dlq_messages")
         .select("id")
@@ -235,7 +236,7 @@ export async function checkDlqMessages(
 
       // Een DB-fout is GEEN "nog niet gezien": bij stil doorgaan zou het bericht
       // opnieuw als nieuw verwerkt worden (mogelijk UNIQUE-violatie). Tel als error,
-      // laat in de queue voor een volgende run (PR#5 claude #4, spiegelt error-queue).
+      // laat in de queue voor een volgende run (spiegelt error-queue-checker).
       if (existingErr) {
         logger.error({ messageId, error: existingErr.message }, "DLQ idempotency-check faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
@@ -245,7 +246,7 @@ export async function checkDlqMessages(
       if (existing && existing.length > 0) {
         // Al gearchiveerd. Self-heal: een eerdere run kan wel gearchiveerd maar de
         // status-update gemist hebben (update-fout). Re-match + re-update voor we
-        // completen, anders blijft de order eeuwig niet-dead_letter (PR#5 claude High).
+        // completen, anders blijft de order eeuwig niet-dead_letter.
         summary.skipped++;
         const { data: healRows, error: healMatchErr } = await supabase
           .from("bc_sync_orders")
@@ -278,8 +279,8 @@ export async function checkDlqMessages(
         continue;
       }
 
-      // 2. Match check (D-11): zoek bc_sync_orders op message_id. Select verbreed
-      // (RISK-2) zodat een complete dead_lettered-event-rij gebouwd kan worden.
+      // 2. Match check: zoek bc_sync_orders op message_id. De select haalt alle
+      // velden op waarmee een complete dead_lettered-event-rij gebouwd kan worden.
       const { data: matchedOrders, error: matchError } = await supabase
         .from("bc_sync_orders")
         .select("id, order_id, company_id, po_number, retry_count, status")
@@ -288,7 +289,7 @@ export async function checkDlqMessages(
 
       // Een DB-fout is GEEN "geen match": zou het bericht als unmatched archiveren
       // EN uit de queue verwijderen -> de dead_letter-koppeling permanent kwijt.
-      // Tel als error, laat in de queue voor een volgende run (PR#5 claude High).
+      // Tel als error, laat in de queue voor een volgende run.
       if (matchError) {
         logger.error({ messageId, error: matchError.message }, "DLQ match-lookup faalde (DB-fout) -- bericht overgeslagen deze run");
         summary.errors++;
@@ -300,7 +301,7 @@ export async function checkDlqMessages(
           ? (matchedOrders[0] as DlqMatchedOrder)
           : null;
 
-      // 3. Parse envelope body als JSON (T-152.1-05: wrapped in try/catch)
+      // 3. Parse envelope body als JSON (in try/catch: de body is onvertrouwde input)
       let envelopeBody: unknown = null;
       try {
         envelopeBody = JSON.parse(msg.body);
@@ -309,7 +310,7 @@ export async function checkDlqMessages(
         logger.warn({ messageId }, "DLQ message body is not valid JSON");
       }
 
-      // 4. INSERT in bc_sync_dlq_messages (D-05/D-06)
+      // 4. INSERT in bc_sync_dlq_messages
       const { error: insertError } = await supabase
         .from("bc_sync_dlq_messages")
         .insert({
@@ -331,7 +332,7 @@ export async function checkDlqMessages(
         continue;
       }
 
-      // 5. Bij match: update bc_sync_orders (D-11) via de gedeelde helper.
+      // 5. Bij match: update bc_sync_orders via de gedeelde helper.
       if (matchedOrder) {
         const outcome = await applyDlqDeadLetter(
           supabase,
@@ -346,25 +347,25 @@ export async function checkDlqMessages(
           summary.errors++;
           // Archief is al gelukt, maar de status staat NOG NIET op dead_letter.
           // NIET completen -- de self-heal in de idempotency-skip retry't de update
-          // een volgende run (PR#5 claude High). Anders gaat de transitie verloren.
+          // een volgende run. Anders gaat de transitie verloren.
           continue;
         }
 
         if (outcome === "terminal") {
           // Al terminaal -> geen dead_letter-transitie door ons; tel als unmatched
-          // (consistent met het terminal-pad in error-queue-checker, PR#5 claude #3).
+          // (consistent met het terminal-pad in error-queue-checker).
           summary.unmatched++;
         } else {
           summary.matched++;
           logger.info({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, deadLetterReason: msg.deadLetterReason, matched: true, orderId: matchedOrder.id }, "DLQ message processed (matched)");
         }
       } else {
-        // D-12: geen match, alsnog opgeslagen
+        // Geen match, alsnog opgeslagen
         summary.unmatched++;
         logger.warn({ messageId, sequenceNumber: msg.brokerProperties.SequenceNumber, deadLetterReason: msg.deadLetterReason, matched: false }, "DLQ message processed (no match)");
       }
 
-      // 6. Complete bericht uit queue (D-03: alleen na succesvolle insert)
+      // 6. Complete bericht uit queue (alleen na succesvolle insert)
       await completeDlqMessage(config.SB_NAMESPACE, config.SB_QUEUE, sasToken, msg);
       summary.processed++;
     } catch (err) {

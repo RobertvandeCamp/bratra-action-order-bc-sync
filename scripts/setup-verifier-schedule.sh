@@ -4,16 +4,16 @@
 # van de verifier-Lambda (bratra-bc-sync-verifier).
 #
 # Wat doet dit script (kort):
-#   De verifier had in productie GEEN enkele trigger; orders bleven op `sent` hangen.
+#   Zonder trigger draait de verifier nooit en blijven orders op `sent` hangen.
 #   Dit script legt de volledige AWS-configuratie idempotent vast:
 #     1. Een EventBridge-rule (cron) die de verifier elke 15 min draait, ma-vr,
 #        ~NL kantooruren (UTC-rule; NL-timezone bewust out-of-scope).
 #     2. Een lambda resource-policy (permission) zodat EventBridge mag invoken,
-#        strikt scoped op DEZE rule-ARN (geen wildcard — threat-mitigatie T-193-01).
+#        strikt scoped op DEZE rule-ARN (geen wildcard: anders mag elke rule invoken).
 #     3. Een target dat de verifier aanroept met Input {"source":"scheduled"} puur
 #        voor log-attributie (de handler negeert het event).
 #     4. Reserved concurrency = 1 zodat cron en handmatige/`/verify`-aanroep nooit
-#        overlappen op de destructieve Service Bus error/DLQ-reads (T-193-02).
+#        overlappen op de destructieve Service Bus error/DLQ-reads.
 #     5. Timeout = 300s zodat een grote batch sequentiële BC-GETs niet halverwege
 #        wordt afgebroken.
 #   Er wordt GEEN Lambda-code gedeployed; dit is puur ops-config.
@@ -43,7 +43,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 
-# --- Identifiers (zie README 'Verifier schedule' + plan 193) -----------------
+# --- Identifiers (zie README 'Verifier schedule') ----------------------------
 
 REGION="eu-central-1"
 ACCOUNT_ID="683001725253"
@@ -129,7 +129,7 @@ apply() {
 
   # 2. Lambda-permission idempotent: eerst verwijderen (negeer ALLEEN ResourceNotFound op
   #    de eerste run; echte fouten — IAM/throttle/netwerk — moeten zichtbaar zijn),
-  #    daarna toevoegen scoped op de rule-ARN (T-193-01, geen wildcard).
+  #    daarna toevoegen scoped op de rule-ARN (geen wildcard).
   local rm_err
   if ! rm_err="$(aws lambda remove-permission --function-name "$FUNCTION_NAME" --statement-id "$STATEMENT_ID" --region "$REGION" 2>&1)"; then
     if ! printf '%s' "$rm_err" | grep -q "ResourceNotFoundException"; then
@@ -173,7 +173,7 @@ JSON
   fi
   echo "[3/5] put-targets OK — verifier gekoppeld met Input {\"source\":\"scheduled\"} (FailedEntryCount=0)."
 
-  # 4. Reserved concurrency = 1 (T-193-02; voorkomt overlappende runs).
+  # 4. Reserved concurrency = 1 (voorkomt overlappende runs).
   aws lambda put-function-concurrency \
     --function-name "$FUNCTION_NAME" \
     --reserved-concurrent-executions "$RESERVED" \

@@ -13,7 +13,7 @@ import type { getSupabaseClient } from "../shared/supabase-client";
 /**
  * Bouw de identiteit-velden van een `BcSyncEventInsert` uit een in-scope
  * `BcSyncOrderRow` (de hele rij zit al in `sentOrders`, geen `.select()` nodig).
- * Alle verifier-buffer-transities komen vanaf status `sent` (D-07).
+ * Alle verifier-buffer-transities komen vanaf status `sent`.
  */
 export function buildBufferEvent(
   order: BcSyncOrderRow,
@@ -77,7 +77,7 @@ export async function checkBufferStatuses(
     errors: 0,
   };
 
-  // D-01: verzamel per-order events en doe ÉÉN bulk-insert aan het einde. Een
+  // Verzamel per-order events en doe ÉÉN bulk-insert aan het einde. Een
   // event wordt alleen toegevoegd op de success-branch van de bijbehorende
   // status-update (een gefaalde update = transitie vond niet plaats -> geen event).
   const events: BcSyncEventInsert[] = [];
@@ -108,7 +108,7 @@ export async function checkBufferStatuses(
         continue;
       }
 
-      // D-04: Query BC buffer by externalId (escape single quotes for OData)
+      // Query BC buffer by externalId (escape single quotes for OData)
       const safeExternalId = order.external_id.replace(/'/g, "''");
       const endpoint = `companies(${bcConfig.companyId})/bratraSalesOrderBuffers?$filter=externalId eq '${safeExternalId}'`;
       const result = await bcGet<BcBufferRecord>(token, bcConfig, endpoint, {
@@ -116,7 +116,7 @@ export async function checkBufferStatuses(
         apiRoute: "api/erpcompany/integration/v1.0",
       }, logger);
 
-      // D-10: Not found -- buffer not yet arrived at BC
+      // Not found -- buffer not yet arrived at BC
       if (!result.value || result.value.length === 0) {
         const sentAge = Date.now() - new Date(order.sent_at!).getTime();
         const oneHour = 60 * 60 * 1000;
@@ -155,12 +155,12 @@ export async function checkBufferStatuses(
 
       const buffer = result.value[0];
 
-      // D-09: Calculate sent_at age for warning check
+      // Calculate sent_at age for warning check
       const sentAge = Date.now() - new Date(order.sent_at!).getTime();
       const tenMinutes = 10 * 60 * 1000;
 
       switch (buffer.status) {
-        // D-07: Done -> verified
+        // Done -> verified
         case "Done": {
           const { error: verifyError } = await supabase
             .from("bc_sync_orders")
@@ -189,7 +189,7 @@ export async function checkBufferStatuses(
           break;
         }
 
-        // D-08: Error/Fatal -> retry or dead_letter
+        // Error/Fatal -> retry or dead_letter
         case "Error":
         case "Fatal": {
           if (order.retry_count < order.max_retries) {
@@ -247,7 +247,7 @@ export async function checkBufferStatuses(
           break;
         }
 
-        // D-09: Pending/Processing -> skip, warn if > 10 min
+        // Pending/Processing -> skip, warn if > 10 min
         case "Pending":
         case "Processing": {
           if (sentAge > tenMinutes) {
@@ -258,7 +258,7 @@ export async function checkBufferStatuses(
           break;
         }
 
-        // Cancelled -> dead_letter (RESEARCH pitfall 5)
+        // Cancelled -> dead_letter
         case "Cancelled": {
           const { error: cancelError } = await supabase
             .from("bc_sync_orders")
@@ -297,8 +297,8 @@ export async function checkBufferStatuses(
     }
   }
 
-  // Best-effort bulk-log na alle per-order checks (D-01). logSyncEvent swallowt
-  // zelf elke fout -- mag de verifier-flow nooit breken (T-185-11).
+  // Best-effort bulk-log na alle per-order checks. logSyncEvent swallowt
+  // zelf elke fout -- mag de verifier-flow nooit breken.
   await logSyncEvent(supabase, events, logger);
 
   return summary;
