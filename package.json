@@ -15,7 +15,7 @@
     "@azure/msal-node": "^5.6.0",
     "@supabase/supabase-js": "^2.117.2",
     "aws-embedded-metrics": "^4.2.1",
-    "pino": "^10.1.0",
+    "pino": "^10.4.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
